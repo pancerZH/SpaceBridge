@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Benchmark artifacts (embeddings, indexes, model/dataset caches, results)
+data/
+cache/
+outputs/
+runs/
+*.npy
+*.npz
+*.faiss
+*.parquet
+*.safetensors
+*.pt
+
+# Secrets / env
+.env
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
