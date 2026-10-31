@@ -26,3 +26,6 @@ runs/
 .vscode/
 .idea/
 .DS_Store
+
+# Local performance reports (kept off GitHub)
+docs/reports/

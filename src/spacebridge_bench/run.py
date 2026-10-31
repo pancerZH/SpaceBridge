@@ -2,7 +2,7 @@
 
 Example:
     uv run spacebridge-bench --dataset scifact --tier 1 3
-    uv run spacebridge-bench --dataset scifact --pair bge-large-en:qwen3-0.6b --rows 0a 0b 6 8
+    uv run spacebridge-bench --dataset fiqa --pair bge-large-en:qwen3-0.6b --rows 0a 0b 6 8 --K 1024 2048
 """
 
 import argparse
@@ -16,7 +16,7 @@ from spacebridge import CalibrationBundle, SpaceBridge, extract_query_proxy, mak
 
 from .datasets import DATASETS, RetrievalDataset, load_beir
 from .encode import Encoder
-from .metrics import evaluate, retention
+from .metrics import bootstrap_ratio_ci, per_query, retention
 from .models import MODELS
 from .search import search
 
@@ -30,7 +30,11 @@ ROWS = {
     "3b": "Row 3 (best Stage-1 op) without mean restore",
     "6": "+ query-proxy pairs (best Stage-1 op)",
     "6b": "Row 6 without mean restore",
+    "6n": "Row 6 without residual norm matching",
     "8": "+ Stage-2 InfoNCE + KL refinement",
+    "8s": "Row 8 without mean restore",
+    "8n": "Row 8 without residual norm matching",
+    "8b": "Row 8 + doc<->doc pairs (anchor docs encoded by M_tgt)",
 }
 
 # row -> (anchor embeddings used as Y, fit mode, pair type, restore source mean)
@@ -42,7 +46,11 @@ BRIDGE_ROWS = {
     "3b": ("tgt_doc", "stage1", "doc", False),
     "6": ("tgt_query", "stage1", "query", True),
     "6b": ("tgt_query", "stage1", "query", False),
+    "6n": ("tgt_query", "stage1", "query", True),
     "8": ("tgt_query", "auto", "query", True),
+    "8s": ("tgt_query", "auto", "query", False),
+    "8n": ("tgt_query", "auto", "query", True),
+    "8b": ("tgt_query", "auto", "query", True),  # + Y_doc_raw
 }
 
 TIERS = {
@@ -60,7 +68,7 @@ def run_pair(
     ds: RetrievalDataset, src_key: str, tgt_key: str, K: int, seed: int, rows: list[str], device: str
 ) -> list[dict]:
     src, tgt = MODELS[src_key], MODELS[tgt_key]
-    K = min(K, ds.N // 10)  # §4.1: K <= N/10
+    K = min(K, ds.N)
 
     enc = Encoder(src, device)
     E_src = enc.docs(ds.titles, ds.texts)
@@ -86,11 +94,19 @@ def run_pair(
     E_tgt = enc.docs(ds.titles, ds.texts)
     Q_tgt = enc.queries(ds.queries, ds.task)
     Y_query, mount = enc.timed_encode([tgt.format_query(p, ds.task) for p in proxies])
-    enc.unload()
     mount["projected_encode_ms_K2048"] = mount["encode_ms"] * 2048 / K
+    if "8b" in rows:
+        _, doc_mount = enc.timed_encode([tgt.format_doc(ds.titles[i], ds.texts[i]) for i in anchor_ids])
+        mount.update({f"doc_{k}": v for k, v in doc_mount.items()})
+    enc.unload()
 
-    native = evaluate(search(Q_src, E_src, SEARCH_K, device), ds.qrels)
-    oracle = evaluate(search(Q_tgt, E_tgt, SEARCH_K, device), ds.qrels)
+    def evaluate(Q: np.ndarray, E: np.ndarray) -> dict[str, np.ndarray]:
+        return per_query(search(Q, E, SEARCH_K, device), ds.qrels)
+
+    native_pq, oracle_pq = evaluate(Q_src, E_src), evaluate(Q_tgt, E_tgt)
+    native = {m: float(v.mean()) for m, v in native_pq.items()}
+    oracle = {m: float(v.mean()) for m, v in oracle_pq.items()}
+    ceiling_r30 = native_pq["recall@30"] if native["recall@30"] <= oracle["recall@30"] else oracle_pq["recall@30"]
     anchor_Y = {"src_query": bundle.X_query_raw, "tgt_query": Y_query, "tgt_doc": E_tgt[anchor_ids]}
     X_distractor = E_src[bundle.distractor_ids]
 
@@ -99,18 +115,20 @@ def run_pair(
     for row in rows:
         rec = {**base, "row": row, "description": ROWS[row]}
         if row in ("0a", "0b"):
-            rec["metrics"] = oracle if row == "0a" else native
+            pq = oracle_pq if row == "0a" else native_pq
         else:
             y_kind, mode, pairs, restore = BRIDGE_ROWS[row]
-            bridge = SpaceBridge(device=device, restore_source_mean=restore)
-            fit = bridge.fit(bundle, anchor_Y[y_kind], mode=mode, pairs=pairs, X_distractor=X_distractor)
+            bridge = SpaceBridge(device=device, restore_source_mean=restore, match_residual_norm=row not in ("6n", "8n"))
+            extra = {"Y_doc_raw": anchor_Y["tgt_doc"]} if row == "8b" else {}
+            fit = bridge.fit(bundle, anchor_Y[y_kind], mode=mode, pairs=pairs, X_distractor=X_distractor, **extra)
             Q = Q_src if row == "1" else Q_tgt
-            Q_hat = bridge.transform_query(Q)
-            rec["metrics"] = evaluate(search(Q_hat, E_src, SEARCH_K, device), ds.qrels)
+            pq = evaluate(bridge.transform_query(Q), E_src)
             rec["fit"] = fit
             rec["projection_us"] = _projection_latency_us(bridge, Q[0])
             if row != "1":
                 rec["mount"] = mount
+        rec["metrics"] = {m: float(v.mean()) for m, v in pq.items()}
+        rec["ci_ceil_recall@30"] = bootstrap_ratio_ci(pq["recall@30"], ceiling_r30)
         rec["rho_oracle"], rec["rho_ceil"] = retention(rec["metrics"], native, oracle)
         rec["rho_native"] = {m: v / native[m] if native[m] > 0 else float("nan") for m, v in rec["metrics"].items()}
         records.append(rec)
@@ -128,7 +146,7 @@ def _projection_latency_us(bridge: SpaceBridge, q: np.ndarray, n: int = 1000) ->
 def print_table(records: list[dict]) -> None:
     r0 = records[0]
     print(f"\n{r0['dataset']}  {r0['src']} (index) <- {r0['tgt']} (queries)  K={r0['K']}  n_q={r0['n_queries']}")
-    header = f"{'row':>4}  {'R@10':>6} {'R@30':>6} {'nDCG@10':>7}  {'ρceil@30':>8} {'ρorac@30':>8}  {'ρ_val':>6}  {'solver':<16} status"
+    header = f"{'row':>4}  {'R@10':>6} {'R@30':>6} {'nDCG@10':>7}  {'ρceil@30':>8} {'95% CI':^13} {'ρorac@30':>8}  {'ρ_val':>6}  {'solver':<16} status"
     print(header)
     print("-" * len(header))
     for r in records:
@@ -139,9 +157,10 @@ def print_table(records: list[dict]) -> None:
         if "stage2_best_step" in fit:
             solver += f" +S2@{fit['stage2_best_step']}"
         rho_val = f"{fit['rho_val']:.3f}" if "rho_val" in fit else ""
+        lo, hi = r["ci_ceil_recall@30"]
         print(
             f"{r['row']:>4}  {m['recall@10']:6.3f} {m['recall@30']:6.3f} {m['ndcg@10']:7.3f}  "
-            f"{r['rho_ceil']['recall@30']:8.3f} {r['rho_oracle']['recall@30']:8.3f}  {rho_val:>6}  {solver:<16} {fit.get('status', '')}"
+            f"{r['rho_ceil']['recall@30']:8.3f} [{lo:.3f},{hi:.3f}] {r['rho_oracle']['recall@30']:8.3f}  {rho_val:>6}  {solver:<16} {fit.get('status', '')}"
         )
     mount = next((r["mount"] for r in records if "mount" in r), None)
     if mount:
@@ -149,6 +168,8 @@ def print_table(records: list[dict]) -> None:
             f"mount: encode {mount['encode_ms']:.0f} ms for {mount['n_inputs']} proxies "
             f"({mount['tokens_per_s']:.0f} tok/s; ~{mount['projected_encode_ms_K2048']:.0f} ms at K=2048)"
         )
+        if "doc_encode_ms" in mount:
+            print(f"       + anchor docs for row 8b: {mount['doc_encode_ms']:.0f} ms ({mount['doc_tokens_per_s']:.0f} tok/s)")
 
 
 def main() -> None:
@@ -157,7 +178,7 @@ def main() -> None:
     p.add_argument("--tier", nargs="*", default=[], choices=sorted(TIERS))
     p.add_argument("--pair", nargs="*", default=[], help="src:tgt model keys, e.g. bge-large-en:qwen3-0.6b")
     p.add_argument("--rows", nargs="*", default=list(ROWS), choices=list(ROWS))
-    p.add_argument("--K", type=int, default=2048, help="anchor budget (capped at N/10)")
+    p.add_argument("--K", type=int, nargs="*", default=[2048], help="anchor budget(s); one run per value")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", type=Path, default=Path("outputs/results.jsonl"))
@@ -173,8 +194,8 @@ def main() -> None:
 
     ds = load_beir(args.dataset)
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    for src, tgt in pairs:
-        records = run_pair(ds, src, tgt, args.K, args.seed, args.rows, args.device)
+    for (src, tgt), K in ((pr, K) for pr in pairs for K in args.K):
+        records = run_pair(ds, src, tgt, K, args.seed, args.rows, args.device)
         with args.out.open("a") as f:
             for rec in records:
                 f.write(json.dumps(rec, default=_json_default) + "\n")

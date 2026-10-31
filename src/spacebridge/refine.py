@@ -29,9 +29,12 @@ def refine(
     Xd_train: torch.Tensor,
     val_score: Callable[[torch.Tensor], float],
     cfg: RefineConfig = RefineConfig(),
+    labels: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict]:
     """Optimizes W against anchor docs with the deployed affine map; returns the best-on-val W.
 
+    Row i of ``Yc_train`` / ``Xq_train`` (and of ``mu_x`` when it is 2-D) is a training query whose
+    positive candidate is ``Xd_train[labels[i]]``; ``labels`` defaults to the diagonal.
     ``val_score`` maps a candidate W to a higher-is-better validation score; step 0 (W0) is a
     candidate, so refinement can never make validation worse.
     """
@@ -40,7 +43,8 @@ def refine(
 
     with torch.no_grad():
         teacher = F.log_softmax(Xq_train @ Xd_train.T / cfg.tau, dim=-1)
-    labels = torch.arange(K_train, device=W0.device)
+    if labels is None:
+        labels = torch.arange(K_train, device=W0.device)
 
     W = W0.clone().requires_grad_(True)
     opt = torch.optim.AdamW([W], lr=cfg.lr, weight_decay=0.0)

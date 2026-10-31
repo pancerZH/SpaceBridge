@@ -22,6 +22,8 @@ def select_anchors(E: np.ndarray, K: int, seed: int = 0) -> np.ndarray:
     N = E.shape[0]
     if not 0 < K <= N:
         raise ValueError(f"K={K} must be in [1, N={N}]")
+    if K == N:
+        return np.arange(N)
     E = _l2(np.asarray(E, dtype=np.float32))
     if N < FPS_THRESHOLD:
         return _farthest_point(E, K, seed)

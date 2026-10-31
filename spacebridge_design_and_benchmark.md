@@ -80,7 +80,7 @@ Modern asymmetric embedding models map **queries** (with task instructions or `"
 flowchart TD
     subgraph Freeze["1. Index Freeze Phase (Source Model M_src, Lang L_src) - offline, once"]
         Docs["Corpus Documents (N)"] --> EncDoc["Encode Docs M_src^doc -> Index E_src (never modified)"]
-        EncDoc --> Medoids["Select K Medoid Docs (D_anchor, X^d), K <= N/10"]
+        EncDoc --> Medoids["Select K Medoid Docs (D_anchor, X^d), K = min(2048, N)"]
         Medoids --> ExtractQ["Extract Lead Sentence / Heading Proxies (Q_anchor)"]
         ExtractQ --> EncSrcQ["Encode Query Proxies M_src^query -> X^q, mu_X^q"]
         EncDoc --> Distract["Sample 50K Distractor Row IDs for rho_val"]
@@ -118,7 +118,7 @@ flowchart TD
 ## 4. Core Algorithms & Mathematical Formulation
 
 ### 4.1 Full-Rank Anchor Selection (`AnchorSelector`)
-To prevent rank deficiency on $1024\text{d}$–$1536\text{d}$ models, the default anchor budget is **$K = 2,048$** ($K_{\text{train}} = 1,638$, $K_{\text{val}} = 410$), subject to **$K \le N/10$** (otherwise calibration approaches re-indexing and benchmark numbers become unrepresentative; e.g. `scifact` with $N = 5,183$ uses $K = 512$).
+To prevent rank deficiency on $1024\text{d}$–$1536\text{d}$ models, the default anchor budget is **$K = \min(2,048, N)$** ($K_{\text{train}} = 1,638$, $K_{\text{val}} = 410$). Fit quality depends on $K$ relative to the embedding dimensions, not on $K/N$: v2.4 briefly capped $K \le N/10$, which on `scifact` forced $K = 518$ and cost Tier 1 about 5 points of `Recall@30` retention (91% vs. 96% at $K = 2,048$), so the cap was removed. Small corpora such as `scifact` remain smoke tests; `fiqa` ($K/N = 3.6\%$) is the authoritative benchmark.
 
 1. **Medoid Sampling ($N \ge 5,000$):** Partition document embeddings into $K$ clusters via `MiniBatchKMeans` and select the actual document $d_k$ closest in cosine similarity to each centroid, yielding $(D_{\text{anchor}}, X^{(d)} \in \mathbb{R}^{K \times d_s})$, with $X^{(d)}$ read **exactly as stored in the index**. (Use Farthest Point Sampling when $N < 5,000$.)
 2. **Zero-LLM Query-Proxy Extraction:** Extract each medoid's title/heading plus first sentence ($32$–$64$ tokens) as paired query proxy $q_k \in Q_{\text{anchor}}$, and encode $X^{(q)} = M_{\text{src}}^{\text{query}}(Q_{\text{anchor}}) \in \mathbb{R}^{K \times d_s}$ using $M_{\text{src}}$'s native query prompt/prefix (§7.1 prompt table).
@@ -144,6 +144,8 @@ where $Y^{(q)} = M_{\text{tgt}}^{\text{query}}(Q_{\text{anchor}}) \in \mathbb{R}
 $$\hat{q}_{\text{src}} = \text{Normalize}\!\left(\mu_X^{(q)} + (q_{\text{tgt}} - \mu_{Y, L_q}^{(q)})\, W\right)$$
 
 Restoring $\mu_X^{(q)}$ puts the projected query on the source query cone, where the index was trained to be searched; dropping it adds a document-dependent term $-\mu_X^{(q)} \cdot e_j$ that alters native rankings. **Identity check:** with $M_{\text{tgt}} = M_{\text{src}}$ and ridge $\lambda \to 0$, $W \to I$ and $\hat{q}_{\text{src}} = x^{(q)}$ exactly, so the pipeline must reproduce native retrieval (Ablation Row 1). The v2.3 behavior (no mean restore) is retained as Ablation Row 3b.
+
+**Residual norm matching (implementation finding).** Least-squares maps (ridge, and Procrustes with $s < 1$) shrink the mapped residual $(q_{\text{tgt}} - \mu_Y)W$ toward zero, so after restoring $\mu_X^{(q)}$ the mean dominates and every query drifts toward the "average query". This made stripping the mean look better at small $K$, while restoring was clearly better with more data. Each Stage-1 candidate $W$ is therefore rescaled so the mean norm of mapped training residuals equals that of native source residuals $\|\bar{X}^{(q)}_{\text{train}}\|$. On `fiqa` this adds about 3 points of Stage-1 `Recall@30` retention, at zero query-time cost (the scale is folded into $W$). Ablation Rows 6n / 8n disable it.
 
 ---
 
@@ -237,11 +239,48 @@ where the student uses $\hat{q}_{\text{src}}$ and the teacher uses native $X^{(q
 
 | Validation Retention $\rho_{\text{val}}$ | Alignment Status | Online Retrieval Pipeline Action |
 | :--- | :--- | :--- |
-| **$\rho_{\text{val}} \ge 0.90$** | `HIGH_CONFIDENCE` | Linear ANN ($W^*$) + BM25 (if $L_q == L_{\text{src}}$) (`rerank_pool = 30`) $\to$ Cross-Encoder Top-5. |
-| **$0.75 \le \rho_{\text{val}} < 0.90$** | `MODERATE_DRIFT` | Fetch `Top-200` $\to$ in-memory **Operator D Relative Rescorer** $\to$ Cross-Encoder on `rerank_pool = 60`. |
-| **$\rho_{\text{val}} < 0.75$** | `LOW_ALIGNMENT_WARN` | Emit warning, widen `rerank_pool = 100`, and recommend background native re-indexing if sustained. |
+| **$\rho_{\text{val}} \ge 0.58$** | `HIGH_CONFIDENCE` | Linear ANN ($W^*$) + BM25 (if $L_q == L_{\text{src}}$) (`rerank_pool = 30`) $\to$ Cross-Encoder Top-5. |
+| **$0.40 \le \rho_{\text{val}} < 0.58$** | `MODERATE_DRIFT` | Fetch `Top-200` $\to$ in-memory **Operator D Relative Rescorer** $\to$ Cross-Encoder on `rerank_pool = 60`. |
+| **$\rho_{\text{val}} < 0.40$** | `LOW_ALIGNMENT_WARN` | Emit warning, widen `rerank_pool = 100`, and recommend background native re-indexing if sustained. |
 
-The 0.90 / 0.75 thresholds are **provisional**. They are replaced after Stage 2 of the benchmark by thresholds fitted from the $\rho_{\text{val}}$ vs. real-query $\rho_{\text{ceil}}$ calibration study (§7.4).
+The thresholds come from the calibration study (§7.4): over 180 `scifact` fits (6 pairs × 6 anchor counts × 5 solver settings), real `Recall@30` ceiling retention $\approx 0.85\,\rho_{\text{val}} + 0.41$ ($R^2 = 0.87$, residual s.d. 4 points; Spearman 0.89 pooled, 0.93 within pairs), so $\rho_{\text{val}} = 0.58$ / $0.40$ correspond to $\approx 90\%$ / $75\%$ retention. Agreement is on a different scale from retention: a $\rho_{\text{val}}$ of 0.6 already means $\approx 92\%$ retention. **On `fiqa` these thresholds did not transfer** (the same fit implies 0.505 / 0.347, and no `fiqa` fit reached `HIGH_CONFIDENCE`), so the fixed-threshold table above is superseded by the calibrated quality score in §5.1.
+
+### 5.1 Conversion Quality Report (Simple Score, Detailed Measurements, Per-Query Confidence)
+
+Goal: the system cannot be good on every corpus, but it must **never be silently bad**. Every mount produces a quality report computed from the calibration bundle alone (no labeled queries), and every online query carries a confidence value.
+
+**Simple mode: one score in $[0, 100]$.** The score is the **predicted ceiling retention of `Recall@30`, in percent**: "87" means "expect about 87% of the retrieval quality that re-indexing with $M_{\text{tgt}}$, or the native $M_{\text{src}}$, whichever is lower, would give". It is produced by a small calibrated regressor (linear to start) from the detailed measurements below to observed retention, fitted on all benchmark runs. It is always reported with a prediction band and a grade:
+
+| Grade | Score | Default routing |
+| :--- | :--- | :--- |
+| **A** | $\ge 95$ | Linear ANN, `rerank_pool = 30` |
+| **B** | $85\text{–}95$ | `rerank_pool = 60` (+ Operator D) |
+| **C** | $70\text{–}85$ | `rerank_pool = 100`, warn |
+| **D** | $< 70$ | Warn and recommend native re-indexing |
+
+The score is marked **experimental** until its regressor is shown to transfer to held-out datasets (leave-one-dataset-out error within the reported band on $\ge 4$ datasets, §7.1).
+
+**Detailed mode: measurements grouped by what they diagnose.**
+
+| Group | Measurement (on held-out anchors unless noted) | Diagnoses |
+| :--- | :--- | :--- |
+| **Fidelity** | $\rho_{\text{val}}$ (teacher top-10 agreement); share of the teacher's top-10 non-own neighbors in the student's top-30 | How closely the bridge reproduces native rankings |
+| **Recoverability** | Share of the teacher's top-10 non-own neighbors in the student's top-100 | Whether losses are reorderings a reranker can fix, or missing documents |
+| **Fit health** | Held-out explained variance of the map; train-vs-val fidelity gap; effective rank $r / \min(d_t, d_s)$; Stage-2 gain | Whether the map is sound, data-starved, or overfitting |
+| **Corpus difficulty** | Native neighborhood crowding (score gap between the teacher's top-1 and top-30); query/doc cone angle | Whether the corpus is intrinsically fragile to small query errors |
+| **Coverage** | $K / d_t$; per-language fidelity $\rho_{\text{val}, L_q}$ (Regime L1) | Calibration-data sufficiency, cross-lingual readiness |
+
+**Per-query confidence $c(q) \in [0, 1]$.** Computed online for each query at $\approx 10\,\mu\text{s}$ extra cost, from how well the query is supported by the calibration anchors: the similarity of the centered target query $\bar{y}_q$ to its nearest training anchors in target space ($\bar{Y}^{(q)}_{\text{train}}$, one $d_t \times K_{\text{train}}$ product), mapped to $[0, 1]$ by a calibration fitted on validation anchors so that low $c(q)$ predicts low per-query agreement with native. Queries far from all anchors are extrapolations of $W$; routing can widen the candidate pool and rerank **only those queries** instead of the whole workload.
+
+```python
+report = bridge.quality_report()         # computed during fit()
+report.score      # 87.0  (predicted % ceiling Recall@30 retention)
+report.band       # (82.0, 92.0)
+report.grade      # "B"
+report.details    # {"fidelity": {...}, "recoverability": {...}, "fit": {...}, "difficulty": {...}, "coverage": {...}}
+
+q_hat, conf = bridge.transform_query(q_raw, return_confidence=True)   # conf in [0, 1] per query
+```
 
 ---
 
@@ -342,7 +381,7 @@ class SpaceBridge:
 
 | Benchmark Role | Hugging Face / `mteb` ID | Scale & Purpose |
 | :--- | :--- | :--- |
-| **Fast Smoke Test** *(Tiers 1, 3, 4)* | `mteb/scifact` | **$5.2\text{K}$** English scientific abstracts + **$300$** queries; rapid inner-loop solver verification at $K = 512$. |
+| **Fast Smoke Test** *(Tiers 1, 3, 4)* | `mteb/scifact` | **$5.2\text{K}$** English scientific abstracts + **$300$** queries; rapid inner-loop solver verification ($K = 2,048$ is 40% of the corpus, so results are optimistic smoke tests). |
 | **Main English Benchmark** *(Tiers 1, 3, 4a, 4b)* | `mteb/fiqa` *(or `mteb/nfcorpus`)* | **$57.6\text{K}$** financial QA passages + **$648$** queries; full $K$ sweep up to $4,096$. |
 | **Native Chinese Benchmark** *(Tier 2)* | `C-MTEB/T2Retrieval` *(via `mteb` `"T2Retrieval"`)* | Native Chinese web passages + real Chinese search queries; subsampled to $25\text{K}$–$50\text{K}$ passages. |
 | **Chinese Contamination Check** *(Tier 2)* | `mteb` `"MedicalRetrieval"` / `"EcomRetrieval"` (Multi-CPR) | `bge-*-zh` fine-tuning data likely includes T2Ranking (source of T2Retrieval), which inflates absolute scores. A second native-Chinese set shows whether retention ratios are affected. |
@@ -354,12 +393,12 @@ class SpaceBridge:
   1. **Positive-Preserving Subsampling:** When subsampling large corpora (e.g., `T2Retrieval` or `MKQARetrieval` from $300\text{K}+$ down to $25\text{K}$ passages), always include $100\%$ of positive `doc_id`s referenced in `test` `qrels` first, then sample remaining distractor passages uniformly at random and shuffle.
   2. **Consistent `title + text` Formatting:** Concatenate `f"{title}\n{text}"` (when `title` is non-empty) consistently during document indexing, except for models with a structured document prompt (`EmbeddingGemma 2`); extract `title` + lead sentence ($32$–$64$ tokens) as zero-LLM query proxies $Q_{\text{anchor}}$.
   3. **Strict Split Hygiene:** `AnchorSelector` samples strictly from `corpus` documents (never `test` queries), keeping evaluation queries completely unseen during calibration.
-  4. **Anchor Budget Cap:** $K \le N/10$ (§4.1).
+  4. **Anchor Budget:** $K = \min(2,048, N)$ (§4.1); `scifact` numbers are smoke tests only.
   5. **Dataset Licensing & Redistribution:** No dataset text or embeddings are committed to the repository. `flores_plus` is CC BY-SA 4.0 and gated, `belebele` is CC BY-SA 4.0, and other `mteb` sets carry their own terms; committing extracts would attach share-alike obligations separate from the code license and sidestep the gating terms. The repo contains only download/filter scripts; all data is fetched at runtime (HF token where gated) into the git-ignored `data/` / `cache/` directories.
   6. **FLORES / Belebele Disjointness:** Drop every FLORES sentence whose `eng_Latn` text appears as a substring of any Belebele `eng_Latn` passage; drop sentences duplicated across `dev` and `devtest`. Use the filtered `dev` subset for the 256-sentence $\Delta\mu$ bank and the filtered `devtest` for $\rho_{\text{val}, L_q}$; Tier 5b uses both (with $\rho_{\text{val}}$ from its own $K_{\text{val}}$ split). Log the surviving counts.
 * **Progressive Execution Order:**
   * **Stage 0 (Harness Sanity):** Identity check (Row 1) on `scifact` for `bge-large-en-v1.5`; measure anchor-encoding throughput (tokens/s, `bf16`) for every model to replace the provisional mount budgets in §2.1.
-  * **Stage 1 (Smoke Test):** `mteb/scifact` ($5.2\text{K}$ docs, $K = 512$) on Tiers 1, 3, and 4a (`< 2 min` end-to-end per pair, excluding 4B encoding).
+  * **Stage 1 (Smoke Test):** `mteb/scifact` ($5.2\text{K}$ docs, $K \in \{512, 2,048\}$) on Tiers 1, 3, and 4a (`< 2 min` end-to-end per pair, excluding 4B encoding).
   * **Stage 2 (Full Monolingual):** `mteb/fiqa` ($57.6\text{K}$ docs) + `C-MTEB/T2Retrieval` ($25\text{K}$ subset) + contamination-check set across Tiers 1–4.
   * **Stage 3 (Cross-Lingual):** filtered `flores_plus` + `XQuADRetrieval` / `MKQARetrieval` (and filtered `BelebeleRetrieval`) on Tiers 5a and 5b.
 
@@ -394,12 +433,13 @@ Every test pair runs through the following configurations:
 | **2** | Uncentered Full-SVD Procrustes ($K=512$, Doc Anchors) | Naive baseline (exposes cone bias + zero-singular-value random rotation). |
 | **3** | + Anchor Centering + Affine Mean Restore + Scaled Truncated Stiefel / Dual Ridge ($K=512$) | Gain from anisotropy removal + nullspace truncation / Woodbury conditioning. |
 | **3b** | Row 3 without mean restore (`restore_source_mean=False`, v2.3 behavior) | Whether stripping $\mu_X^{(q)}$ helps or hurts versus native-cone queries. |
-| **4** | + Scale Anchor Count $K \in \{512, 1024, 2048, 4096\}$ (subject to $K \le N/10$) | Knee of the sample-complexity curve across $384\text{d}$, $1024\text{d}$, and $2560\text{d}$. |
+| **4** | + Scale Anchor Count $K \in \{512, 1024, 2048, 4096\}$ | Knee of the sample-complexity curve across $384\text{d}$, $1024\text{d}$, and $2560\text{d}$. |
 | **5** | **In-Domain Corpus Medoids ($K=2048$) vs. Filtered Static FLORES Bank** | How much corpus-specific anchor coverage matters vs. a universal human anchor bank. |
 | **6** | + **Dual-Manifold Query-Proxy Alignment** ($\mu_Y^{(q)}, X^{(q)}$) | Gain from fixing `"query:"` / instruction cone shift (`E5`, `Qwen3`, `harrier`, `Gemma`). |
 | **7** | + **FLORES Language-Cone Shift Correction ($\Delta\mu_{L_q \to L_{\text{src}}}$)** *(Tier 5a)* | Gain from stripping language-ID bias when querying an `en` index in `zh`. |
 | **8** | + **Stage-2 GPU InfoNCE + Teacher KL Refinement (150 steps)** | Gain from contrastive ranking optimization over Frobenius MSE (~80ms on 5070 Ti). |
-| **8b** | + Doc↔Doc InfoNCE term (anchor docs encoded by $M_{\text{tgt}}^{\text{doc}}$) | Whether extra pairs offset the proxy-positive shortcut; costs a second encoding pass. |
+| **8s** | Row 8 without mean restore | Whether Stage 2 changes the restore-vs-strip comparison of Rows 6 / 6b. |
+| **8b** | + Doc↔Doc pairs in Stage 1 and Stage 2 (anchor docs encoded by $M_{\text{tgt}}^{\text{doc}}$, each pair type centered on its own cone mean) | Whether extra pairs offset the proxy-positive shortcut; costs a second, ~4–5× longer encoding pass. |
 | **9** | + **Hybrid RRF + Candidate Relative Rescorer + Reranker** (`bge-reranker-v2-m3` and `Qwen3-Reranker-0.6B`) | End-to-end RAG `NDCG@5` & `Recall@5` recovery across all 5 tiers; reranker comparison. |
 
 ### 7.4 Metrics Logged per Run

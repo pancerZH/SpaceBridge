@@ -7,6 +7,11 @@ RECALL_KS = (5, 10, 30, 100)
 
 def evaluate(ranked: np.ndarray, qrels: list[dict[int, int]]) -> dict[str, float]:
     """Recall@{5,10,30,100}, MRR@10 and NDCG@{5,10}; ``qrels[i]`` maps doc row -> graded relevance."""
+    return {name: float(v.mean()) for name, v in per_query(ranked, qrels).items()}
+
+
+def per_query(ranked: np.ndarray, qrels: list[dict[int, int]]) -> dict[str, np.ndarray]:
+    """The metrics of ``evaluate`` for each query separately (for paired bootstrap intervals)."""
     out: dict[str, list[float]] = {f"recall@{k}": [] for k in RECALL_KS}
     out.update({"mrr@10": [], "ndcg@5": [], "ndcg@10": []})
     for row, rel in zip(ranked, qrels):
@@ -17,7 +22,14 @@ def evaluate(ranked: np.ndarray, qrels: list[dict[int, int]]) -> dict[str, float
         out["mrr@10"].append(0.0 if first is None else 1.0 / (first + 1))
         for k in (5, 10):
             out[f"ndcg@{k}"].append(_ndcg(row[:k], rel, k))
-    return {name: float(np.mean(v)) for name, v in out.items()}
+    return {name: np.asarray(v) for name, v in out.items()}
+
+
+def bootstrap_ratio_ci(num: np.ndarray, den: np.ndarray, n: int = 2000, seed: int = 0) -> tuple[float, float]:
+    """95% paired-bootstrap interval of mean(num) / mean(den) over queries."""
+    idx = np.random.default_rng(seed).integers(0, len(num), size=(n, len(num)))
+    ratios = num[idx].mean(1) / den[idx].mean(1)
+    return float(np.percentile(ratios, 2.5)), float(np.percentile(ratios, 97.5))
 
 
 def _ndcg(row: np.ndarray, rel: dict[int, int], k: int) -> float:

@@ -9,7 +9,7 @@ from conftest import l2, make_world, overlap_at_k, top_k
 
 
 def _fit(world, Y, **kwargs):
-    fit_kwargs = {k: kwargs.pop(k) for k in ("mode", "pairs") if k in kwargs}
+    fit_kwargs = {k: kwargs.pop(k) for k in ("mode", "pairs", "Y_doc_raw") if k in kwargs}
     bridge = SpaceBridge(device="cpu", **kwargs)
     info = bridge.fit(world.bundle, Y, X_distractor=world.E_src[world.bundle.distractor_ids], **fit_kwargs)
     return bridge, info
@@ -51,6 +51,14 @@ def test_mean_restore_tracks_native_rankings_under_a_strong_query_cone():
         bridge, _ = _fit(world, world.Y_query, mode="stage1", restore_source_mean=restore)
         overlaps[restore] = overlap_at_k(native, top_k(bridge.transform_query(world.Q_tgt), world.E_src))
     assert overlaps[True] > overlaps[False]
+
+
+def test_doc_pairs_augment_stage1_and_stage2(world):
+    _, info = _fit(world, world.Y_query, mode="auto", Y_doc_raw=world.Y_doc, refine_config=RefineConfig(steps=20))
+    assert info["doc_pairs"] == len(world.bundle.train_idx)
+    assert info["rho_val"] > 0.5
+    with pytest.raises(ValueError):
+        _fit(world, world.Y_query, mode="naive", Y_doc_raw=world.Y_doc)
 
 
 def test_naive_mode_runs_and_reports_status(world):
