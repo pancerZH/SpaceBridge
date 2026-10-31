@@ -13,12 +13,12 @@ from pathlib import Path
 
 import numpy as np
 
-from spacebridge import extract_query_proxy, sample_distractors
+from spacebridge import sample_distractors
 from spacebridge.anchors import count_tokens
 from spacebridge_bench.datasets import load_beir
 from spacebridge_bench.encode import Encoder
 from spacebridge_bench.models import MODELS
-from spacebridge_bench.run import ANCHOR_CACHE
+from spacebridge_bench.run import ANCHOR_CACHE, make_proxy
 
 N_SAMPLE = 2_000
 
@@ -26,6 +26,12 @@ N_SAMPLE = 2_000
 def anchor_version(path: Path) -> str:
     """M2 files before the torch k-means change used sklearn anchors (cache files without ``_tkm``)."""
     return "sklearn" if path.name.startswith(("m2_", "m2d_")) else "tkm"
+
+
+def feature_key(r: dict, path: Path) -> tuple:
+    """(dataset, src, K, seed, anchor version[, proxy style when not lead]); lead keys predate the style."""
+    key = (r["dataset"], r["src"], r["K"], r.get("seed", 0), anchor_version(path))
+    return key + ((r["proxy"],) if r.get("proxy", "lead") != "lead" else ())
 
 
 def features(ds, E: np.ndarray, Xq: np.ndarray, ids: np.ndarray, proxies: list[str], seed: int) -> dict:
@@ -67,11 +73,13 @@ def main() -> None:
         for line in path.open():
             r = json.loads(line)
             if "quality" in r.get("fit", {}) and "reranker" not in r and r["row"] != "1":
-                keys.add((r["dataset"], r["src"], r["K"], r.get("seed", 0), anchor_version(path)))
+                keys.add(feature_key(r, path))
     todo = sorted(keys - done)
     print(f"{len(keys)} keys, {len(todo)} to compute")
     cache = {}
-    for dataset, src, K, seed, version in todo:
+    for key in todo:
+        dataset, src, K, seed, version = key[:5]
+        style = key[5] if len(key) > 5 else "lead"
         if dataset not in cache:
             cache.clear()
             cache[dataset] = load_beir(dataset)
@@ -86,13 +94,13 @@ def main() -> None:
             print(f"missing anchors {path}")
             continue
         ids = np.load(path)
-        proxies = [extract_query_proxy(ds.titles[i], ds.texts[i]) for i in ids]
+        proxies = [make_proxy(ds.titles[i], ds.texts[i], style) for i in ids]
         enc = Encoder(MODELS[src], "cuda")
         Xq = enc.queries(proxies, ds.task)
         enc.unload()
         f = features(ds, E, Xq, ids, proxies, seed)
         with args.out.open("a") as fh:
-            fh.write(json.dumps({"key": [dataset, src, K, seed, version], **f}) + "\n")
+            fh.write(json.dumps({"key": list(key), **f}) + "\n")
         print(dataset, src, K, seed, version, {k: round(v, 3) for k, v in f.items()})
 
 

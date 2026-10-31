@@ -15,7 +15,6 @@ from typing import Optional
 import numpy as np
 
 from spacebridge import CalibrationBundle, RefineConfig, SpaceBridge, extract_query_proxy, make_split, sample_distractors, select_anchors
-from spacebridge.anchors import _truncate_tokens, count_tokens
 
 from .datasets import DATASETS, RetrievalDataset, load_beir, load_shift_bank
 from .encode import Encoder
@@ -89,11 +88,12 @@ CI_METRICS = ("recall@30", "ndcg@5", "ndcg@10")
 PROXY_STYLES = ("lead", "short", "title")
 
 
-def make_proxy(title: str, text: str, style: str = "lead") -> str:
-    """``lead``: the design's title + lead sentence (32-64 tokens). ``title``: the title alone when it has
-    >= 4 tokens, else ``lead``. ``short``: like ``title``, but the fallback is cut to 16 tokens."""
-    if style != "lead" and title and count_tokens(title) >= 4:
-        return _truncate_tokens(title.strip(), 16)
+def make_proxy(title: str, text: str, style: str = "title") -> str:
+    """``title`` (engine default since M3): the title alone when it has >= 4 tokens, else title + lead
+    sentence (32-64 tokens). ``lead``: title + lead sentence for every document (the M2 default).
+    ``short``: like ``title``, but the fallback is cut to 16 tokens."""
+    if style == "lead":
+        return extract_query_proxy(title, text, title_min_tokens=None)
     if style == "short":
         return extract_query_proxy(title, text, min_tokens=4, max_tokens=16)
     return extract_query_proxy(title, text)
@@ -112,7 +112,7 @@ def cached_anchors(ds: RetrievalDataset, src_key: str, E_src: np.ndarray, allowe
 
 def run_pair(
     ds: RetrievalDataset, src_key: str, tgt_key: str, K: int, seed: int, rows: list[str], device: str,
-    rerankers: tuple[str, ...] = (), proxy: str = "lead", stage2_batch: Optional[int] = None,
+    rerankers: tuple[str, ...] = (), proxy: str = "title", stage2_batch: Optional[int] = None,
     doc_pair_tokens: Optional[int] = None, time_mount: bool = False, stage2_tau_scale: Optional[float] = None,
 ) -> list[dict]:
     src, tgt = MODELS[src_key], MODELS[tgt_key]
@@ -208,8 +208,7 @@ def run_pair(
         return bridged[row]
 
     base = {"dataset": ds.name, "src": src_key, "tgt": tgt_key, "K": K, "seed": seed, "n_queries": len(ds.queries)}
-    if proxy != "lead":
-        base["proxy"] = proxy
+    base["proxy"] = proxy  # records without this field (before M3's title default) used lead proxies
     if stage2_batch is not None:
         base["stage2_batch"] = stage2_batch
     if stage2_tau_scale:
@@ -370,7 +369,7 @@ def main() -> None:
     p.add_argument("--seed", type=int, nargs="*", default=[0], help="one run per seed, in one process")
     p.add_argument("--time-mount", action="store_true",
                    help="re-encode anchors uncached to time the mount, and time the projection (use an idle GPU)")
-    p.add_argument("--proxy", default="lead", choices=PROXY_STYLES, help="query-proxy style")
+    p.add_argument("--proxy", default="title", choices=PROXY_STYLES, help="query-proxy style")
     p.add_argument("--doc-pair-tokens", type=int, default=None, help="truncate anchor docs encoded for doc pairs")
     p.add_argument("--stage2-batch", type=int, default=None, help="Stage-2 candidate mini-batch size (default: the engine's; 0: full batch)")
     p.add_argument("--stage2-tau-scale", type=float, default=None, help="Stage-2 temperature relative to the teacher score s.d., on every index (ablation)")

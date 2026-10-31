@@ -50,3 +50,13 @@ def test_bundle_roundtrip(tmp_path, world):
     assert loaded.anchor_query_texts == world.bundle.anchor_query_texts
     np.testing.assert_array_equal(loaded.X_query_raw, world.bundle.X_query_raw)
     np.testing.assert_array_equal(loaded.mu_x_doc, world.bundle.mu_x_doc)
+
+
+def test_query_proxy_is_the_title_when_it_is_long_enough():
+    text = "Lead sentence of the abstract. " + " ".join(f"word{i}" for i in range(80))
+    assert extract_query_proxy("Clinical features of a viral infection in adults", text) == "Clinical features of a viral infection in adults"
+    long_title = " ".join(f"t{i}" for i in range(30))
+    assert count_tokens(extract_query_proxy(long_title, text)) == 16
+    assert extract_query_proxy("Meme", text).startswith("Meme\nLead sentence")  # short titles keep the lead
+    assert extract_query_proxy("Clinical features of a viral infection", text, title_min_tokens=None).startswith(
+        "Clinical features of a viral infection\nLead sentence")

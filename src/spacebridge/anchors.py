@@ -1,6 +1,7 @@
 """Anchor selection, query-proxy extraction, and fixed calibration splits (design §4.1)."""
 
 import re
+from typing import Optional
 
 import numpy as np
 import torch
@@ -114,8 +115,20 @@ def _truncate_tokens(text: str, max_tokens: int) -> str:
     return text
 
 
-def extract_query_proxy(title: str, text: str, min_tokens: int = 32, max_tokens: int = 64) -> str:
-    """Title plus lead sentence(s), extended to at least ``min_tokens`` and cut at ``max_tokens``."""
+def extract_query_proxy(
+    title: str, text: str, min_tokens: int = 32, max_tokens: int = 64,
+    title_min_tokens: Optional[int] = 4, title_max_tokens: int = 16,
+) -> str:
+    """The title alone when it has at least ``title_min_tokens`` tokens (cut at ``title_max_tokens``);
+    otherwise title plus lead sentence(s), extended to at least ``min_tokens`` and cut at ``max_tokens``.
+
+    Titles are human-written summaries shaped like queries. With title proxies Stage 2 learns "query-like
+    text -> its document" instead of "lead sentence -> its document": +4.7 to +8.6 points Recall@30 on
+    trec-covid, +0.4 to +3.4 on scidocs / nq / hotpotqa, about 0 on arguana (M3). ``title_min_tokens=None``
+    gives the title + lead proxy for every document.
+    """
+    if title_min_tokens is not None and title and count_tokens(title) >= title_min_tokens:
+        return _truncate_tokens(title.strip(), title_max_tokens)
     parts = [title.strip()] if title and title.strip() else []
     n = sum(count_tokens(p) for p in parts)
     has_sentence = False

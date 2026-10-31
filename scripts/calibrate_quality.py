@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
+from difficulty_features import feature_key
 from spacebridge.quality import CALIBRATION_PATH
 
 TARGET = "recall@30"
@@ -39,8 +40,7 @@ def load(paths: list[Path], extra: dict | None = None) -> list[dict]:
             r = json.loads(line)
             if r["row"] in ROWS and "quality" in r.get("fit", {}) and "reranker" not in r:
                 if extra is not None:  # index-only difficulty features (scripts/difficulty_features.py)
-                    version = "sklearn" if path.name.startswith(("m2_", "m2d_")) else "tkm"
-                    f = extra.get((r["dataset"], r["src"], r["K"], r.get("seed", 0), version))
+                    f = extra.get(feature_key(r, path))
                     if f is None:
                         continue
                     r["fit"]["quality"]["corpus"] = f
