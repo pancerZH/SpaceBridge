@@ -190,7 +190,7 @@ def run_pair(
             bridge = SpaceBridge(
                 device=device, restore_source_mean=restore, match_residual_norm=row not in ("6n", "8n"),
                 hard_negatives=10 if row == "8h" else 0, doc_pairs=row in doc_rows,
-                **({"refine_config": RefineConfig(batch_candidates=stage2_batch)} if stage2_batch else {}),
+                **({"refine_config": RefineConfig(batch_candidates=stage2_batch or None)} if stage2_batch is not None else {}),
             )
             extra = {"Y_doc_raw": doc_rows[row]} if row in doc_rows else {}
             fit = bridge.fit(bundle, anchor_Y[y_kind], mode=mode, pairs=pairs, X_distractor=X_distractor, **extra)
@@ -207,7 +207,7 @@ def run_pair(
     base = {"dataset": ds.name, "src": src_key, "tgt": tgt_key, "K": K, "seed": seed, "n_queries": len(ds.queries)}
     if proxy != "lead":
         base["proxy"] = proxy
-    if stage2_batch:
+    if stage2_batch is not None:
         base["stage2_batch"] = stage2_batch
     if doc_pair_tokens:
         base["doc_pair_tokens"] = doc_pair_tokens
@@ -367,7 +367,7 @@ def main() -> None:
                    help="re-encode anchors uncached to time the mount, and time the projection (use an idle GPU)")
     p.add_argument("--proxy", default="lead", choices=PROXY_STYLES, help="query-proxy style")
     p.add_argument("--doc-pair-tokens", type=int, default=None, help="truncate anchor docs encoded for doc pairs")
-    p.add_argument("--stage2-batch", type=int, default=None, help="Stage-2 candidate mini-batch size (default: engine's)")
+    p.add_argument("--stage2-batch", type=int, default=None, help="Stage-2 candidate mini-batch size (default: the engine's; 0: full batch)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", type=Path, default=Path("outputs/results.jsonl"))
     args = p.parse_args()

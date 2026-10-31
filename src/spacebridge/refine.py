@@ -22,8 +22,10 @@ class RefineConfig:
     patience: int = 50  # stop after this many steps without a validation improvement
     early_stop: bool = True  # False: run all steps and return the final W (validation is only logged)
     # Stage 2 is full-batch (rows x candidates logits). With more candidates than this, each step trains on
-    # a random subset of this many candidates and the rows whose positive is in it. None: always full batch.
-    batch_candidates: Optional[int] = None
+    # a random subset of this many candidates and the rows whose positive is in it, so the per-step cost stays
+    # at the default K = 2,048 level (1,638 training anchors). At K = 4,096 this takes Row 8b from 454 to 199 ms
+    # (fiqa) at -0.4 / +0.1 points Recall@30 (fiqa / scidocs, 3 seeds). None: always full batch.
+    batch_candidates: Optional[int] = 1638
 
 
 def refine(
