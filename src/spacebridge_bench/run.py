@@ -112,6 +112,7 @@ def cached_anchors(ds: RetrievalDataset, src_key: str, E_src: np.ndarray, allowe
 def run_pair(
     ds: RetrievalDataset, src_key: str, tgt_key: str, K: int, seed: int, rows: list[str], device: str,
     rerankers: tuple[str, ...] = (), proxy: str = "lead", stage2_batch: Optional[int] = None,
+    doc_pair_tokens: Optional[int] = None,
 ) -> list[dict]:
     src, tgt = MODELS[src_key], MODELS[tgt_key]
     K = min(K, ds.N - int((ds.self_rows >= 0).sum()))
@@ -149,8 +150,12 @@ def run_pair(
         bank_src, bank_q = load_shift_bank(ds.query_lang)
         Y_bank_src, Y_bank_q = enc.queries(bank_src, ds.task), enc.queries(bank_q, ds.task)
     mount["projected_encode_ms_K2048"] = mount["encode_ms"] * 2048 / K
+    Y_doc_pairs = None
     if {"8b", "7b"} & needs:
-        _, doc_mount = enc.timed_encode([tgt.format_doc(ds.titles[i], ds.texts[i]) for i in anchor_ids])
+        if doc_pair_tokens:  # cheaper mount: anchor docs for doc pairs encoded truncated
+            enc.model.max_seq_length = doc_pair_tokens
+        Y_doc_pairs, doc_mount = enc.timed_encode([tgt.format_doc(ds.titles[i], ds.texts[i]) for i in anchor_ids])
+        enc.model.max_seq_length = tgt.max_seq_length
         mount.update({f"doc_{k}": v for k, v in doc_mount.items()})
     enc.unload()
 
@@ -159,7 +164,8 @@ def run_pair(
     native_pq, oracle_pq = per_query(native_ranked, ds.qrels), per_query(oracle_ranked, ds.qrels)
     anchor_Y = {"src_query": bundle.X_query_raw, "tgt_query": Y_query, "tgt_doc": E_tgt[anchor_ids]}
     # Rows that run the default engine (doc<->doc pairs on); the identity row pairs source docs with themselves.
-    doc_rows = {"1": bundle.X_doc_raw, "8b": anchor_Y["tgt_doc"], "7b": anchor_Y["tgt_doc"]}
+    Y_doc = Y_doc_pairs if doc_pair_tokens else anchor_Y["tgt_doc"]
+    doc_rows = {"1": bundle.X_doc_raw, "8b": Y_doc, "7b": Y_doc}
     X_distractor = E_src[bundle.distractor_ids]
 
     global _warm
@@ -192,6 +198,8 @@ def run_pair(
         base["proxy"] = proxy
     if stage2_batch:
         base["stage2_batch"] = stage2_batch
+    if doc_pair_tokens:
+        base["doc_pair_tokens"] = doc_pair_tokens
     records = []
     for row in (r for r in rows if r not in RERANK_DEPTH):
         if row in ("0c", "7", "7b") and not ds.query_lang:
@@ -343,6 +351,7 @@ def main() -> None:
     p.add_argument("--K", type=int, nargs="*", default=[2048], help="anchor budget(s); one run per value")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--proxy", default="lead", choices=PROXY_STYLES, help="query-proxy style")
+    p.add_argument("--doc-pair-tokens", type=int, default=None, help="truncate anchor docs encoded for doc pairs")
     p.add_argument("--stage2-batch", type=int, default=None, help="Stage-2 candidate mini-batch size (default: engine's)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", type=Path, default=Path("outputs/results.jsonl"))
@@ -359,7 +368,8 @@ def main() -> None:
     ds = load_beir(args.dataset)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     for (src, tgt), K in ((pr, K) for pr in pairs for K in args.K):
-        records = run_pair(ds, src, tgt, K, args.seed, args.rows, args.device, tuple(args.rerankers), args.proxy, args.stage2_batch)
+        records = run_pair(ds, src, tgt, K, args.seed, args.rows, args.device, tuple(args.rerankers), args.proxy, args.stage2_batch,
+                           args.doc_pair_tokens)
         with args.out.open("a") as f:
             for rec in records:
                 f.write(json.dumps(rec, default=_json_default) + "\n")
