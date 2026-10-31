@@ -118,6 +118,7 @@ def run_pair(
     ds: RetrievalDataset, src_key: str, tgt_key: str, K: int, seed: int, rows: list[str], device: str,
     rerankers: tuple[str, ...] = (), proxy: str = "title", stage2_batch: Optional[int] = None,
     doc_pair_tokens: int = DOC_PAIR_TOKENS, time_mount: bool = False, stage2_tau_scale: Optional[float] = None,
+    stage2_curves: bool = False, stage2_rule: Optional[str] = None,
 ) -> list[dict]:
     src, tgt = MODELS[src_key], MODELS[tgt_key]
     K = min(K, ds.N - int((ds.self_rows >= 0).sum()))
@@ -197,6 +198,8 @@ def run_pair(
                 refine_config=RefineConfig(
                     **({"batch_candidates": stage2_batch or None} if stage2_batch is not None else {}),
                     **({"tau_scale": stage2_tau_scale, "tau_scale_below_sd": float("inf")} if stage2_tau_scale else {}),
+                    **({"stop_rule": stage2_rule} if stage2_rule else {}),
+                    keep_checkpoints=stage2_curves,
                 ),
             )
             extra = {"Y_doc_raw": doc_rows[row]} if row in doc_rows else {}
@@ -217,6 +220,8 @@ def run_pair(
         base["stage2_batch"] = stage2_batch
     if stage2_tau_scale:
         base["stage2_tau_scale"] = stage2_tau_scale
+    if stage2_rule:
+        base["stage2_rule"] = stage2_rule
     base["doc_pair_tokens"] = doc_pair_tokens  # records without this field (before the M3 budget decision) used 0
     records = []
     for row in (r for r in rows if r not in RERANK_DEPTH):
@@ -234,6 +239,12 @@ def run_pair(
             pq = per_query(ranked, ds.qrels)
             if row != "1" and mount is not None:
                 rec["mount"] = mount
+            if bridge.stage2_checkpoints:
+                rec["stage2_real"] = _checkpoint_study(
+                    bridge, Q_src if row == "1" else Q_tgt, ds.query_lang if row in ("7", "7b") else None,
+                    lambda Q: per_query(search(Q, E_src, SEARCH_K, device, exclude=ds.self_rows), ds.qrels),
+                    native_pq if row == "1" else None, native_pq, oracle_pq,
+                )
             if bridge.quality is not None and row != "1":
                 q = bridge.quality
                 rec["quality"] = {"score": q.score, "band": q.band, "grade": q.grade, "rerank_pool": q.rerank_pool, "notes": q.notes}
@@ -278,6 +289,30 @@ def _score_record(rec: dict, pq: dict, native_pq: dict, oracle_pq: dict) -> dict
     rec["rho_oracle"], rec["rho_ceil"] = retention(rec["metrics"], native, oracle)
     rec["rho_native"] = {m: v / native[m] if native[m] > 0 else float("nan") for m, v in rec["metrics"].items()}
     return rec
+
+
+def _checkpoint_study(bridge: SpaceBridge, Q: np.ndarray, lang: Optional[str], evaluate, ref_pq, native_pq, oracle_pq) -> dict:
+    """Real test retention of every Stage-2 checkpoint, and of two checkpoint averages (stop-rule studies).
+
+    Retention is against ``ref_pq`` (native, for the identity row) or the ceiling min(native, oracle)."""
+    def rho(pq):
+        out = {}
+        for m in ("recall@30", "ndcg@10"):
+            ref = ref_pq[m] if ref_pq is not None else (
+                native_pq[m] if native_pq[m].mean() <= oracle_pq[m].mean() else oracle_pq[m])
+            out[m] = float(pq[m].mean() / ref.mean())
+        return out
+
+    W_sel = bridge.W
+    Ws = dict(bridge.stage2_checkpoints)
+    variants = {**{str(s): W for s, W in Ws.items()}, "avg_all": np.mean(list(Ws.values()), 0),
+                "avg_10_50": np.mean([W for s, W in Ws.items() if s > 0], 0)}
+    out = {}
+    for name, W in variants.items():
+        bridge.W = W
+        out[name] = rho(evaluate(bridge.transform_query(Q, query_lang=lang)))
+    bridge.W = W_sel
+    return out
 
 
 def _confidence_study(
@@ -378,6 +413,9 @@ def main() -> None:
                    help="truncate anchor docs encoded for doc pairs to this many tokens (0: full length)")
     p.add_argument("--stage2-batch", type=int, default=None, help="Stage-2 candidate mini-batch size (default: the engine's; 0: full batch)")
     p.add_argument("--stage2-tau-scale", type=float, default=None, help="Stage-2 temperature relative to the teacher score s.d., on every index (ablation)")
+    p.add_argument("--stage2-curves", action="store_true",
+                   help="score every Stage-2 checkpoint on the test queries (stop-rule studies; records stage2_real)")
+    p.add_argument("--stage2-rule", default=None, help="Stage-2 checkpoint selection rule (default: the engine's)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", type=Path, default=Path("outputs/results.jsonl"))
     args = p.parse_args()
@@ -394,7 +432,7 @@ def main() -> None:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     for seed, (src, tgt), K in ((s, pr, K) for s in args.seed for pr in pairs for K in args.K):
         records = run_pair(ds, src, tgt, K, seed, args.rows, args.device, tuple(args.rerankers), args.proxy, args.stage2_batch,
-                           args.doc_pair_tokens, args.time_mount, args.stage2_tau_scale)
+                           args.doc_pair_tokens, args.time_mount, args.stage2_tau_scale, args.stage2_curves, args.stage2_rule)
         with args.out.open("a") as f:
             for rec in records:
                 f.write(json.dumps(rec, default=_json_default) + "\n")

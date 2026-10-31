@@ -2,7 +2,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -26,13 +26,31 @@ class RefineConfig:
     kl_scale: float = 1.0
     beta: Optional[float] = None  # None: 1e-3, or 1e-2 when d_t > K_train
     eval_every: int = 10
-    patience: int = 50  # stop after this many steps without a validation improvement
     early_stop: bool = True  # False: run all steps and return the final W (validation is only logged)
+    # Checkpoint selection (``select_checkpoint``): "floor" keeps the checkpoint with the best held-out own-doc
+    # MRR among those keeping min_agree_ratio of step 0's teacher agree@10 (the M2 rule).
+    stop_rule: str = "floor"
+    min_agree_ratio: float = 0.9
+    keep_checkpoints: bool = False  # studies: also return every checkpoint's W (info["checkpoints"])
     # Stage 2 is full-batch (rows x candidates logits). With more candidates than this, each step trains on
     # a random subset of this many candidates and the rows whose positive is in it, so the per-step cost stays
     # at the default K = 2,048 level (1,638 training anchors). At K = 4,096 this takes Row 8b from 454 to 199 ms
     # (fiqa) at -0.4 / +0.1 points Recall@30 (fiqa / scidocs, 3 seeds). None: always full batch.
     batch_candidates: Optional[int] = 1638
+
+
+def floor_scores(curve: Sequence[tuple[int, dict]], min_agree_ratio: float) -> list[float]:
+    """Own-doc MRR of each checkpoint, or -inf when it keeps less than ``min_agree_ratio`` of step 0's agree@10."""
+    floor = min_agree_ratio * curve[0][1]["agree"]
+    return [s["mrr"] if s["agree"] >= floor else -math.inf for _, s in curve]
+
+
+def select_checkpoint(curve: Sequence[tuple[int, dict]], cfg: RefineConfig) -> int:
+    """Index into ``curve`` (``(step, signals)`` with step 0 first) of the checkpoint Stage 2 returns."""
+    if cfg.stop_rule == "floor":
+        scores = floor_scores(curve, cfg.min_agree_ratio)
+        return max(range(len(scores)), key=lambda i: (scores[i], -i))  # first best: ties keep the earlier step
+    raise ValueError(f"unknown Stage-2 stop rule {cfg.stop_rule!r}")
 
 
 def refine(
@@ -41,16 +59,17 @@ def refine(
     Yc_train: torch.Tensor,
     Xq_train: torch.Tensor,
     Xd_train: torch.Tensor,
-    val_score: Callable[[torch.Tensor], float],
+    val_signals: Callable[[torch.Tensor], dict],
     cfg: RefineConfig = RefineConfig(),
     labels: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict]:
-    """Optimizes W against anchor docs with the deployed affine map; returns the best-on-val W.
+    """Optimizes W against anchor docs with the deployed affine map; returns the selected checkpoint's W.
 
     Row i of ``Yc_train`` / ``Xq_train`` (and of ``mu_x`` when it is 2-D) is a training query whose
     positive candidate is ``Xd_train[labels[i]]``; ``labels`` defaults to the diagonal.
-    ``val_score`` maps a candidate W to a higher-is-better validation score; step 0 (W0) is a
-    candidate, so refinement can never make validation worse.
+    ``val_signals`` maps a candidate W to label-free validation signals (``agree``: teacher agree@10,
+    ``mrr``: own-doc MRR, on held-out proxies); every ``eval_every`` steps a checkpoint is scored and
+    ``select_checkpoint`` picks one from the whole curve. Step 0 (W0) is a candidate.
     """
     K_train, d_t = Yc_train.shape
     beta = cfg.beta if cfg.beta is not None else (1e-2 if d_t > K_train else 1e-3)
@@ -71,8 +90,7 @@ def refine(
     opt = torch.optim.AdamW([W], lr=cfg.lr, weight_decay=0.0)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda t: 0.5 * (1 + math.cos(math.pi * t / cfg.steps)))
 
-    best_score, best_step, best_W = val_score(W0), 0, W0.clone()
-    curve = [(0, best_score)]
+    curve, Ws = [(0, val_signals(W0))], [W0.clone()]
     for step in range(1, cfg.steps + 1):
         mu_b, Y_b, cand, lab, t = mu_x, Yc_train, Xd_train, labels, teacher
         if batch is not None:
@@ -94,19 +112,17 @@ def refine(
 
         if step % cfg.eval_every == 0 or step == cfg.steps:
             with torch.no_grad():
-                score = val_score(W.detach())
-            curve.append((step, score))
-            if not cfg.early_stop:
-                continue
-            if score > best_score:
-                best_score, best_step, best_W = score, step, W.detach().clone()
-            elif step - best_step >= cfg.patience:
-                break
+                curve.append((step, val_signals(W.detach())))
+            Ws.append(W.detach().clone())
 
-    if not cfg.early_stop:
-        best_step, best_W, best_score = step, W.detach().clone(), curve[-1][1]
-
-    return best_W, {
-        "best_step": best_step, "best_val": best_score, "val_curve": curve, "beta": beta, "steps_run": step, "tau": tau,
+    best = select_checkpoint(curve, cfg) if cfg.early_stop else len(curve) - 1
+    floor = floor_scores(curve, cfg.min_agree_ratio)
+    info = {
+        "best_step": curve[best][0], "val_curve": curve, "beta": beta, "steps_run": step, "tau": tau,
         "teacher_sd": sd, "tau_scaled": tau != cfg.tau,
+        "mrr_gain": curve[best][1]["mrr"] - curve[0][1]["mrr"],
+        "floor_rejected": sum(v == -math.inf for v in floor[1:]) / max(len(floor) - 1, 1),
     }
+    if cfg.keep_checkpoints:
+        info["checkpoints"] = list(zip((s for s, _ in curve), Ws))
+    return Ws[best], info

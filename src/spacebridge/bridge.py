@@ -1,6 +1,5 @@
 """The SpaceBridge query-side alignment engine (design §4.2–§6)."""
 
-import math
 import time
 import warnings
 from typing import Dict, Literal, Optional
@@ -23,7 +22,6 @@ Pairs = Literal["query", "doc"]
 HIGH_CONFIDENCE = 0.58
 MODERATE_DRIFT = 0.40
 VAL_K = 10
-STAGE2_MIN_AGREE_RATIO = 0.9  # Stage-2 steps must keep this share of Stage 1's teacher agree@10
 SUPPORT_K = 5
 
 
@@ -107,6 +105,7 @@ class SpaceBridge:
         self.status: str = "uninitialized"
         self.metrics: Dict[str, float] = {}
         self.quality: Optional[QualityReport] = None
+        self.stage2_checkpoints: list[tuple[int, np.ndarray]] = []  # with RefineConfig(keep_checkpoints=True)
         self._support_anchors: Optional[np.ndarray] = None  # (K_train, d_t) unit-norm centered target proxies
         self._conf_map: Optional[tuple[np.ndarray, np.ndarray]] = None  # isotonic support -> agreement knots
 
@@ -170,13 +169,16 @@ class SpaceBridge:
         def val_score(W: torch.Tensor) -> float:
             return topk_agreement(self._project(Y[va], mu_y, mu_x, W), sel_pool, sel_teacher)
 
-        def owndoc_score(W: torch.Tensor) -> float:  # anchor docs are the first rows of sel_pool
+        def stage2_signals(W: torch.Tensor) -> dict:  # anchor docs are the first rows of sel_pool
             # Own-doc MRR alone rewards pulling proxies onto their own docs (on the identity it trades
-            # 20 points of agree@10 for +0.4 MRR), so steps that give up the source geometry are rejected.
+            # 20 points of agree@10 for +0.4 MRR), so the stop rule also watches teacher agreement.
             Q = self._project(Y[va], mu_y, mu_x, W)
-            if topk_agreement(Q, sel_pool, sel_teacher) < STAGE2_MIN_AGREE_RATIO * stage1_agree:
-                return -math.inf
-            return retrieval_stats(Q, sel_pool, va)["mrr"]
+            out = {"agree": topk_agreement(Q, sel_pool, sel_teacher), "mrr": retrieval_stats(Q, sel_pool, va)["mrr"]}
+            if Y_doc_raw is not None and self.refine_config.keep_checkpoints:  # held-out doc pairs (studies)
+                Qd = F.normalize((Yd_va - Yd_mu) @ W + (mu_xd if self.restore_source_mean else 0.0), dim=-1)
+                out["doc_agree"] = topk_agreement(Qd, sel_pool, doc_teacher)
+                out["doc_mrr"] = retrieval_stats(Qd, sel_pool, va)["mrr"]
+            return out
 
         info: Dict[str, float] = {"mode": mode, "pairs": pairs}
         self._sync()
@@ -191,8 +193,10 @@ class SpaceBridge:
             Y_fit, X_fit = Yc[tr], Xc[tr]
             if Y_doc_raw is not None:
                 Yd = self._t(Y_doc_raw)[tr]
-                mu_xd = Xd[tr].mean(0)
-                Ydc, Xdc = Yd - Yd.mean(0), Xd[tr] - mu_xd
+                mu_xd, Yd_mu = Xd[tr].mean(0), Yd.mean(0)
+                Ydc, Xdc = Yd - Yd_mu, Xd[tr] - mu_xd
+                Yd_va = self._t(Y_doc_raw)[va]
+                doc_teacher = (Xd[va] @ sel_pool.T).topk(min(VAL_K, sel_pool.shape[0]), dim=1).indices
                 Y_fit, X_fit = torch.cat([Y_fit, Ydc]), torch.cat([X_fit, Xdc])
                 info["doc_pairs"] = len(tr)
             if self.match_residual_norm:
@@ -210,7 +214,7 @@ class SpaceBridge:
                 for lam_rel, W_r in ridge_path(Y_fit, X_fit, self.lambdas_rel):
                     W_r = rescale(W_r)
                     candidates.append((val_score(W_r), W_r, {"solver": "ridge", "lambda_rel": lam_rel}))
-            stage1_agree, W, chosen = max(candidates, key=lambda c: c[0])
+            _, W, chosen = max(candidates, key=lambda c: c[0])
             info.update(chosen)
         self._sync()
         info["stage1_ms"] = 1e3 * (time.perf_counter() - t0)
@@ -227,17 +231,18 @@ class SpaceBridge:
                 labels = torch.cat([labels, labels])
             # Stopping signal: held-out own-doc MRR under the agreement floor. Stage 2 lowers teacher agreement even
             # when it improves real retention, so stopping on agree@10 (the v2 signal) stopped it at step 0 (M2).
-            W, r_info = refine(W, mu_rows, Y_rows, teacher_rows, Xd[tr], owndoc_score, self.refine_config, labels)
+            W, r_info = refine(W, mu_rows, Y_rows, teacher_rows, Xd[tr], stage2_signals, self.refine_config, labels)
             self._sync()
             info["stage2_ms"] = 1e3 * (time.perf_counter() - t0)
             info["stage2_best_step"] = r_info["best_step"]
             info["stage2_steps_run"] = r_info["steps_run"]
             info["stage2_tau"] = r_info["tau"]
-            info["stage2_gain"] = r_info["best_val"] - r_info["val_curve"][0][1]
-            checks = [v for step, v in r_info["val_curve"] if step > 0]
-            info["stage2_floor_rejected"] = sum(v == -math.inf for v in checks) / max(len(checks), 1)
+            info["stage2_gain"] = r_info["mrr_gain"]
+            info["stage2_floor_rejected"] = r_info["floor_rejected"]
+            info["stage2_curve"] = [{"step": s, **sig} for s, sig in r_info["val_curve"]]
             info["stage2_teacher_sd"] = r_info["teacher_sd"]
             info["stage2_tau_scaled"] = bool(r_info["tau_scaled"])
+            self.stage2_checkpoints = [(s, Wk.cpu().numpy()) for s, Wk in r_info.get("checkpoints", [])]
 
         self.src_lang = bundle.src_lang
         self.W = W.cpu().numpy()

@@ -163,23 +163,20 @@ def test_stage2_temperature_follows_compressed_teacher_scores(world):
     assert scaled["stage2_tau"] == pytest.approx(0.6 * sd, rel=1e-3)
 
 
-def test_stage2_health_flags_blocked_and_compressed_fits(world, monkeypatch):
-    import spacebridge.bridge as bridge_mod
-
+def test_stage2_health_flags_blocked_and_compressed_fits(world):
     cfg = RefineConfig(steps=20)
     healthy, info = _fit(world, world.Y_query, mode="auto", Y_doc_raw=world.Y_doc, refine_config=cfg)
     assert info["stage2_best_step"] > 0 and not info["stage2_tau_scaled"]
     assert healthy.quality_report().details["stage2"]["health_flag"] == 0.0
     assert not any("stage 2" in n or "compressed" in n for n in healthy.quality_report().notes)
 
-    monkeypatch.setattr(bridge_mod, "STAGE2_MIN_AGREE_RATIO", 2.0)  # the floor rejects every checkpoint
-    blocked, info = _fit(world, world.Y_query, mode="auto", Y_doc_raw=world.Y_doc, refine_config=cfg)
+    blocked, info = _fit(world, world.Y_query, mode="auto", Y_doc_raw=world.Y_doc,
+                         refine_config=RefineConfig(steps=20, min_agree_ratio=2.0))  # the floor rejects every checkpoint
     h = blocked.quality_report().details["stage2"]
     assert info["stage2_best_step"] == 0 and info["stage2_floor_rejected"] == 1.0
     assert h["blocked"] == h["health_flag"] == 1.0 and h["compressed_scores"] == 0.0
     assert any("stage 2 blocked" in n for n in blocked.quality_report().notes)
     assert blocked.quality_report().rerank_pool == 100
-    monkeypatch.undo()
 
     compressed, info = _fit(world, world.Y_query, mode="auto", Y_doc_raw=world.Y_doc,
                             refine_config=RefineConfig(steps=20, tau_scale_below_sd=float("inf")))
