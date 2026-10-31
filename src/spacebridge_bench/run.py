@@ -85,17 +85,17 @@ ANCHOR_CACHE = Path("data/cache/anchors")
 _warm = False
 RERANK_DEPTH = {"9n": 30, "9": 60, "9w": 100}
 CI_METRICS = ("recall@30", "ndcg@5", "ndcg@10")
-PROXY_STYLES = ("lead", "short")
+PROXY_STYLES = ("lead", "short", "title")
 
 
 def make_proxy(title: str, text: str, style: str = "lead") -> str:
-    """``lead``: the design's title + lead sentence (32-64 tokens). ``short``: closer to keyword / question
-    queries: the title alone when it has >= 4 tokens, else title + lead cut to 16 tokens."""
-    if style == "lead":
-        return extract_query_proxy(title, text)
-    if title and count_tokens(title) >= 4:
+    """``lead``: the design's title + lead sentence (32-64 tokens). ``title``: the title alone when it has
+    >= 4 tokens, else ``lead``. ``short``: like ``title``, but the fallback is cut to 16 tokens."""
+    if style != "lead" and title and count_tokens(title) >= 4:
         return _truncate_tokens(title.strip(), 16)
-    return extract_query_proxy(title, text, min_tokens=4, max_tokens=16)
+    if style == "short":
+        return extract_query_proxy(title, text, min_tokens=4, max_tokens=16)
+    return extract_query_proxy(title, text)
 
 
 def cached_anchors(ds: RetrievalDataset, src_key: str, E_src: np.ndarray, allowed: np.ndarray, K: int, seed: int) -> np.ndarray:
