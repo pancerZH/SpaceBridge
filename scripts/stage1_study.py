@@ -41,9 +41,16 @@ def run(args) -> None:
         enc.unload()
     evaluate = lambda Q, E: per_query(search(Q, E, 100, args.device, exclude=ds.self_rows), ds.qrels)
     allowed = np.setdiff1d(np.arange(ds.N), ds.self_rows)
+    done = defaultdict(set)  # resume: fits with every candidate already recorded are skipped
+    if args.out.exists():
+        for line in args.out.open():
+            r = json.loads(line)
+            done[r["dataset"], r["src"], r["tgt"], r["K"], r["seed"]].add((r["op"], r["lambda_rel"]))
 
     with args.out.open("a") as f:
         for (src, tgt), K, seed in ((pr, K, s) for pr in pairs for K in args.K for s in args.seeds):
+            if len(done[args.dataset, src, tgt, K, seed]) == len(CANDIDATES):
+                continue
             E, E_t = emb[src]["docs"], emb[tgt]["docs"]
             ids = cached_anchors(ds, src, E, allowed, K, seed)
             proxies = [extract_query_proxy(ds.titles[i], ds.texts[i]) for i in ids]
@@ -76,15 +83,15 @@ def run(args) -> None:
 
 
 def summarize(paths: list[Path], metric: str) -> None:
-    fits = defaultdict(list)
+    fits = defaultdict(dict)
     for p in paths:
         for line in p.open():
             r = json.loads(line)
-            fits[r["dataset"], r["src"], r["tgt"], r["K"], r["seed"]].append(r)
+            fits[r["dataset"], r["src"], r["tgt"], r["K"], r["seed"]][r["op"], r["lambda_rel"]] = r  # last run wins
     by_ds = defaultdict(list)
     for key, cands in fits.items():
         if len(cands) == len(CANDIDATES):
-            by_ds[key[0]].append(cands)
+            by_ds[key[0]].append(list(cands.values()))
     for stage in ("stage1", "auto"):
         print(f"\n## Real {metric} ρceil of the candidate each signal picks ({'Stage 1 only' if stage == 'stage1' else 'after Stage 2'}), points vs. the agree@10 pick\n")
         print("Signals are measured on the Stage-1 map in both cases (that is when selection happens).\n")
