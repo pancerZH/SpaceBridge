@@ -81,8 +81,8 @@ CI_METRICS = ("recall@30", "ndcg@5", "ndcg@10")
 
 
 def cached_anchors(ds: RetrievalDataset, src_key: str, E_src: np.ndarray, allowed: np.ndarray, K: int, seed: int) -> np.ndarray:
-    """Anchor doc rows, cached on disk: k-means at K ~ N/2 takes CPU-hours and repeats for every pair."""
-    path = ANCHOR_CACHE / f"{ds.name}_{src_key}_N{ds.N}_n{len(allowed)}_K{K}_s{seed}.npy"
+    """Anchor doc rows, cached on disk so every pair and row of a dataset reuses one selection."""
+    path = ANCHOR_CACHE / f"{ds.name}_{src_key}_N{ds.N}_n{len(allowed)}_K{K}_s{seed}_tkm.npy"  # _tkm: torch k-means
     if path.exists():
         return np.load(path)
     ids = allowed[select_anchors(E_src[allowed], K, seed)]

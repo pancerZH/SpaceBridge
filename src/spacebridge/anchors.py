@@ -3,7 +3,7 @@
 import re
 
 import numpy as np
-from sklearn.cluster import MiniBatchKMeans
+import torch
 
 FPS_THRESHOLD = 5_000
 MAX_DISTRACTORS = 50_000
@@ -17,7 +17,7 @@ def _l2(a: np.ndarray) -> np.ndarray:
     return a / (np.linalg.norm(a, axis=-1, keepdims=True) + 1e-12)
 
 
-def select_anchors(E: np.ndarray, K: int, seed: int = 0) -> np.ndarray:
+def select_anchors(E: np.ndarray, K: int, seed: int = 0, device: str = "cuda") -> np.ndarray:
     """Returns K distinct row ids of E: k-means medoids when N >= 5,000, farthest-point sampling below."""
     N = E.shape[0]
     if not 0 < K <= N:
@@ -27,9 +27,37 @@ def select_anchors(E: np.ndarray, K: int, seed: int = 0) -> np.ndarray:
     E = _l2(np.asarray(E, dtype=np.float32))
     if N < FPS_THRESHOLD:
         return _farthest_point(E, K, seed)
-    km = MiniBatchKMeans(n_clusters=K, batch_size=max(4096, 4 * K), n_init=1, random_state=seed)
-    km.fit(E)
-    return _unique_medoids(E, _l2(km.cluster_centers_.astype(np.float32)))
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        device = "cpu"
+    return _unique_medoids(E, _spherical_kmeans(E, K, seed, device))
+
+
+def _spherical_kmeans(E: np.ndarray, K: int, seed: int, device: str, iters: int = 20, chunk: int = 16_384) -> np.ndarray:
+    """Unit-norm k-means centroids: k-means++ seeding, then full-batch Lloyd steps in torch.
+
+    Replaces sklearn MiniBatchKMeans, whose greedy k-means++ init (2 + ln K trials per center over
+    3 x batch_size >= 12K samples) grows with K^2 and took 46 of 47 s at K = 2,048 on fiqa.
+    """
+    X = torch.as_tensor(E, device=device)
+    N = X.shape[0]
+    gen = torch.Generator(device=device).manual_seed(seed)
+    ids = torch.empty(K, dtype=torch.long, device=device)
+    ids[0] = torch.randint(N, (1,), generator=gen, device=device)
+    dist = (1 - X @ X[ids[0]]).clamp_min_(0)  # squared Euclidean / 2 for unit vectors
+    for k in range(1, K):
+        ids[k] = torch.multinomial(dist, 1, generator=gen)[0]
+        dist = torch.minimum(dist, (1 - X @ X[ids[k]]).clamp_min_(0))
+    C = X[ids].clone()
+    assign = torch.full((N,), -1, dtype=torch.long, device=device)
+    for _ in range(iters):
+        new = torch.cat([(X[s : s + chunk] @ C.T).argmax(1) for s in range(0, N, chunk)])
+        if torch.equal(new, assign):
+            break
+        assign = new
+        sums = torch.zeros_like(C).index_add_(0, assign, X)
+        filled = sums.norm(dim=1) > 0  # empty clusters keep their previous centroid
+        C[filled] = torch.nn.functional.normalize(sums[filled], dim=-1)
+    return C.cpu().numpy()
 
 
 def _unique_medoids(E: np.ndarray, C: np.ndarray, n_cand: int = 8, chunk: int = 256) -> np.ndarray:
