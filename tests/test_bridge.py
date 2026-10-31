@@ -145,3 +145,10 @@ def test_stage2_hard_negatives_extend_candidates(world):
     n_train = len(world.bundle.train_idx)
     assert n_train < info["stage2_candidates"] <= n_train + 5 * n_train
     assert info["rho_val"] > 0.5
+
+
+def test_stage1_candidates_can_be_restricted(world):
+    _, info = _fit(world, world.Y_query, mode="stage1", stage1_operators=("ridge",), lambdas_rel=(5.0,))
+    assert info["solver"] == "ridge" and info["lambda_rel"] == 5.0
+    _, info = _fit(world, world.Y_query, mode="auto", stage1_operators=("stiefel",), refine_config=RefineConfig(steps=10))
+    assert info["solver"] == "stiefel" and "stage2_ms" in info

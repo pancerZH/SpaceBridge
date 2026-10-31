@@ -84,6 +84,8 @@ class SpaceBridge:
         hard_negatives: int = 0,
         stage2_signal: str = "owndoc_mrr",
         doc_pairs: bool = True,
+        stage1_operators: tuple[str, ...] = ("stiefel", "ridge"),
+        lambdas_rel: tuple[float, ...] = LAMBDAS_REL,
     ):
         if device.startswith("cuda") and not torch.cuda.is_available():
             device = "cpu"
@@ -103,6 +105,9 @@ class SpaceBridge:
         # Default mount (M2): ``auto`` fits also use doc<->doc pairs (Row 8b, best first stage on 5 of
         # 6 BEIR sets and on cross-lingual); False is the opt-out for ablation rows without them.
         self.doc_pairs = doc_pairs
+        # Stage-1 candidates for the ``stage1`` / ``auto`` modes (restricting them is for selection studies).
+        self.stage1_operators = stage1_operators
+        self.lambdas_rel = lambdas_rel
         self.src_lang: str = "en"
         self.mu_x_query: Optional[np.ndarray] = None
         self.mu_y_by_lang: Dict[str, np.ndarray] = {}
@@ -204,12 +209,13 @@ class SpaceBridge:
             else:
                 rescale = lambda W: W
             candidates = []
-            if mode != "ridge":
+            ops = self.stage1_operators if mode in ("stage1", "auto") else (mode,)
+            if "stiefel" in ops:
                 W_s, s_info = stiefel_procrustes(Y_fit, X_fit)
                 W_s = rescale(W_s)
                 candidates.append((val_score(W_s), W_s, {"solver": "stiefel", "rank": s_info["rank"], "scale": s_info["scale"]}))
-            if mode != "stiefel":
-                for lam_rel, W_r in ridge_path(Y_fit, X_fit, LAMBDAS_REL):
+            if "ridge" in ops:
+                for lam_rel, W_r in ridge_path(Y_fit, X_fit, self.lambdas_rel):
                     W_r = rescale(W_r)
                     candidates.append((val_score(W_r), W_r, {"solver": "ridge", "lambda_rel": lam_rel}))
             stage1_agree, W, chosen = max(candidates, key=lambda c: c[0])
