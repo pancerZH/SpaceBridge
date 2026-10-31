@@ -271,6 +271,11 @@ Approved routing (2026-10-30):
 
 The score is marked **experimental** until its regressor is shown to transfer to held-out datasets (leave-one-dataset-out error within the reported band on $\ge 4$ datasets, §7.1).
 
+> [!NOTE]
+> **Implementation finding (calibration, M2 P2):** fitted on 306 Stage-1/2 fits (6 pairs × 3 K × rows 6/8/8b) over six BEIR sets (`fiqa`, `nfcorpus`, `scidocs`, `arguana`, `nq`, `trec-covid`), weighted by each fit's bootstrap variance and validated leave-one-dataset-out. $\rho_{\text{val}}$ alone transfers best (LODO RMSE 4.3 points; a constant predicts with 6.5); adding all the measurements in the table below fits better in-sample but transfers worse (5.0), because the error is dominated by a per-dataset offset (e.g. `trec-covid` is over-predicted by 8 points, `nq` under-predicted by 5) that no calibration-only measurement captured. The shipped `quality_calibration.json` is therefore $\rho_{\text{val}}$-only with a ±4.3-point band; it is within its band on 4 of 6 held-out datasets (so not marked experimental), but grade boundaries are only ~2 bands apart, and within-dataset rank correlation of $\rho_{\text{val}}$ with retention ranges from 0.94 (`nq`) to ~0.1 (`arguana`, `trec-covid`). The detailed measurements are still reported as diagnostics.
+>
+> **Per-query confidence** (support = mean top-5 cosine to centered training proxies, isotonic map to per-proxy agree@10): the top support quintile has higher real `Recall@30` retention than the bottom on 82 of 102 fits across the six datasets (e.g. `fiqa` 0.83 → 0.90, `trec-covid` 0.72 → 0.92); Spearman with per-query native overlap@30 is 0.31–0.70. Useful for routing low-support queries to a wider rerank pool, not as a per-query guarantee.
+
 **Detailed mode: measurements grouped by what they diagnose.**
 
 | Group | Measurement (on held-out anchors unless noted) | Diagnoses |
