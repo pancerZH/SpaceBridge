@@ -13,19 +13,27 @@ from pathlib import Path
 
 import numpy as np
 
+from spacebridge_bench.run import TIERS
+
 
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("results", type=Path, nargs="+")
     p.add_argument("--metric", default="recall@30")
     p.add_argument("--compare", nargs="*", default=["6:8", "8:8b"], help="base:new row pairs")
+    p.add_argument("--by-tier", action="store_true", help="split every table by tier (pairs as in run.TIERS)")
     args = p.parse_args()
+    tier_of = {}
+    for t, prs in TIERS.items():  # first tier wins: Tier 5a reuses Tier 3 pairs
+        for pr in prs:
+            tier_of.setdefault(pr, t)
     by = {}
     for f in args.results:
         for line in f.open():
             r = json.loads(line)
             if "reranker" not in r:
-                by[(r["dataset"], r["K"], r["row"], r["src"], r["tgt"], r["seed"])] = r  # last run wins
+                ds = r["dataset"] + (f" T{tier_of.get((r['src'], r['tgt']), '?')}" if args.by_tier else "")
+            by[(ds, r["K"], r["row"], r["src"], r["tgt"], r["seed"])] = r  # last run wins
 
     def ret(r):  # identity is judged against native, everything else against the ceiling
         return (r["rho_native"] if r["row"] == "1" else r["rho_ceil"])[args.metric]
