@@ -152,3 +152,13 @@ def test_stage1_candidates_can_be_restricted(world):
     assert info["solver"] == "ridge" and info["lambda_rel"] == 5.0
     _, info = _fit(world, world.Y_query, mode="auto", stage1_operators=("stiefel",), refine_config=RefineConfig(steps=10))
     assert info["solver"] == "stiefel" and "stage2_ms" in info
+
+
+def test_stage2_candidate_minibatches_match_full_batch(world):
+    full, info_full = _fit(world, world.Y_query, mode="auto", Y_doc_raw=world.Y_doc, refine_config=RefineConfig(steps=30))
+    mini, info_mini = _fit(world, world.Y_query, mode="auto", Y_doc_raw=world.Y_doc,
+                           refine_config=RefineConfig(steps=30, batch_candidates=100))
+    assert len(world.bundle.train_idx) > 100  # the mini-batch path is exercised
+    a, b = top_k(full.transform_query(world.Q_tgt), world.E_src), top_k(mini.transform_query(world.Q_tgt), world.E_src)
+    assert overlap_at_k(a, b) > 0.8
+    assert info_mini["val_metrics"]["owndoc_mrr"] >= info_full["val_metrics"]["owndoc_mrr"] - 0.05

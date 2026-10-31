@@ -21,6 +21,9 @@ class RefineConfig:
     eval_every: int = 10
     patience: int = 50  # stop after this many steps without a validation improvement
     early_stop: bool = True  # False: run all steps and return the final W (validation is only logged)
+    # Stage 2 is full-batch (rows x candidates logits). With more candidates than this, each step trains on
+    # a random subset of this many candidates and the rows whose positive is in it. None: always full batch.
+    batch_candidates: Optional[int] = None
 
 
 def refine(
@@ -42,11 +45,15 @@ def refine(
     """
     K_train, d_t = Yc_train.shape
     beta = cfg.beta if cfg.beta is not None else (1e-2 if d_t > K_train else 1e-3)
-
-    with torch.no_grad():
-        teacher = F.log_softmax(Xq_train @ Xd_train.T / cfg.tau, dim=-1)
+    n_cand, dev = Xd_train.shape[0], W0.device
+    mu_x = mu_x.expand(K_train, -1) if mu_x.dim() == 1 else mu_x
     if labels is None:
-        labels = torch.arange(K_train, device=W0.device)
+        labels = torch.arange(K_train, device=dev)
+    batch = cfg.batch_candidates if cfg.batch_candidates and n_cand > cfg.batch_candidates else None
+    with torch.no_grad():
+        teacher_logits = Xq_train @ Xd_train.T / cfg.tau
+        teacher = F.log_softmax(teacher_logits, dim=-1) if batch is None else None
+    gen = torch.Generator(device=dev).manual_seed(0)
 
     W = W0.clone().requires_grad_(True)
     opt = torch.optim.AdamW([W], lr=cfg.lr, weight_decay=0.0)
@@ -55,10 +62,18 @@ def refine(
     best_score, best_step, best_W = val_score(W0), 0, W0.clone()
     curve = [(0, best_score)]
     for step in range(1, cfg.steps + 1):
-        q = F.normalize(mu_x + Yc_train @ W, dim=-1)
-        log_p = F.log_softmax(q @ Xd_train.T / cfg.tau, dim=-1)
-        ce = F.nll_loss(log_p, labels)
-        kl = F.kl_div(log_p, teacher, log_target=True, reduction="batchmean")
+        mu_b, Y_b, cand, lab, t = mu_x, Yc_train, Xd_train, labels, teacher
+        if batch is not None:
+            sel = torch.randperm(n_cand, generator=gen, device=dev)[:batch]
+            slot = torch.full((n_cand,), -1, dtype=torch.long, device=dev)
+            slot[sel] = torch.arange(batch, device=dev)
+            rows = (slot[labels] >= 0).nonzero().squeeze(1)
+            mu_b, Y_b, cand, lab = mu_x[rows], Yc_train[rows], Xd_train[sel], slot[labels[rows]]
+            t = F.log_softmax(teacher_logits[rows][:, sel], dim=-1)
+        q = F.normalize(mu_b + Y_b @ W, dim=-1)
+        log_p = F.log_softmax(q @ cand.T / cfg.tau, dim=-1)
+        ce = F.nll_loss(log_p, lab)
+        kl = F.kl_div(log_p, t, log_target=True, reduction="batchmean")
         loss = (1 - cfg.alpha) * ce + cfg.alpha * cfg.kl_scale * kl + beta * (W - W0).pow(2).sum()
         opt.zero_grad(set_to_none=True)
         loss.backward()
