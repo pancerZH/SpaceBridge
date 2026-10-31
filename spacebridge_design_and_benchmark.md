@@ -174,7 +174,9 @@ Initialized from $W_0 \in \{W_{\text{stiefel}}, W_{\text{ridge}}\}$, `SpaceBridg
 
 $$S_{\text{student}}(W) = \frac{1}{\tau} \text{Normalize}\!\left(\mu_X^{(q)} + \bar{Y}_{\text{train}}^{(q)} W\right) \left(X_{\text{train}}^{(d)}\right)^T, \qquad S_{\text{teacher}} = \frac{1}{\tau} X_{\text{train}}^{(q)} \left(X_{\text{train}}^{(d)}\right)^T$$
 
-$$\mathcal{L}(W) = (1 - \alpha)\, \mathcal{L}_{\text{InfoNCE}}\!\left(S_{\text{student}}(W)\right) + \alpha \tau^2\, \text{KL}\!\left(\text{softmax}(S_{\text{teacher}}) \;\|\; \text{softmax}(S_{\text{student}}(W))\right) + \beta \|W - W_0\|_F^2$$
+$$\mathcal{L}(W) = (1 - \alpha)\, \mathcal{L}_{\text{InfoNCE}}\!\left(S_{\text{student}}(W)\right) + \alpha\, \text{KL}\!\left(\text{softmax}(S_{\text{teacher}}) \;\|\; \text{softmax}(S_{\text{student}}(W))\right) + \beta \|W - W_0\|_F^2$$
+
+(The Hinton $\tau^2$ factor is omitted: it compensates for a KL computed at a *higher* temperature than the CE term, but here both share $\tau = 0.05$, so $\tau^2$ would shrink the KL term $\sim 400\times$ relative to InfoNCE. Exposed as `RefineConfig.kl_scale`.)
 
 with $\tau = 0.05$, $\alpha = 0.5$, $\beta = 10^{-3}$ (upgraded to $\beta = 10^{-2}$ when $d_t > K_{\text{train}}$ to prevent high-dimensional overfitting), early-stopped on $K_{\text{val}}$. The teacher is the native source ranking, i.e. exactly what the index would return for $M_{\text{src}}$ queries.
 
@@ -222,11 +224,14 @@ $$\mu_{Y, L_q}^{(q)} = \mu_{Y, L_{\text{src}}}^{(q)} + \left(\mu_{\text{FLORES},
 
 ## 5. Automated Confidence Routing Policy
 
-**Definition.** For each of the $K_{\text{val}} = 410$ held-out proxies, retrieve from the pool $\mathcal{P}$ = all $K$ anchor docs $\cup$ the $\le 50\text{K}$ distractor rows (§4.1), scoring with raw stored vectors. Then
+**Definition.** For each of the $K_{\text{val}} = 410$ held-out proxies, retrieve from the pool $\mathcal{P}$ = all $K$ anchor docs $\cup$ the $\le 50\text{K}$ distractor rows (§4.1), scoring with raw stored vectors. Then $\rho_{\text{val}}$ is the **top-10 agreement with the teacher**:
 
-$$\rho_{\text{val}} = \frac{\text{Recall@10}_{\text{student}}(K_{\text{val}}, \mathcal{P})}{\text{Recall@10}_{\text{teacher}}(K_{\text{val}}, \mathcal{P})}$$
+$$\rho_{\text{val}} = \frac{1}{K_{\text{val}}} \sum_{i \in \mathcal{I}_{\text{val}}} \frac{\left|\text{Top10}_{\mathcal{P}}(\hat{q}_{\text{src}, i}) \cap \text{Top10}_{\mathcal{P}}(X_i^{(q)})\right|}{10}$$
 
-where the student uses $\hat{q}_{\text{src}}$ and the teacher uses native $X^{(q)}$. Scoring only against the $K$ anchors would saturate near $1.0$ and fail to discriminate.
+where the student uses $\hat{q}_{\text{src}}$ and the teacher uses native $X^{(q)}$. The same score selects the Stage-1 operator / $\lambda_{\text{rel}}$ and early-stops Stage 2.
+
+> [!NOTE]
+> **Implementation finding (Stage 1, `scifact`):** the v2.4 draft defined $\rho_{\text{val}}$ as a ratio of own-anchor-doc `Recall@10`. Because each proxy is the lead sentence of its own anchor doc, both teacher and student hit it almost always, so that ratio was $1.000$ for every configuration (including ones with 82% real retention). Solver selection and Stage-2 early stopping were then decided by ties. Own-doc recall is still logged as a diagnostic.
 
 **Per-language validation (Regime L1).** English-anchor $\rho_{\text{val}}$ says nothing about Chinese queries. For each registered $L_q$, a second score $\rho_{\text{val}, L_q}$ uses FLORES `devtest` pairs (disjoint from the 256 `dev` sentences used for $\Delta\mu$): $L_q$ sentences are projected as queries and must retrieve their $L_{\text{src}}$ counterparts, encoded once by $M_{\text{src}}^{\text{doc}}$ and mixed into $\mathcal{P}$. Routing uses $\rho_{\text{val}, L_q}$ for queries in $L_q$.
 
@@ -276,8 +281,10 @@ class SpaceBridge:
     def fit(
         self,
         bundle: CalibrationBundle,
-        Y_query_raw: np.ndarray,   # (K, d_t) target query embeddings of bundle.anchor_query_texts
-        mode: Literal["auto", "stiefel", "ridge", "distill"] = "auto",
+        Y_raw: np.ndarray,         # (K, d_t) target query embeddings of the proxies (or of anchor docs if pairs="doc")
+        mode: Literal["naive", "stiefel", "ridge", "stage1", "auto"] = "auto",  # auto = best Stage-1 + Stage-2
+        pairs: Literal["query", "doc"] = "query",
+        X_distractor: Optional[np.ndarray] = None,  # index vectors at bundle.distractor_ids
     ) -> Dict[str, float]:
         """Sets src_lang, mu_x_query, mu_y_by_lang[src_lang] and W (scaled truncated Stiefel or
         primal/dual ridge, then 150-step GPU InfoNCE/KL), and computes rho_val and status."""
