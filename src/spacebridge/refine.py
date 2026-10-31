@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 @dataclass
 class RefineConfig:
-    steps: int = 150
+    steps: int = 50  # gains plateau by step 20-50 (M2 P4 study); the cosine schedule spans all steps
     lr: float = 3e-3
     tau: float = 0.05
     alpha: float = 0.5

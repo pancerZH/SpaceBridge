@@ -31,11 +31,21 @@ def test_cross_model_alignment_recovers_most_native_retrieval(world):
     assert info["rho_val"] > 0.8
 
 
-def test_stage2_never_lowers_validation(world):
+def test_stage2_never_lowers_its_stopping_signal(world):
     _, stage1 = _fit(world, world.Y_query, mode="stage1")
     _, auto = _fit(world, world.Y_query, mode="auto", refine_config=RefineConfig(steps=30))
-    assert auto["rho_val"] >= stage1["rho_val"] - 1e-9
+    assert auto["val_metrics"]["owndoc_mrr"] >= stage1["val_metrics"]["owndoc_mrr"] - 1e-9
     assert "stage2_ms" in auto
+    _, agree = _fit(world, world.Y_query, mode="auto", refine_config=RefineConfig(steps=30), stage2_signal="agree@10")
+    assert agree["rho_val"] >= stage1["rho_val"] - 1e-9
+    with pytest.raises(ValueError):
+        SpaceBridge(device="cpu", stage2_signal="nope")
+
+
+def test_stage2_keeps_most_teacher_agreement_on_the_identity(world):
+    _, stage1 = _fit(world, world.bundle.X_query_raw, mode="stage1")
+    _, auto = _fit(world, world.bundle.X_query_raw, mode="auto", refine_config=RefineConfig(steps=30))
+    assert auto["rho_val"] >= 0.9 * stage1["rho_val"] - 1e-9
 
 
 def test_mean_restore_tracks_native_rankings_under_a_strong_query_cone():

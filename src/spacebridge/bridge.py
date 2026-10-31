@@ -1,5 +1,6 @@
 """The SpaceBridge query-side alignment engine (design §4.2–§6)."""
 
+import math
 import time
 import warnings
 from typing import Dict, Literal, Optional
@@ -22,6 +23,7 @@ Pairs = Literal["query", "doc"]
 HIGH_CONFIDENCE = 0.58
 MODERATE_DRIFT = 0.40
 VAL_K = 10
+STAGE2_MIN_AGREE_RATIO = 0.9  # Stage-2 steps must keep this share of Stage 1's teacher agree@10
 SUPPORT_K = 5
 
 
@@ -80,6 +82,7 @@ class SpaceBridge:
         match_residual_norm: bool = True,
         selection_pool: int = 10_000,
         hard_negatives: int = 0,
+        stage2_signal: str = "owndoc_mrr",
     ):
         if device.startswith("cuda") and not torch.cuda.is_available():
             device = "cpu"
@@ -91,6 +94,11 @@ class SpaceBridge:
         self.refine_config = refine_config or RefineConfig()
         self.selection_pool = selection_pool
         self.hard_negatives = hard_negatives  # per training row: teacher top-k index docs added to Stage 2
+        # Stage-2 early stopping: held-out own-doc MRR, or "agree@10" (teacher agreement, the v2 signal).
+        # Stage 2 lowers teacher agreement even when it improves real retention, so agree@10 stops it at step 0.
+        if stage2_signal not in ("owndoc_mrr", "agree@10"):
+            raise ValueError(f"unknown stage2_signal {stage2_signal!r}")
+        self.stage2_signal = stage2_signal
         self.src_lang: str = "en"
         self.mu_x_query: Optional[np.ndarray] = None
         self.mu_y_by_lang: Dict[str, np.ndarray] = {}
@@ -156,6 +164,14 @@ class SpaceBridge:
         def val_score(W: torch.Tensor) -> float:
             return topk_agreement(self._project(Y[va], mu_y, mu_x, W), sel_pool, sel_teacher)
 
+        def owndoc_score(W: torch.Tensor) -> float:  # anchor docs are the first rows of sel_pool
+            # Own-doc MRR alone rewards pulling proxies onto their own docs (on the identity it trades
+            # 20 points of agree@10 for +0.4 MRR), so steps that give up the source geometry are rejected.
+            Q = self._project(Y[va], mu_y, mu_x, W)
+            if topk_agreement(Q, sel_pool, sel_teacher) < STAGE2_MIN_AGREE_RATIO * stage1_agree:
+                return -math.inf
+            return retrieval_stats(Q, sel_pool, va)["mrr"]
+
         info: Dict[str, float] = {"mode": mode, "pairs": pairs}
         self._sync()
         t0 = time.perf_counter()
@@ -187,7 +203,7 @@ class SpaceBridge:
                 for lam_rel, W_r in ridge_path(Y_fit, X_fit, LAMBDAS_REL):
                     W_r = rescale(W_r)
                     candidates.append((val_score(W_r), W_r, {"solver": "ridge", "lambda_rel": lam_rel}))
-            _, W, chosen = max(candidates, key=lambda c: c[0])
+            stage1_agree, W, chosen = max(candidates, key=lambda c: c[0])
             info.update(chosen)
         self._sync()
         info["stage1_ms"] = 1e3 * (time.perf_counter() - t0)
@@ -210,7 +226,8 @@ class SpaceBridge:
                 nbr = (teacher_rows @ dis.T).topk(min(self.hard_negatives, dis.shape[0]), dim=1).indices.unique()
                 cand = torch.cat([cand, dis[nbr]])
                 info["stage2_candidates"] = int(cand.shape[0])
-            W, r_info = refine(W, mu_rows, Y_rows, teacher_rows, cand, val_score, self.refine_config, labels)
+            stage2_score = owndoc_score if self.stage2_signal == "owndoc_mrr" else val_score
+            W, r_info = refine(W, mu_rows, Y_rows, teacher_rows, cand, stage2_score, self.refine_config, labels)
             self._sync()
             info["stage2_ms"] = 1e3 * (time.perf_counter() - t0)
             info["stage2_best_step"] = r_info["best_step"]
