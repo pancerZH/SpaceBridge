@@ -102,6 +102,7 @@ def test_language_registration_and_fallback(world):
     np.testing.assert_allclose(
         bridge.transform_query(q_zh, query_lang="zh"), bridge.transform_query(world.Q_tgt[:5]), atol=1e-5
     )
+    assert any("'zh'" in n for n in bridge.quality_report().notes)
     with pytest.warns(UserWarning, match="not registered"):
         bridge.transform_query(world.Q_tgt[:5], query_lang="ja")
 

@@ -349,6 +349,11 @@ class SpaceBridge:
             raise RuntimeError("fit() must be called before register_query_language()")
         shift = Y_flores_query_lang.mean(axis=0) - Y_flores_src_lang.mean(axis=0)
         self.mu_y_by_lang[lang] = self.mu_y_by_lang[self.src_lang] + shift
+        if self.quality is not None and lang != self.src_lang:
+            # The score is fitted on same-language queries; held out on xquad-zh it over-predicted by 10.5 points.
+            self.quality.notes.append(
+                f"quality score covers {self.src_lang!r} queries only; it does not apply to {lang!r} queries"
+            )
 
     def _mu_y(self, query_lang: Optional[str]) -> np.ndarray:
         lang = query_lang or self.src_lang
