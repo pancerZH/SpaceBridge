@@ -103,13 +103,15 @@ def main() -> None:
             )
         print()
 
-    feats, X, alpha, pred = results["all measurements"]
+    # Ship whichever feature set transfers better to unseen datasets (lower LODO error).
+    chosen = min(results, key=lambda k: np.average((results[k][3] - y) ** 2, weights=w))
+    feats, X, alpha, pred = results[chosen]
     m = fit_ridge(X, y, w, alpha)
     resid = pred - y
     band = float(np.sqrt(np.average(resid**2, weights=w)))
     per_ds = {d: float(np.abs(resid[datasets == d]).mean()) for d in np.unique(datasets)}
     transfers = sum(v <= band for v in per_ds.values())
-    print("## final model (all fits)\n")
+    print(f"## final model: {chosen} (all fits)\n")
     for f, c in sorted(zip(feats, m["coef"]), key=lambda t: -abs(t[1])):
         print(f"- {f}: {100 * c:+.2f} points per s.d.")
     print(f"- intercept {100 * m['intercept']:.1f}; band ±{100 * band:.1f} (LODO RMSE); "
