@@ -54,16 +54,18 @@ Upgrading an embedding model, querying a massive pre-computed vector dataset ($1
 \* Provisional: re-baseline after Stage 1 smoke test. In v2.3 this target was stated against the $2560\text{d}$ oracle, which can exceed the source-capacity ceiling itself.
 
 * **Solver Budget (any model):** Stage-1 + Stage-2 + validation on precomputed embeddings must complete in **$< 250\text{ ms}$** on the RTX 5070 Ti.
-* **End-to-End Mount Budget (anchor encoding in `bf16` + solver):** encoding $K = 2,048$ proxies at 32–64 tokens is $\approx 1.3 \times 10^5$ tokens, i.e. $\approx 2 \cdot P \cdot 1.3 \times 10^5$ FLOPs for a $P$-parameter encoder. Provisional budgets, to be replaced by measurements in Stage 0:
+* **End-to-End Mount Budget (anchor encoding in `bf16` + solver):** the default mount encodes $K = 2,048$ query proxies plus, for doc↔doc pairs, the $K$ anchor docs **truncated to 128 tokens**, at $K = 2,048$ on the reference GPU. **Budgets revised and approved 2026-10-31** from the M3 measurements below (the original 2 / 4 / 20 s were provisional and assumed proxies only):
 
-| $M_{\text{tgt}}$ size class | Examples | End-to-end mount budget |
-| :--- | :--- | :--- |
-| $\le 0.35\text{B}$ | `MiniLM`, `bge-*`, `EmbeddingGemma 2` (text path) | **$< 2.0\text{ s}$** |
-| $\approx 0.6\text{B}$ | `Qwen3-Embedding-0.6B`, `harrier-oss-v1-0.6b`, `mE5-large` | **$< 4.0\text{ s}$** |
-| $\approx 4\text{B}$ | `Qwen3-Embedding-4B` | **$< 20\text{ s}$** (one-time per mount) |
+| $M_{\text{tgt}}$ size class | Examples | Mount protocol | End-to-end mount budget |
+| :--- | :--- | :--- | :--- |
+| $\le 0.35\text{B}$ | `MiniLM`, `bge-*`, `EmbeddingGemma 2` (text path) | proxies + 128-token anchor docs | **$< 5\text{ s}$** |
+| $\approx 0.6\text{B}$ | `Qwen3-Embedding-0.6B`, `harrier-oss-v1-0.6b`, `mE5-large` | proxies + 128-token anchor docs | **$< 10\text{ s}$** |
+| $\approx 4\text{B}$ | `Qwen3-Embedding-4B` | proxies only (`doc_pairs=False`, §4.3) | **$< 30\text{ s}$** (one-time per mount) |
+
+Mount must also stay far below re-indexing the corpus with $M_{\text{tgt}}$ (FiQA, 57.6K docs: minutes per 0.6B model; millions of docs: hours).
 
 > [!NOTE]
-> **Measured (M3, `fiqa`, $K = 2,048$, idle RTX 5070 Ti, bf16; budgets above unchanged pending a decision).** Mount = proxy encoding + anchor-doc encoding for doc↔doc pairs (§4.3) + solver:
+> **Measured (M3, `fiqa`, $K = 2,048$, idle RTX 5070 Ti, bf16; the basis of the revised budgets).** Mount = proxy encoding + anchor-doc encoding for doc↔doc pairs (§4.3) + solver:
 >
 > | $M_{\text{tgt}}$ | Proxies | Anchor docs (full / 128 tokens) | Solver | Mount without doc pairs | Mount, default |
 > | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -213,7 +215,7 @@ with $\tau = 0.05$ (or $0.6\,\sigma_T$ on compressed-score indexes, below), $\al
 >
 > **Default change (2026-10-31): doc↔doc pairs are on.** Across the six M2 BEIR sets, Row 8b was the best first-stage configuration on every dataset except `arguana` (a tie) and on all four Tier 5a pairs, and it recovered most of the `trec-covid` Tier 1 miss (+5.9 points `Recall@30` over Row 8). Cost: one extra $M_{\text{tgt}}^{\text{doc}}$ encoding pass over the $K$ anchor docs at mount (3–30 s for 0.6B-class models) and +50 ms solver time (164 / 174 ms mean / max at $K = 2,048$ on `fiqa`, inside the 250 ms budget). `fit(mode="auto")` therefore requires `Y_doc_raw`; `SpaceBridge(doc_pairs=False)` opts out (ablation Rows 6–8). The identity check (Row 1) now runs with doc pairs ($Y^{(d)} := X^{(d)}$).
 >
-> **Size-dependent (M3, Tier 4).** For 4B-class query models the doc-pair pass costs 51 s at $K = 2,048$ (70 s mount vs. a 20 s budget) and gives no measurable gain: `Qwen3-Embedding-4B` queries into a MiniLM index, Row 8b − Row 8 = +0.1 ± 3.0 points `Recall@30` (3 seeds; +2.6 ± 0.4 at $K = 4,096$). The mount protocol is therefore doc pairs for query models up to ~0.6B (gains of +1.6 to +7.4 points across `fiqa`, `trec-covid` and the MRL sweep, for seconds of encoding) and `doc_pairs=False` for 4B-class models.
+> **Size-dependent (M3, Tier 4).** For 4B-class query models the doc-pair pass costs 51 s at $K = 2,048$ (70 s mount vs. a 20 s budget) and gives no measurable gain: `Qwen3-Embedding-4B` queries into a MiniLM index, Row 8b − Row 8 = +0.1 ± 3.0 points `Recall@30` (3 seeds; +2.6 ± 0.4 at $K = 4,096$). The mount protocol is therefore doc pairs for query models up to ~0.6B (gains of +1.6 to +7.4 points across `fiqa`, `trec-covid` and the MRL sweep, for seconds of encoding), with anchor docs encoded truncated to 128 tokens (§2.1), and `doc_pairs=False` for 4B-class models.
 
 #### Operator D: Candidate-Scoped Relative Representation Rescorer (Zero Extra Index)
 Applied strictly in-memory over `Top-200` first-stage candidates $\mathcal{C}_{200}$ against $K_{\text{ref}} = 512$ reference anchor **documents** when moderate drift is detected. Both sides are profiled against the *same* 512 documents, so profile coordinates are comparable across spaces:
