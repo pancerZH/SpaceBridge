@@ -15,7 +15,9 @@ import numpy as np
 
 from spacebridge_bench.models import MODELS
 
-BUDGET_S = ((0.35, 2.0), (0.6, 4.0), (4.0, 20.0))  # size class (B params) -> end-to-end mount budget
+# Size class (B params) -> end-to-end mount budget, s (design §2.1, set from M3 measurements: 128-token
+# anchor docs for doc pairs up to 0.6B, no doc pairs for 4B-class query models).
+BUDGET_S = ((0.35, 5.0), (0.6, 10.0), (4.0, 30.0))
 
 
 def budget(params_b: float) -> float:

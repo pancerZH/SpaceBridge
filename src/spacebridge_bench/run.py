@@ -82,6 +82,9 @@ TIERS = {
 }
 
 SEARCH_K = 100
+# Mount protocol (design §2.1): anchor docs for doc pairs are encoded truncated to this many tokens. 2.3-2.5x
+# faster than full length at -0.3 to -0.5 points Recall@30 (fiqa, 3 seeds, M3); 0 encodes them in full.
+DOC_PAIR_TOKENS = 128
 ANCHOR_CACHE = Path("data/cache/anchors")
 _warm = False
 RERANK_DEPTH = {"9n": 30, "9": 60, "9w": 100}
@@ -114,7 +117,7 @@ def cached_anchors(ds: RetrievalDataset, src_key: str, E_src: np.ndarray, allowe
 def run_pair(
     ds: RetrievalDataset, src_key: str, tgt_key: str, K: int, seed: int, rows: list[str], device: str,
     rerankers: tuple[str, ...] = (), proxy: str = "title", stage2_batch: Optional[int] = None,
-    doc_pair_tokens: Optional[int] = None, time_mount: bool = False, stage2_tau_scale: Optional[float] = None,
+    doc_pair_tokens: int = DOC_PAIR_TOKENS, time_mount: bool = False, stage2_tau_scale: Optional[float] = None,
 ) -> list[dict]:
     src, tgt = MODELS[src_key], MODELS[tgt_key]
     K = min(K, ds.N - int((ds.self_rows >= 0).sum()))
@@ -161,7 +164,7 @@ def run_pair(
     if {"8b", "7b"} & needs and (time_mount or doc_pair_tokens):
         if doc_pair_tokens:  # cheaper mount: anchor docs for doc pairs encoded truncated
             enc.unload()
-            enc = Encoder(replace(tgt, max_seq_length=doc_pair_tokens), device)
+            enc = Encoder(replace(tgt, max_seq_length=min(doc_pair_tokens, tgt.max_seq_length)), device)
         doc_inputs = [tgt.format_doc(ds.titles[i], ds.texts[i]) for i in anchor_ids]
         if time_mount:
             Y_doc_pairs, doc_mount = enc.timed_encode(doc_inputs)
@@ -214,8 +217,7 @@ def run_pair(
         base["stage2_batch"] = stage2_batch
     if stage2_tau_scale:
         base["stage2_tau_scale"] = stage2_tau_scale
-    if doc_pair_tokens:
-        base["doc_pair_tokens"] = doc_pair_tokens
+    base["doc_pair_tokens"] = doc_pair_tokens  # records without this field (before the M3 budget decision) used 0
     records = []
     for row in (r for r in rows if r not in RERANK_DEPTH):
         if row in ("0c", "7", "7b") and not ds.query_lang:
@@ -371,7 +373,8 @@ def main() -> None:
     p.add_argument("--time-mount", action="store_true",
                    help="re-encode anchors uncached to time the mount, and time the projection (use an idle GPU)")
     p.add_argument("--proxy", default="title", choices=PROXY_STYLES, help="query-proxy style")
-    p.add_argument("--doc-pair-tokens", type=int, default=None, help="truncate anchor docs encoded for doc pairs")
+    p.add_argument("--doc-pair-tokens", type=int, default=DOC_PAIR_TOKENS,
+                   help="truncate anchor docs encoded for doc pairs to this many tokens (0: full length)")
     p.add_argument("--stage2-batch", type=int, default=None, help="Stage-2 candidate mini-batch size (default: the engine's; 0: full batch)")
     p.add_argument("--stage2-tau-scale", type=float, default=None, help="Stage-2 temperature relative to the teacher score s.d., on every index (ablation)")
     p.add_argument("--device", default="cuda")
