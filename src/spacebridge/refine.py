@@ -31,8 +31,10 @@ class RefineConfig:
     # min_agree_ratio of step 0's teacher agree@10. "tail" (M4): the average of the checkpoints from step
     # tail_from on, if its own agree@10 clears the gap floor a0 - floor_gap * (1 - a0) (a0: step 0's agree@10, so
     # the allowed loss scales with Stage 1's disagreement with the teacher and stays tight near the identity);
-    # otherwise the "floor" choice under the gap floor.
-    stop_rule: str = "floor"
+    # otherwise the "floor" choice under the gap floor. "tail" is the default since M4: vs. "floor" (3 seeds, both K)
+    # it unblocks T2 with an mE5 index (+3.3 points, seed-to-seed s.d. 3.5 -> 0.8), +0.5 on trec-covid (s.d. 2.5 ->
+    # 1.7), 0.0 / -0.1 on xquad-zh / fiqa; held out: hotpotqa +0.0, scidocs -0.0, fiqa with an mE5 index +0.4.
+    stop_rule: str = "tail"
     min_agree_ratio: float = 0.9
     floor_gap: float = 0.25
     tail_from: int = 20

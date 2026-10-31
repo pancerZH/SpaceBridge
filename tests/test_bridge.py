@@ -171,7 +171,7 @@ def test_stage2_health_flags_blocked_and_compressed_fits(world):
     assert not any("stage 2" in n or "compressed" in n for n in healthy.quality_report().notes)
 
     blocked, info = _fit(world, world.Y_query, mode="auto", Y_doc_raw=world.Y_doc,
-                         refine_config=RefineConfig(steps=20, min_agree_ratio=2.0))  # the floor rejects every checkpoint
+                         refine_config=RefineConfig(steps=20, floor_gap=-10.0))  # the floor rejects every checkpoint
     h = blocked.quality_report().details["stage2"]
     assert info["stage2_best_step"] == 0 and info["stage2_floor_rejected"] == 1.0
     assert h["blocked"] == h["health_flag"] == 1.0 and h["compressed_scores"] == 0.0
@@ -191,13 +191,13 @@ def test_stage2_health_flags_blocked_and_compressed_fits(world):
 def test_tail_rule_floor_scales_with_stage1_disagreement():
     from spacebridge.refine import agree_floor, select_checkpoint
 
-    tail = RefineConfig(stop_rule="tail", floor_gap=0.25)
+    tail, floor = RefineConfig(stop_rule="tail", floor_gap=0.25), RefineConfig(stop_rule="floor")
     assert agree_floor(0.6, tail) == pytest.approx(0.5)  # allowed loss 0.25 * (1 - 0.6)
     assert agree_floor(1.0, tail) == pytest.approx(1.0)  # no loss allowed at perfect agreement
-    assert agree_floor(0.6, RefineConfig()) == pytest.approx(0.54)  # "floor": 90% of a0
+    assert agree_floor(0.6, floor) == pytest.approx(0.54)  # "floor": 90% of a0
     curve = [(0, {"agree": 0.6, "mrr": 0.5}), (10, {"agree": 0.52, "mrr": 0.7}), (20, {"agree": 0.45, "mrr": 0.9})]
     assert select_checkpoint(curve, tail) == 1  # step 20 is below the gap floor 0.5
-    assert select_checkpoint(curve, RefineConfig()) == 0  # both Stage-2 steps fail the 90% floor
+    assert select_checkpoint(curve, floor) == 0  # both Stage-2 steps fail the 90% floor
 
 
 def test_tail_rule_averages_the_late_checkpoints(world):
