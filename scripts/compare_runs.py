@@ -1,5 +1,7 @@
 """Paired comparison of two spacebridge-bench result files: same dataset, pairs, K, rows and seeds, one
-setting changed (proxy style, an engine option, a code version). Per tier, mean ± s.d. over seeds.
+setting changed (proxy style, an engine option, a code version). Per tier, mean ± s.d. over seeds, the
+median and a 95% bootstrap CI of the mean difference over (pair, seed) cells; ``--pool`` also pools each
+dataset and row over tiers and K.
 
     uv run python scripts/compare_runs.py outputs/m3_trec-covid_seeds.jsonl outputs/m3_trec-covid_title.jsonl
     uv run python scripts/compare_runs.py before.jsonl after.jsonl --rows 1 6 8 8b --detail
@@ -22,6 +24,7 @@ def main() -> None:
     p.add_argument("--metric", default="recall@30")
     p.add_argument("--rows", nargs="*", default=["6", "8", "8b"])
     p.add_argument("--detail", action="store_true", help="also list every configuration with solver and Stage-2 step")
+    p.add_argument("--pool", action="store_true", help="also pool each dataset and row over tiers and K")
     args = p.parse_args()
     tier = {}
     for t, prs in TIERS.items():  # first tier wins: Tier 5a reuses Tier 3 pairs
@@ -44,15 +47,34 @@ def main() -> None:
         if k in base:
             groups[k[:4]][k[6]].append((ret(base[k]), ret(r)))
     sd = lambda a: np.std(a, ddof=1) if len(a) > 1 else 0.0
-    print(f"| dataset | tier | K | row | base mean | new mean ± s.d. (seeds) | new − base, points | (pair, seed) cells + |")
-    print("| --- | --- | --- | --- | --- | --- | --- | --- |")
-    for g, seeds in sorted(groups.items()):
+    rng = np.random.default_rng(0)
+
+    def cell_ci(diffs):  # 95% bootstrap CI of the mean over (pair, seed) cells, points
+        diffs = np.asarray(diffs)
+        boot = diffs[rng.integers(0, len(diffs), (2000, len(diffs)))].mean(1)
+        return np.percentile(boot, [2.5, 97.5])
+
+    def row(label, seeds):
         b = [np.mean([x[0] for x in v]) for v in seeds.values()]
         n = [np.mean([x[1] for x in v]) for v in seeds.values()]
         d = [100 * (y - x) for x, y in zip(b, n)]
-        cells = [y > x for v in seeds.values() for x, y in v]
-        print(f"| {g[0]} | {g[1]} | {g[2]} | {g[3]} | {np.mean(b):.3f} | {np.mean(n):.3f} ± {sd(n):.3f} | "
-              f"{np.mean(d):+.1f} ± {sd(d):.1f} | {sum(cells)}/{len(cells)} |")
+        cells = [100 * (y - x) for v in seeds.values() for x, y in v]
+        lo, hi = cell_ci(cells)
+        print(f"| {label} | {np.mean(b):.3f} | {np.mean(n):.3f} ± {sd(n):.3f} | {np.mean(d):+.1f} ± {sd(d):.1f} | "
+              f"{np.median(cells):+.1f} | [{lo:+.1f}, {hi:+.1f}] | {sum(c > 0 for c in cells)}/{len(cells)} |")
+
+    print(f"| dataset | tier | K | row | base mean | new mean ± s.d. (seeds) | new − base, points | median cell | "
+          f"95% CI (cells) | (pair, seed) cells + |")
+    print("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    for g, seeds in sorted(groups.items()):
+        row(f"{g[0]} | {g[1]} | {g[2]} | {g[3]}", seeds)
+    if args.pool:
+        pooled = defaultdict(lambda: defaultdict(list))
+        for g, seeds in groups.items():
+            for s_, v in seeds.items():
+                pooled[g[0], g[3]][s_].extend(v)
+        for (ds, r), seeds in sorted(pooled.items()):
+            row(f"{ds} | all | all | {r}", seeds)
 
     if args.detail:
         print("\n| index ← queries | K | row | seed | base | new | Δ | solver base → new | S2 step base → new |")
