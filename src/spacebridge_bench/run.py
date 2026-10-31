@@ -14,7 +14,10 @@ from typing import Optional
 
 import numpy as np
 
-from spacebridge import CalibrationBundle, RefineConfig, SpaceBridge, extract_query_proxy, make_split, sample_distractors, select_anchors
+from spacebridge import (
+    CalibrationBundle, RefineConfig, SpaceBridge, extract_query_proxy, make_query_proxies, make_split, sample_distractors,
+    select_anchors,
+)
 
 from .datasets import DATASETS, RetrievalDataset, load_beir, load_shift_bank
 from .encode import Encoder
@@ -83,18 +86,18 @@ ANCHOR_CACHE = Path("data/cache/anchors")
 _warm = False
 RERANK_DEPTH = {"9n": 30, "9": 60, "9w": 100}
 CI_METRICS = ("recall@30", "ndcg@5", "ndcg@10")
-PROXY_STYLES = ("lead", "short", "title")
+PROXY_STYLES = ("title", "title-any", "lead", "short")
 
 
-def make_proxy(title: str, text: str, style: str = "title") -> str:
-    """``title`` (engine default since M3): the title alone when it has >= 4 tokens, else title + lead
-    sentence (32-64 tokens). ``lead``: title + lead sentence for every document (the M2 default).
-    ``short``: like ``title``, but the fallback is cut to 16 tokens."""
-    if style == "lead":
-        return extract_query_proxy(title, text, title_min_tokens=None)
-    if style == "short":
-        return extract_query_proxy(title, text, min_tokens=4, max_tokens=16)
-    return extract_query_proxy(title, text)
+def make_proxies(titles: list[str], texts: list[str], style: str = "title") -> list[str]:
+    """``title`` (engine default since M3): the title alone when it has >= 4 tokens and no other anchor
+    shares it, else title + lead sentence (32-64 tokens). ``title-any``: the title alone even when shared
+    (the first M3 version). ``lead``: title + lead sentence for every document (the M2 default).
+    ``short``: like ``title-any``, but the fallback is cut to 16 tokens."""
+    if style == "title":
+        return make_query_proxies(titles, texts)
+    kwargs = {"lead": {"title_min_tokens": None}, "title-any": {}, "short": {"min_tokens": 4, "max_tokens": 16}}[style]
+    return [extract_query_proxy(t, x, **kwargs) for t, x in zip(titles, texts)]
 
 
 def cached_anchors(ds: RetrievalDataset, src_key: str, E_src: np.ndarray, allowed: np.ndarray, K: int, seed: int) -> np.ndarray:
@@ -123,7 +126,7 @@ def run_pair(
     # Split hygiene (design §7.1 rule 3): corpus rows that are test queries (ArguAna) never become anchors.
     allowed = np.setdiff1d(np.arange(ds.N), ds.self_rows)
     anchor_ids = cached_anchors(ds, src_key, E_src, allowed, K, seed)
-    proxies = [make_proxy(ds.titles[i], ds.texts[i], proxy) for i in anchor_ids]
+    proxies = make_proxies([ds.titles[i] for i in anchor_ids], [ds.texts[i] for i in anchor_ids], proxy)
     train_idx, val_idx = make_split(K, seed=seed)
     bundle = CalibrationBundle(
         src_lang=ds.lang,

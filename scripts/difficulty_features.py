@@ -18,7 +18,7 @@ from spacebridge.anchors import count_tokens
 from spacebridge_bench.datasets import load_beir
 from spacebridge_bench.encode import Encoder
 from spacebridge_bench.models import MODELS
-from spacebridge_bench.run import ANCHOR_CACHE, make_proxy
+from spacebridge_bench.run import ANCHOR_CACHE, make_proxies
 
 N_SAMPLE = 2_000
 
@@ -94,7 +94,7 @@ def main() -> None:
             print(f"missing anchors {path}")
             continue
         ids = np.load(path)
-        proxies = [make_proxy(ds.titles[i], ds.texts[i], style) for i in ids]
+        proxies = make_proxies([ds.titles[i] for i in ids], [ds.texts[i] for i in ids], style)
         enc = Encoder(MODELS[src], "cuda")
         Xq = enc.queries(proxies, ds.task)
         enc.unload()

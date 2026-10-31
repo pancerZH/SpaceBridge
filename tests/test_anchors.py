@@ -60,3 +60,15 @@ def test_query_proxy_is_the_title_when_it_is_long_enough():
     assert extract_query_proxy("Meme", text).startswith("Meme\nLead sentence")  # short titles keep the lead
     assert extract_query_proxy("Clinical features of a viral infection", text, title_min_tokens=None).startswith(
         "Clinical features of a viral infection\nLead sentence")
+
+
+def test_shared_titles_are_not_used_alone():
+    from spacebridge import make_query_proxies
+
+    titles = ["University of Notre Dame campus", "University of Notre Dame campus", "A unique paper title here", ""]
+    texts = ["First paragraph. More.", "Second paragraph. More.", "Abstract text. More.", "No title here. More."]
+    proxies = make_query_proxies(titles, texts)
+    assert proxies[0].startswith("University of Notre Dame campus\nFirst paragraph.")
+    assert proxies[1].startswith("University of Notre Dame campus\nSecond paragraph.")
+    assert proxies[2] == "A unique paper title here"
+    assert proxies[3].startswith("No title here.")

@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from spacebridge import CalibrationBundle, SpaceBridge, extract_query_proxy, make_split, sample_distractors
+from spacebridge import CalibrationBundle, SpaceBridge, make_query_proxies, make_split, sample_distractors
 from spacebridge.solvers import LAMBDAS_REL
 from spacebridge_bench.datasets import load_beir
 from spacebridge_bench.encode import Encoder
@@ -53,7 +53,7 @@ def run(args) -> None:
                 continue
             E, E_t = emb[src]["docs"], emb[tgt]["docs"]
             ids = cached_anchors(ds, src, E, allowed, K, seed)
-            proxies = [extract_query_proxy(ds.titles[i], ds.texts[i]) for i in ids]
+            proxies = make_query_proxies([ds.titles[i] for i in ids], [ds.texts[i] for i in ids])
             enc = Encoder(MODELS[src], args.device)
             Xq = enc.queries(proxies, ds.task)
             enc.unload()

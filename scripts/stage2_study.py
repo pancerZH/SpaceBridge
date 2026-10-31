@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from spacebridge import CalibrationBundle, RefineConfig, SpaceBridge, extract_query_proxy, make_split, sample_distractors
+from spacebridge import CalibrationBundle, RefineConfig, SpaceBridge, make_query_proxies, make_split, sample_distractors
 from spacebridge_bench.datasets import load_beir
 from spacebridge_bench.encode import Encoder
 from spacebridge_bench.metrics import per_query
@@ -55,7 +55,7 @@ def main() -> None:
         E = s["docs"]
         allowed = np.setdiff1d(np.arange(ds.N), ds.self_rows)
         ids = cached_anchors(ds, src, E, allowed, args.K, 0)
-        proxies = [extract_query_proxy(ds.titles[i], ds.texts[i]) for i in ids]
+        proxies = make_query_proxies([ds.titles[i] for i in ids], [ds.texts[i] for i in ids])
         enc = Encoder(MODELS[src], args.device)
         Xq = enc.queries(proxies, ds.task)
         enc.unload()
