@@ -10,7 +10,6 @@ from pathlib import Path
 import numpy as np
 
 RERANK_ROWS = ("9n", "9", "9w")
-FIRST_STAGE = ("6", "8")
 
 
 def table(header: list[str], rows: list[list[str]]) -> str:
@@ -29,11 +28,14 @@ def main() -> None:
     pairs = list(dict.fromkeys((r["dataset"], r["src"], r["tgt"]) for r in recs if r["row"] in RERANK_ROWS))
     rerankers = list(dict.fromkeys(r["reranker"] for r in recs if r["row"] in RERANK_ROWS))
 
+    # First-stage row each rerank record was built on (Row 8 before the M2 default change).
+    base = {(r["dataset"], r["src"], r["tgt"]): r.get("first_stage_row", "8") for r in recs if r["row"] in RERANK_ROWS}
+
     for rr in rerankers:
         print(f"\n## {rr}: end-to-end nDCG@5 (K = {args.K})\n")
         rows = []
         for ds, s, t in pairs:
-            first = by.get((ds, s, t, "8", None))
+            first = by.get((ds, s, t, base[ds, s, t], None))
             cells = [ds, f"{s} ← {t}"]
             cells.append(f"{first['rho_ceil']['ndcg@5']:.3f}" if first else "")
             for row in RERANK_ROWS:
@@ -50,14 +52,14 @@ def main() -> None:
                           f"{r9['rho_ceil']['recall@5']:.3f}", f"{r9['jaccard@5']['bridge_vs_oracle']:.2f} ({r9['jaccard@5']['native_vs_oracle']:.2f})"]
             rows.append(cells)
         means = ["**mean**", ""]
-        first = [by[(ds, s, t, "8", None)]["rho_ceil"]["ndcg@5"] for ds, s, t in pairs if (ds, s, t, "8", None) in by]
+        first = [by[k]["rho_ceil"]["ndcg@5"] for ds, s, t in pairs if (k := (ds, s, t, base[ds, s, t], None)) in by]
         means.append(f"**{np.mean(first):.3f}**" if first else "")
         for row in RERANK_ROWS:
             v = [by[(ds, s, t, row, rr)]["rho_ceil"]["ndcg@5"] for ds, s, t in pairs if (ds, s, t, row, rr) in by]
             means.append(f"**{np.mean(v):.3f}**" if v else "")
         rows.append(means)
         print(table(
-            ["dataset", "index ← queries", "Row 8 first stage", "9n (top-30)", "9 (top-60)", "9w (top-100)",
+            ["dataset", "index ← queries", "first stage", "9n (top-30)", "9 (top-60)", "9w (top-100)",
              "nDCG@5 native / oracle / bridge (top-60)", "ρceil R@5 (top-60)", "J@5 bridge–oracle (native–oracle)"],
             rows,
         ))

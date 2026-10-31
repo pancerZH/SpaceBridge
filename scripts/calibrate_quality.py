@@ -40,7 +40,7 @@ def load(paths: list[Path]) -> list[dict]:
             if r["row"] in ROWS and "quality" in r.get("fit", {}) and "reranker" not in r:
                 recs.append(r)
     # One record per configuration (last run wins).
-    return list({(r["dataset"], r["src"], r["tgt"], r["K"], r["row"]): r for r in recs}.values())
+    return list({(r["dataset"], r["src"], r["tgt"], r["K"], r["row"], r.get("seed", 0)): r for r in recs}.values())
 
 
 def features(r: dict, names: list[str]) -> list[float]:

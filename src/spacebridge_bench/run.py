@@ -40,9 +40,9 @@ ROWS = {
     "8n": "Row 8 without residual norm matching",
     "8b": "Row 8 + doc<->doc pairs (anchor docs encoded by M_tgt; default engine)",
     "8h": "Row 8 + Stage-2 hard negatives (teacher top-10 index docs per training proxy)",
-    "9n": "Row 8 bridged top-30 + cross-encoder rerank",
-    "9": "Row 8 bridged top-60 + cross-encoder rerank",
-    "9w": "Row 8 bridged top-100 + cross-encoder rerank",
+    "9n": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-30 + cross-encoder rerank",
+    "9": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-60 + cross-encoder rerank",
+    "9w": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-100 + cross-encoder rerank",
 }
 
 # row -> (anchor embeddings used as Y, fit mode, pair type, restore source mean)
@@ -125,11 +125,13 @@ def run_pair(
     E_tgt = enc.docs(ds.titles, ds.texts)
     Q_tgt = enc.queries(ds.queries, ds.task)
     Y_query, mount = enc.timed_encode([tgt.format_query(p, ds.task) for p in proxies])
-    if {"7", "7b"} & set(rows) and ds.query_lang:
+    rerank_base = "7b" if ds.query_lang else "8b"  # Row 9 reranks the default engine's first stage
+    needs = set(rows) | ({rerank_base} if set(rows) & set(RERANK_DEPTH) else set())
+    if {"7", "7b"} & needs and ds.query_lang:
         bank_src, bank_q = load_shift_bank(ds.query_lang)
         Y_bank_src, Y_bank_q = enc.queries(bank_src, ds.task), enc.queries(bank_q, ds.task)
     mount["projected_encode_ms_K2048"] = mount["encode_ms"] * 2048 / K
-    if {"8b", "7b"} & set(rows):
+    if {"8b", "7b"} & needs:
         _, doc_mount = enc.timed_encode([tgt.format_doc(ds.titles[i], ds.texts[i]) for i in anchor_ids])
         mount.update({f"doc_{k}": v for k, v in doc_mount.items()})
     enc.unload()
@@ -188,7 +190,7 @@ def run_pair(
 
     rerank_rows = [r for r in rows if r in RERANK_DEPTH]
     if rerank_rows and rerankers:
-        ranked8, fit8, _, _ = fit_row("8")
+        ranked8, fit8, _, _ = fit_row(rerank_base)
         docs = [f"{t}\n{x}" if t else x for t, x in zip(ds.titles, ds.texts)]
         for rr_key in rerankers:
             rr = Reranker(RERANKERS[rr_key], device)
@@ -198,7 +200,8 @@ def run_pair(
                        (("native", native_ranked, ds.index_lang_queries), ("oracle", oracle_ranked, ds.queries),
                         ("bridge", ranked8, ds.queries))}
                 pqs = {name: per_query(r, ds.qrels) for name, r in out.items()}
-                rec = {**base, "row": row, "description": ROWS[row], "reranker": rr_key, "depth": depth, "fit": fit8}
+                rec = {**base, "row": row, "description": ROWS[row], "reranker": rr_key, "depth": depth, "fit": fit8,
+                       "first_stage_row": rerank_base}
                 rec["baselines"] = {name: {m: float(v.mean()) for m, v in pqs[name].items()} for name in ("native", "oracle")}
                 rec["jaccard@5"] = {
                     "bridge_vs_oracle": float(topk_jaccard(out["bridge"], out["oracle"]).mean()),
