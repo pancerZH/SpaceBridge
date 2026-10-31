@@ -11,7 +11,7 @@ CALIBRATION_PATH = Path(__file__).with_name("quality_calibration.json")
 GRADES = ((95.0, "A"), (85.0, "B"), (70.0, "C"))
 # Advisory routing (M2): the score's ±4.3-point transfer error is about half a grade and it over-predicts
 # hard corpora (trec-covid by 8 points), so a grade may widen the rerank pool but never shrink it below
-# the default of 60, where Tier 1 and 3 of 4 Tier 3 pairs meet their end-to-end targets on fiqa.
+# the default of 60, where all Tier 1 and 3-4 of 4 Tier 3 fiqa pairs (by reranker) meet end-to-end targets.
 DEFAULT_RERANK_POOL = 60
 RERANK_POOL_BY_GRADE = {"A": 60, "B": 60, "C": 100, "D": 100}
 
