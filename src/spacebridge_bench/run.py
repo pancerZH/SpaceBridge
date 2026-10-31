@@ -14,15 +14,17 @@ import numpy as np
 
 from spacebridge import CalibrationBundle, SpaceBridge, extract_query_proxy, make_split, sample_distractors, select_anchors
 
-from .datasets import DATASETS, RetrievalDataset, load_beir
+from .datasets import DATASETS, RetrievalDataset, load_beir, load_shift_bank
 from .encode import Encoder
 from .metrics import bootstrap_ratio_ci, per_query, retention
 from .models import MODELS
+from .rerank import RERANKERS, Reranker, rerank, topk_jaccard
 from .search import search
 
 ROWS = {
     "0a": "Oracle full re-index (M_tgt docs + M_tgt queries)",
-    "0b": "M_src native (ceiling)",
+    "0b": "M_src native (ceiling; parallel index-language queries for cross-lingual sets)",
+    "0c": "M_src encoding the test queries directly (cross-lingual sets: no bridge)",
     "1": "Identity sanity (M_tgt := M_src, full pipeline)",
     "2": "Uncentered full-SVD Procrustes, doc anchors",
     "3s": "+ centering + mean restore + scaled truncated Stiefel, doc anchors",
@@ -31,10 +33,15 @@ ROWS = {
     "6": "+ query-proxy pairs (best Stage-1 op)",
     "6b": "Row 6 without mean restore",
     "6n": "Row 6 without residual norm matching",
+    "7": "Row 8 + language-cone shift correction (Tatoeba stand-in for FLORES; cross-lingual sets)",
     "8": "+ Stage-2 InfoNCE + KL refinement",
     "8s": "Row 8 without mean restore",
     "8n": "Row 8 without residual norm matching",
     "8b": "Row 8 + doc<->doc pairs (anchor docs encoded by M_tgt)",
+    "8h": "Row 8 + Stage-2 hard negatives (teacher top-10 index docs per training proxy)",
+    "9n": "Row 8 bridged top-30 + cross-encoder rerank",
+    "9": "Row 8 bridged top-60 + cross-encoder rerank",
+    "9w": "Row 8 bridged top-100 + cross-encoder rerank",
 }
 
 # row -> (anchor embeddings used as Y, fit mode, pair type, restore source mean)
@@ -47,10 +54,12 @@ BRIDGE_ROWS = {
     "6": ("tgt_query", "stage1", "query", True),
     "6b": ("tgt_query", "stage1", "query", False),
     "6n": ("tgt_query", "stage1", "query", True),
+    "7": ("tgt_query", "auto", "query", True),  # + register_query_language
     "8": ("tgt_query", "auto", "query", True),
     "8s": ("tgt_query", "auto", "query", False),
     "8n": ("tgt_query", "auto", "query", True),
     "8b": ("tgt_query", "auto", "query", True),  # + Y_doc_raw
+    "8h": ("tgt_query", "auto", "query", True),  # + hard negatives
 }
 
 TIERS = {
@@ -62,18 +71,25 @@ TIERS = {
 }
 
 SEARCH_K = 100
+_warm = False
+RERANK_DEPTH = {"9n": 30, "9": 60, "9w": 100}
+CI_METRICS = ("recall@30", "ndcg@5", "ndcg@10")
 
 
 def run_pair(
-    ds: RetrievalDataset, src_key: str, tgt_key: str, K: int, seed: int, rows: list[str], device: str
+    ds: RetrievalDataset, src_key: str, tgt_key: str, K: int, seed: int, rows: list[str], device: str,
+    rerankers: tuple[str, ...] = (),
 ) -> list[dict]:
     src, tgt = MODELS[src_key], MODELS[tgt_key]
-    K = min(K, ds.N)
+    K = min(K, ds.N - int((ds.self_rows >= 0).sum()))
 
     enc = Encoder(src, device)
     E_src = enc.docs(ds.titles, ds.texts)
-    Q_src = enc.queries(ds.queries, ds.task)
-    anchor_ids = select_anchors(E_src, K, seed)
+    Q_src = enc.queries(ds.index_lang_queries, ds.task)
+    Q_src_direct = enc.queries(ds.queries, ds.task) if "0c" in rows else None
+    # Split hygiene (design §7.1 rule 3): corpus rows that are test queries (ArguAna) never become anchors.
+    allowed = np.setdiff1d(np.arange(ds.N), ds.self_rows)
+    anchor_ids = allowed[select_anchors(E_src[allowed], K, seed)]
     proxies = [extract_query_proxy(ds.titles[i], ds.texts[i]) for i in anchor_ids]
     train_idx, val_idx = make_split(K, seed=seed)
     bundle = CalibrationBundle(
@@ -94,45 +110,133 @@ def run_pair(
     E_tgt = enc.docs(ds.titles, ds.texts)
     Q_tgt = enc.queries(ds.queries, ds.task)
     Y_query, mount = enc.timed_encode([tgt.format_query(p, ds.task) for p in proxies])
+    if "7" in rows and ds.query_lang:
+        bank_src, bank_q = load_shift_bank(ds.query_lang)
+        Y_bank_src, Y_bank_q = enc.queries(bank_src, ds.task), enc.queries(bank_q, ds.task)
     mount["projected_encode_ms_K2048"] = mount["encode_ms"] * 2048 / K
     if "8b" in rows:
         _, doc_mount = enc.timed_encode([tgt.format_doc(ds.titles[i], ds.texts[i]) for i in anchor_ids])
         mount.update({f"doc_{k}": v for k, v in doc_mount.items()})
     enc.unload()
 
-    def evaluate(Q: np.ndarray, E: np.ndarray) -> dict[str, np.ndarray]:
-        return per_query(search(Q, E, SEARCH_K, device), ds.qrels)
-
-    native_pq, oracle_pq = evaluate(Q_src, E_src), evaluate(Q_tgt, E_tgt)
-    native = {m: float(v.mean()) for m, v in native_pq.items()}
-    oracle = {m: float(v.mean()) for m, v in oracle_pq.items()}
-    ceiling_r30 = native_pq["recall@30"] if native["recall@30"] <= oracle["recall@30"] else oracle_pq["recall@30"]
+    native_ranked = search(Q_src, E_src, SEARCH_K, device, exclude=ds.self_rows)
+    oracle_ranked = search(Q_tgt, E_tgt, SEARCH_K, device, exclude=ds.self_rows)
+    native_pq, oracle_pq = per_query(native_ranked, ds.qrels), per_query(oracle_ranked, ds.qrels)
     anchor_Y = {"src_query": bundle.X_query_raw, "tgt_query": Y_query, "tgt_doc": E_tgt[anchor_ids]}
     X_distractor = E_src[bundle.distractor_ids]
 
-    base = {"dataset": ds.name, "src": src_key, "tgt": tgt_key, "K": K, "seed": seed, "n_queries": len(ds.queries)}
-    records = []
-    for row in rows:
-        rec = {**base, "row": row, "description": ROWS[row]}
-        if row in ("0a", "0b"):
-            pq = oracle_pq if row == "0a" else native_pq
-        else:
+    global _warm
+    if not _warm:  # one untimed fit, so the first row's timing excludes CUDA / cuSOLVER warmup
+        SpaceBridge(device=device).fit(bundle, Y_query, X_distractor=X_distractor)
+        _warm = True
+    bridged: dict[str, tuple[np.ndarray, dict, float, SpaceBridge]] = {}
+
+    def fit_row(row: str) -> tuple[np.ndarray, dict, float, SpaceBridge]:
+        if row not in bridged:
             y_kind, mode, pairs, restore = BRIDGE_ROWS[row]
-            bridge = SpaceBridge(device=device, restore_source_mean=restore, match_residual_norm=row not in ("6n", "8n"))
+            bridge = SpaceBridge(
+                device=device, restore_source_mean=restore, match_residual_norm=row not in ("6n", "8n"),
+                hard_negatives=10 if row == "8h" else 0,
+            )
             extra = {"Y_doc_raw": anchor_Y["tgt_doc"]} if row == "8b" else {}
             fit = bridge.fit(bundle, anchor_Y[y_kind], mode=mode, pairs=pairs, X_distractor=X_distractor, **extra)
             Q = Q_src if row == "1" else Q_tgt
-            pq = evaluate(bridge.transform_query(Q), E_src)
-            rec["fit"] = fit
-            rec["projection_us"] = _projection_latency_us(bridge, Q[0])
+            lang = None
+            if row == "7":
+                lang = ds.query_lang
+                bridge.register_query_language(lang, Y_bank_src, Y_bank_q)
+            ranked = search(bridge.transform_query(Q, query_lang=lang), E_src, SEARCH_K, device, exclude=ds.self_rows)
+            bridged[row] = (ranked, fit, _projection_latency_us(bridge, Q[0]), bridge)
+        return bridged[row]
+
+    base = {"dataset": ds.name, "src": src_key, "tgt": tgt_key, "K": K, "seed": seed, "n_queries": len(ds.queries)}
+    records = []
+    for row in (r for r in rows if r not in RERANK_DEPTH):
+        if row in ("0c", "7") and not ds.query_lang:
+            continue  # cross-lingual rows only
+        rec = {**base, "row": row, "description": ROWS[row]}
+        if row in ("0a", "0b"):
+            pq = oracle_pq if row == "0a" else native_pq
+        elif row == "0c":
+            pq = per_query(search(Q_src_direct, E_src, SEARCH_K, device, exclude=ds.self_rows), ds.qrels)
+        else:
+            ranked, rec["fit"], rec["projection_us"], bridge = fit_row(row)
+            pq = per_query(ranked, ds.qrels)
             if row != "1":
                 rec["mount"] = mount
-        rec["metrics"] = {m: float(v.mean()) for m, v in pq.items()}
-        rec["ci_ceil_recall@30"] = bootstrap_ratio_ci(pq["recall@30"], ceiling_r30)
-        rec["rho_oracle"], rec["rho_ceil"] = retention(rec["metrics"], native, oracle)
-        rec["rho_native"] = {m: v / native[m] if native[m] > 0 else float("nan") for m, v in rec["metrics"].items()}
-        records.append(rec)
+            if bridge.quality is not None and row != "1":
+                rec["quality"] = {"score": bridge.quality.score, "band": bridge.quality.band, "grade": bridge.quality.grade}
+                rec["confidence"] = _confidence_study(bridge, Q_tgt, ranked, native_ranked, pq, native_pq, oracle_pq)
+        records.append(_score_record(rec, pq, native_pq, oracle_pq))
+
+    rerank_rows = [r for r in rows if r in RERANK_DEPTH]
+    if rerank_rows and rerankers:
+        ranked8, fit8, _, _ = fit_row("8")
+        docs = [f"{t}\n{x}" if t else x for t, x in zip(ds.titles, ds.texts)]
+        for rr_key in rerankers:
+            rr = Reranker(RERANKERS[rr_key], device)
+            for row in rerank_rows:
+                depth = RERANK_DEPTH[row]
+                out = {name: rerank(rr, r, depth, qs, docs, ds.task) for name, r, qs in
+                       (("native", native_ranked, ds.index_lang_queries), ("oracle", oracle_ranked, ds.queries),
+                        ("bridge", ranked8, ds.queries))}
+                pqs = {name: per_query(r, ds.qrels) for name, r in out.items()}
+                rec = {**base, "row": row, "description": ROWS[row], "reranker": rr_key, "depth": depth, "fit": fit8}
+                rec["baselines"] = {name: {m: float(v.mean()) for m, v in pqs[name].items()} for name in ("native", "oracle")}
+                rec["jaccard@5"] = {
+                    "bridge_vs_oracle": float(topk_jaccard(out["bridge"], out["oracle"]).mean()),
+                    "bridge_vs_native": float(topk_jaccard(out["bridge"], out["native"]).mean()),
+                    "native_vs_oracle": float(topk_jaccard(out["native"], out["oracle"]).mean()),
+                }
+                rec["rerank_ms_per_query"] = rr.timed_ms_per_query(ds.queries[0], [docs[j] for j in ranked8[0, :depth]], ds.task)
+                records.append(_score_record(rec, pqs["bridge"], pqs["native"], pqs["oracle"]))
+            rr.unload()
     return records
+
+
+def _score_record(rec: dict, pq: dict, native_pq: dict, oracle_pq: dict) -> dict:
+    """Adds mean metrics, retention ratios and paired-bootstrap ceiling CIs to ``rec``."""
+    native = {m: float(v.mean()) for m, v in native_pq.items()}
+    oracle = {m: float(v.mean()) for m, v in oracle_pq.items()}
+    rec["metrics"] = {m: float(v.mean()) for m, v in pq.items()}
+    rec["ci_ceil"] = {
+        m: bootstrap_ratio_ci(pq[m], native_pq[m] if native[m] <= oracle[m] else oracle_pq[m]) for m in CI_METRICS
+    }
+    rec["ci_ceil_recall@30"] = rec["ci_ceil"]["recall@30"]
+    rec["rho_oracle"], rec["rho_ceil"] = retention(rec["metrics"], native, oracle)
+    rec["rho_native"] = {m: v / native[m] if native[m] > 0 else float("nan") for m, v in rec["metrics"].items()}
+    return rec
+
+
+def _confidence_study(
+    bridge: SpaceBridge, Q_tgt: np.ndarray, ranked: np.ndarray, native_ranked: np.ndarray,
+    pq: dict, native_pq: dict, oracle_pq: dict, n_bins: int = 5,
+) -> dict:
+    """Real-query retention by quintile of per-query confidence (design §5.1)."""
+    _, conf = bridge.transform_query(Q_tgt, return_confidence=True)
+    support = bridge.query_support(Q_tgt)
+    overlap = np.array([len(set(a[:30]) & set(b[:30])) / 30 for a, b in zip(ranked, native_ranked)])
+    ceil = native_pq["recall@30"] if native_pq["recall@30"].mean() <= oracle_pq["recall@30"].mean() else oracle_pq["recall@30"]
+    bins = np.array_split(np.argsort(support, kind="stable"), n_bins)
+    return {
+        "spearman_support_overlap30": _spearman(support, overlap),
+        "support_mean": float(support.mean()),
+        "conf_mean": float(conf.mean()),
+        "quintiles": [
+            {
+                "support": float(support[b].mean()),
+                "conf": float(conf[b].mean()),
+                "overlap@30_native": float(overlap[b].mean()),
+                "rho_ceil_recall@30": float(pq["recall@30"][b].sum() / max(ceil[b].sum(), 1e-9)),
+            }
+            for b in bins
+        ],
+    }
+
+
+def _spearman(a: np.ndarray, b: np.ndarray) -> float:
+    ra, rb = np.argsort(np.argsort(a)), np.argsort(np.argsort(b))
+    return float(np.corrcoef(ra, rb)[0, 1])
 
 
 def _projection_latency_us(bridge: SpaceBridge, q: np.ndarray, n: int = 1000) -> float:
@@ -149,7 +253,7 @@ def print_table(records: list[dict]) -> None:
     header = f"{'row':>4}  {'R@10':>6} {'R@30':>6} {'nDCG@10':>7}  {'ρceil@30':>8} {'95% CI':^13} {'ρorac@30':>8}  {'ρ_val':>6}  {'solver':<16} status"
     print(header)
     print("-" * len(header))
-    for r in records:
+    for r in (r for r in records if r["row"] not in RERANK_DEPTH):
         m, fit = r["metrics"], r.get("fit", {})
         solver = fit.get("solver", "")
         if "lambda_rel" in fit:
@@ -162,6 +266,19 @@ def print_table(records: list[dict]) -> None:
             f"{r['row']:>4}  {m['recall@10']:6.3f} {m['recall@30']:6.3f} {m['ndcg@10']:7.3f}  "
             f"{r['rho_ceil']['recall@30']:8.3f} [{lo:.3f},{hi:.3f}] {r['rho_oracle']['recall@30']:8.3f}  {rho_val:>6}  {solver:<16} {fit.get('status', '')}"
         )
+    rr = [r for r in records if r["row"] in RERANK_DEPTH]
+    if rr:
+        header = f"{'row':>4} {'reranker':<20} {'depth':>5}  {'nDCG@5 nat/orc/bridge':^23}  {'ρceil nDCG@5':>12} {'95% CI':^13}  {'ρceil R@5':>9}  {'J@5 orc':>7}  {'ms/q':>6}"
+        print(header)
+        print("-" * len(header))
+        for r in rr:
+            b, m = r["baselines"], r["metrics"]
+            lo, hi = r["ci_ceil"]["ndcg@5"]
+            print(
+                f"{r['row']:>4} {r['reranker']:<20} {r['depth']:>5}  {b['native']['ndcg@5']:.3f}/{b['oracle']['ndcg@5']:.3f}/{m['ndcg@5']:.3f}  "
+                f"{r['rho_ceil']['ndcg@5']:12.3f} [{lo:.3f},{hi:.3f}]  {r['rho_ceil']['recall@5']:9.3f}  "
+                f"{r['jaccard@5']['bridge_vs_oracle']:7.3f}  {r['rerank_ms_per_query']:6.0f}"
+            )
     mount = next((r["mount"] for r in records if "mount" in r), None)
     if mount:
         print(
@@ -177,7 +294,9 @@ def main() -> None:
     p.add_argument("--dataset", default="scifact", choices=sorted(DATASETS))
     p.add_argument("--tier", nargs="*", default=[], choices=sorted(TIERS))
     p.add_argument("--pair", nargs="*", default=[], help="src:tgt model keys, e.g. bge-large-en:qwen3-0.6b")
-    p.add_argument("--rows", nargs="*", default=list(ROWS), choices=list(ROWS))
+    p.add_argument("--rows", nargs="*", default=[r for r in ROWS if r not in RERANK_DEPTH], choices=list(ROWS),
+                   help="ablation rows; rerank rows 9n/9/9w are opt-in")
+    p.add_argument("--rerankers", nargs="*", default=list(RERANKERS), choices=list(RERANKERS))
     p.add_argument("--K", type=int, nargs="*", default=[2048], help="anchor budget(s); one run per value")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda")
@@ -195,7 +314,7 @@ def main() -> None:
     ds = load_beir(args.dataset)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     for (src, tgt), K in ((pr, K) for pr in pairs for K in args.K):
-        records = run_pair(ds, src, tgt, K, args.seed, args.rows, args.device)
+        records = run_pair(ds, src, tgt, K, args.seed, args.rows, args.device, tuple(args.rerankers))
         with args.out.open("a") as f:
             for rec in records:
                 f.write(json.dumps(rec, default=_json_default) + "\n")

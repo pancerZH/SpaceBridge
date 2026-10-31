@@ -1,0 +1,137 @@
+"""Fit the quality score (design §5.1): calibration-time measurements -> real Recall@30 ceiling retention.
+
+Uses every bridged fit with quality measurements in the given spacebridge-bench JSONL files, validates
+by leave-one-dataset-out (LODO), compares against a rho_val-only baseline, and writes the coefficients
+to src/spacebridge/quality_calibration.json.
+
+    uv run python scripts/calibrate_quality.py outputs/m2_*.jsonl
+"""
+
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+
+from spacebridge.quality import CALIBRATION_PATH
+
+TARGET = "recall@30"
+ROWS = ("6", "6b", "6n", "8", "8s", "8n", "8b")
+# Candidate measurements; ``fidelity.agree@10`` alone is the rho_val baseline.
+FEATURES = [
+    "fidelity.agree@10",
+    "fidelity.nbr_recall@30",
+    "recoverability.nbr_recall@100",
+    "fit.val_resid_cos",
+    "fit.train_val_gap",
+    "fit.rank_ratio",
+    "difficulty.teacher_gap_sd",
+    "difficulty.cone_angle_deg",
+    "coverage.K_over_dt",
+]
+ALPHAS = (0.01, 0.1, 1.0, 10.0, 100.0)
+
+
+def load(paths: list[Path]) -> list[dict]:
+    recs = []
+    for path in paths:
+        for line in path.open():
+            r = json.loads(line)
+            if r["row"] in ROWS and "quality" in r.get("fit", {}) and "reranker" not in r:
+                recs.append(r)
+    # One record per configuration (last run wins).
+    return list({(r["dataset"], r["src"], r["tgt"], r["K"], r["row"]): r for r in recs}.values())
+
+
+def features(r: dict, names: list[str]) -> list[float]:
+    flat = {f"{g}.{k}": v for g, vals in r["fit"]["quality"].items() for k, v in vals.items()}
+    return [flat[n] for n in names]
+
+
+def fit_ridge(X, y, w, alpha):
+    mean, scale = np.average(X, axis=0, weights=w), X.std(0) + 1e-12
+    Z = (X - mean) / scale
+    sw = np.sqrt(w)[:, None]
+    A = np.hstack([np.ones((len(Z), 1)), Z]) * sw
+    reg = alpha * np.eye(A.shape[1])
+    reg[0, 0] = 0.0  # intercept is not penalized
+    beta = np.linalg.solve(A.T @ A + reg, A.T @ (y * sw[:, 0]))
+    return {"mean": mean, "scale": scale, "intercept": beta[0], "coef": beta[1:]}
+
+
+def predict(m, X):
+    return m["intercept"] + ((X - m["mean"]) / m["scale"]) @ m["coef"]
+
+
+def lodo(X, y, w, datasets, alpha):
+    pred = np.empty_like(y)
+    for d in np.unique(datasets):
+        test = datasets == d
+        pred[test] = predict(fit_ridge(X[~test], y[~test], w[~test], alpha), X[test])
+    return pred
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("results", type=Path, nargs="+")
+    p.add_argument("--write", action="store_true", help=f"write {CALIBRATION_PATH.name}")
+    args = p.parse_args()
+    recs = load(args.results)
+    datasets = np.array([r["dataset"] for r in recs])
+    y = np.array([r["rho_ceil"][TARGET] for r in recs])
+    # Inverse-variance weights from each fit's paired-bootstrap CI (50-query sets count less).
+    se = np.array([(r["ci_ceil"][TARGET][1] - r["ci_ceil"][TARGET][0]) / 3.92 for r in recs])
+    w = 1.0 / np.maximum(se, 0.01) ** 2
+    print(f"{len(recs)} fits from {len(set(datasets))} datasets: {dict(zip(*np.unique(datasets, return_counts=True)))}\n")
+
+    results = {}
+    for name, feats in (("rho_val only", FEATURES[:1]), ("all measurements", FEATURES)):
+        X = np.array([features(r, feats) for r in recs])
+        best = min(ALPHAS, key=lambda a: np.average((lodo(X, y, w, datasets, a) - y) ** 2, weights=w))
+        pred = lodo(X, y, w, datasets, best)
+        results[name] = (feats, X, best, pred)
+        resid = pred - y
+        print(f"## {name} (alpha={best}): LODO weighted RMSE {100 * np.sqrt(np.average(resid**2, weights=w)):.1f} points\n")
+        print("| held-out dataset | fits | observed mean | predicted mean | bias | MAE | within ±RMSE band |")
+        print("| --- | --- | --- | --- | --- | --- | --- |")
+        band = np.sqrt(np.average(resid**2, weights=w))
+        for d in np.unique(datasets):
+            m = datasets == d
+            print(
+                f"| {d} | {m.sum()} | {100 * y[m].mean():.1f} | {100 * pred[m].mean():.1f} | {100 * resid[m].mean():+.1f} | "
+                f"{100 * np.abs(resid[m]).mean():.1f} | {np.mean(np.abs(resid[m]) <= band):.0%} |"
+            )
+        print()
+
+    feats, X, alpha, pred = results["all measurements"]
+    m = fit_ridge(X, y, w, alpha)
+    resid = pred - y
+    band = float(np.sqrt(np.average(resid**2, weights=w)))
+    per_ds = {d: float(np.abs(resid[datasets == d]).mean()) for d in np.unique(datasets)}
+    transfers = sum(v <= band for v in per_ds.values())
+    print("## final model (all fits)\n")
+    for f, c in sorted(zip(feats, m["coef"]), key=lambda t: -abs(t[1])):
+        print(f"- {f}: {100 * c:+.2f} points per s.d.")
+    print(f"- intercept {100 * m['intercept']:.1f}; band ±{100 * band:.1f} (LODO RMSE); "
+          f"transfers on {transfers}/{len(per_ds)} held-out datasets")
+    if args.write:
+        out = {
+            "target": f"rho_ceil {TARGET}",
+            "features": feats,
+            "mean": m["mean"].tolist(),
+            "scale": m["scale"].tolist(),
+            "coef": m["coef"].tolist(),
+            "intercept": float(m["intercept"]),
+            "alpha": alpha,
+            "resid_sd": band,
+            "lodo_mae_by_dataset": per_ds,
+            "n_fits": len(recs),
+            # Design §5.1: experimental until LODO error is within the band on >= 4 datasets.
+            "experimental": transfers < 4 or len(per_ds) < 4,
+        }
+        CALIBRATION_PATH.write_text(json.dumps(out, indent=2) + "\n")
+        print(f"\nwrote {CALIBRATION_PATH}")
+
+
+if __name__ == "__main__":
+    main()

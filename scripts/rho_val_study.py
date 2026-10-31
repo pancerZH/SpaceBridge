@@ -56,8 +56,8 @@ def main() -> None:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     for src, tgt in pairs:
         s, t = emb[src], emb[tgt]
-        native = evaluate(search(s["q"], s["docs"], 100, args.device), ds.qrels)
-        oracle = evaluate(search(t["q"], t["docs"], 100, args.device), ds.qrels)
+        native = evaluate(search(s["q"], s["docs"], 100, args.device, exclude=ds.self_rows), ds.qrels)
+        oracle = evaluate(search(t["q"], t["docs"], 100, args.device, exclude=ds.self_rows), ds.qrels)
         ceiling = min(native[TARGET], oracle[TARGET])
         for K in (K for K in KS if K <= N):
             ids = select_anchors(s["docs"], K)
@@ -70,7 +70,7 @@ def main() -> None:
             for mode, restore in SETTINGS:
                 bridge = SpaceBridge(device=args.device, restore_source_mean=restore)
                 fit = bridge.fit(bundle, t["proxy"][ids], mode=mode, X_distractor=s["docs"][bundle.distractor_ids])
-                real = evaluate(search(bridge.transform_query(t["q"]), s["docs"], 100, args.device), ds.qrels)
+                real = evaluate(search(bridge.transform_query(t["q"]), s["docs"], 100, args.device, exclude=ds.self_rows), ds.qrels)
                 rows.append({
                     "src": src, "tgt": tgt, "K": K, "mode": mode, "restore": restore,
                     "retention": real[TARGET] / ceiling, **fit["val_metrics"],

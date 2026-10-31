@@ -15,6 +15,7 @@ class ModelSpec:
     batch_size: int = 64
     langs: tuple[str, ...] = ("en",)
     tokenizer_kwargs: dict = field(default_factory=dict)
+    config_kwargs: dict = field(default_factory=dict)
 
     def format_query(self, text: str, task: str) -> str:
         return self.query_template.format(task=task, text=text)
@@ -57,7 +58,7 @@ MODELS: dict[str, ModelSpec] = {
         ModelSpec(
             "embeddinggemma-2", "google/embeddinggemma-2", 768, 0.27,
             "task: search result | query: {text}", doc_template="title: {title_or_none} | text: {text}",
-            langs=("multi",),
+            langs=("multi",), config_kwargs={"vision_config": None, "audio_config": None},  # text-only, 270M
         ),
     ]
 }

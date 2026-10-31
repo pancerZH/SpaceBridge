@@ -31,6 +31,7 @@ class Encoder:
                 device=self.device,
                 model_kwargs={"torch_dtype": torch.bfloat16},
                 processor_kwargs=self.spec.tokenizer_kwargs,
+                config_kwargs=self.spec.config_kwargs or None,
             )
             self._model.max_seq_length = self.spec.max_seq_length
         return self._model

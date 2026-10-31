@@ -51,7 +51,7 @@ def main() -> None:
     E_src = s["docs"]
 
     def evaluate(Q: np.ndarray, E: np.ndarray) -> dict[str, np.ndarray]:
-        return per_query(search(Q, E, 100, args.device), test.qrels)
+        return per_query(search(Q, E, 100, args.device, exclude=test.self_rows), test.qrels)
 
     native, oracle = evaluate(s["test_q"], E_src), evaluate(t["test_q"], t["docs"])
     ceiling = {m: native[m] if native[m].mean() <= oracle[m].mean() else oracle[m] for m in METRICS}

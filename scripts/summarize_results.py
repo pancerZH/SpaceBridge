@@ -35,7 +35,7 @@ def main() -> None:
     p.add_argument("results", type=Path)
     p.add_argument("--K", type=int, default=2048, help="anchor count for the headline tables")
     args = p.parse_args()
-    recs = [json.loads(line) for line in args.results.open()]
+    recs = [r for r in (json.loads(line) for line in args.results.open()) if "reranker" not in r]
     by = {(r["src"], r["tgt"], r["K"], r["row"]): r for r in recs}  # last run wins
     pairs = list(dict.fromkeys((r["src"], r["tgt"]) for r in recs))
     Ks = sorted({r["K"] for r in recs})
@@ -51,6 +51,9 @@ def main() -> None:
         cells = [f"{TIER_OF.get((src, tgt), '3')}", f"{src} ← {tgt}", f"{nat['recall@30']:.3f} / {nat['ndcg@10']:.3f}", f"{orc['recall@30']:.3f} / {orc['ndcg@10']:.3f}", f"{g('1')['rho_ceil']['recall@30']:.3f}"]
         for row in ("2", "6", "6n", "8", "8n", "8b"):
             r = g(row)
+            if r is None:
+                cells.append("")
+                continue
             lo, hi = r["ci_ceil_recall@30"]
             cells.append(f"{r['rho_ceil']['recall@30']:.3f} [{lo:.2f},{hi:.2f}]")
         rows.append(cells)
@@ -60,6 +63,8 @@ def main() -> None:
     rows = []
     for row in ["1"] + BRIDGE_ROWS:
         rs = [by[(s, t, K, row)] for s, t in pairs if (s, t, K, row) in by]
+        if not rs:
+            continue
         mean = lambda f: np.mean([f(r) for r in rs])
         wins = sum(r["rho_ceil"]["recall@30"] >= 0.95 for r in rs)
         rows.append([
@@ -102,7 +107,9 @@ def main() -> None:
     print(f"\n## Timing at K = {K}\n")
     rows = []
     for src, tgt in pairs:
-        r8b, r8 = by.get((src, tgt, K, "8b")), by[(src, tgt, K, "8")]
+        r8b, r8 = by.get((src, tgt, K, "8b")), by.get((src, tgt, K, "8"))
+        if r8 is None:
+            continue
         m, f = r8["mount"], r8["fit"]
         doc = (r8b or {}).get("mount", {})
         rows.append([
