@@ -10,6 +10,7 @@ from conftest import l2, make_world, overlap_at_k, top_k
 
 def _fit(world, Y, **kwargs):
     fit_kwargs = {k: kwargs.pop(k) for k in ("mode", "pairs", "Y_doc_raw") if k in kwargs}
+    kwargs.setdefault("doc_pairs", "Y_doc_raw" in fit_kwargs)  # most tests exercise query pairs alone
     bridge = SpaceBridge(device="cpu", **kwargs)
     info = bridge.fit(world.bundle, Y, X_distractor=world.E_src[world.bundle.distractor_ids], **fit_kwargs)
     return bridge, info
@@ -71,6 +72,12 @@ def test_doc_pairs_augment_stage1_and_stage2(world):
         _fit(world, world.Y_query, mode="naive", Y_doc_raw=world.Y_doc)
 
 
+def test_default_auto_fit_requires_doc_pairs(world):
+    with pytest.raises(ValueError, match="Y_doc_raw"):
+        SpaceBridge(device="cpu").fit(world.bundle, world.Y_query)
+    SpaceBridge(device="cpu").fit(world.bundle, world.Y_query, mode="stage1")  # Stage 1 alone stays optional
+
+
 def test_naive_mode_runs_and_reports_status(world):
     _, info = _fit(world, world.Y_query, mode="naive")
     assert info["status"] in {"HIGH_CONFIDENCE", "MODERATE_DRIFT", "LOW_ALIGNMENT_WARN"}
@@ -116,6 +123,11 @@ def test_quality_report_measurements_and_scoring(world):
     assert scored.score == pytest.approx(100 * (0.5 + 0.5 * feats["fidelity.agree@10"]))
     assert scored.band == pytest.approx((scored.score - 3, scored.score + 3))
     assert scored.grade in "ABCD"
+    assert scored.rerank_pool == {"A": 60, "B": 60, "C": 100, "D": 100}[scored.grade]
+    for intercept, pool in ((1.2, 60), (0.9, 60), (0.75, 100), (0.5, 100)):
+        r = score_report(QualityReport(report.details), {**calib, "coef": [0.0], "intercept": intercept})
+        assert r.rerank_pool == pool  # a high grade never shrinks the pool below the default
+    assert QualityReport(report.details).rerank_pool == 60  # unscored reports keep the default
 
 
 def test_per_query_confidence_is_bounded_and_lower_off_distribution(world):

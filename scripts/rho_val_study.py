@@ -68,7 +68,7 @@ def main() -> None:
                 distractor_ids=sample_distractors(N, ids),
             )
             for mode, restore in SETTINGS:
-                bridge = SpaceBridge(device=args.device, restore_source_mean=restore)
+                bridge = SpaceBridge(device=args.device, restore_source_mean=restore, doc_pairs=False)
                 fit = bridge.fit(bundle, t["proxy"][ids], mode=mode, X_distractor=s["docs"][bundle.distractor_ids])
                 real = evaluate(search(bridge.transform_query(t["q"]), s["docs"], 100, args.device, exclude=ds.self_rows), ds.qrels)
                 rows.append({

@@ -83,6 +83,7 @@ class SpaceBridge:
         selection_pool: int = 10_000,
         hard_negatives: int = 0,
         stage2_signal: str = "owndoc_mrr",
+        doc_pairs: bool = True,
     ):
         if device.startswith("cuda") and not torch.cuda.is_available():
             device = "cpu"
@@ -99,6 +100,9 @@ class SpaceBridge:
         if stage2_signal not in ("owndoc_mrr", "agree@10"):
             raise ValueError(f"unknown stage2_signal {stage2_signal!r}")
         self.stage2_signal = stage2_signal
+        # Default mount (M2): ``auto`` fits also use doc<->doc pairs (Row 8b, best first stage on 5 of
+        # 6 BEIR sets and on cross-lingual); False is the opt-out for ablation rows without them.
+        self.doc_pairs = doc_pairs
         self.src_lang: str = "en"
         self.mu_x_query: Optional[np.ndarray] = None
         self.mu_y_by_lang: Dict[str, np.ndarray] = {}
@@ -142,6 +146,11 @@ class SpaceBridge:
             raise ValueError("Stage-2 refinement needs query-proxy pairs")
         if Y_doc_raw is not None and (pairs != "query" or mode == "naive"):
             raise ValueError("doc<->doc pairs augment centered query-proxy fits only")
+        if mode == "auto" and self.doc_pairs and Y_doc_raw is None:
+            raise ValueError(
+                "the default auto fit uses doc<->doc pairs: pass Y_doc_raw (anchor docs encoded with the "
+                "target doc prompt), or construct SpaceBridge(doc_pairs=False)"
+            )
         Y = self._t(Y_raw)
         Xq, Xd = self._t(bundle.X_query_raw), self._t(bundle.X_doc_raw)
         X_pairs = Xq if pairs == "query" else Xd

@@ -72,7 +72,7 @@ def main() -> None:
             X_doc_raw=Xd, X_query_raw=Xq, train_idx=train_idx, val_idx=val_idx,
             distractor_ids=sample_distractors(N, np.unique(anchor_ids)),
         )
-        bridge = SpaceBridge(device=args.device, restore_source_mean=restore)
+        bridge = SpaceBridge(device=args.device, restore_source_mean=restore, doc_pairs=False)
         fit = bridge.fit(bundle, Yq, mode=mode, X_distractor=E_src[bundle.distractor_ids])
         solver = fit["solver"] + (f" λ={fit['lambda_rel']}" if "lambda_rel" in fit else "")
         solver += f" +S2@{fit['stage2_best_step']}" if "stage2_best_step" in fit else ""

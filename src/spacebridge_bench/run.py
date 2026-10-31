@@ -25,7 +25,7 @@ ROWS = {
     "0a": "Oracle full re-index (M_tgt docs + M_tgt queries)",
     "0b": "M_src native (ceiling; parallel index-language queries for cross-lingual sets)",
     "0c": "M_src encoding the test queries directly (cross-lingual sets: no bridge)",
-    "1": "Identity sanity (M_tgt := M_src, full pipeline)",
+    "1": "Identity sanity (M_tgt := M_src, full default pipeline incl. doc<->doc pairs)",
     "2": "Uncentered full-SVD Procrustes, doc anchors",
     "3s": "+ centering + mean restore + scaled truncated Stiefel, doc anchors",
     "3r": "+ centering + mean restore + ridge (lambda sweep), doc anchors",
@@ -34,10 +34,11 @@ ROWS = {
     "6b": "Row 6 without mean restore",
     "6n": "Row 6 without residual norm matching",
     "7": "Row 8 + language-cone shift correction (Tatoeba stand-in for FLORES; cross-lingual sets)",
+    "7b": "Row 8b + language-cone shift correction (default engine on cross-lingual sets)",
     "8": "+ Stage-2 InfoNCE + KL refinement",
     "8s": "Row 8 without mean restore",
     "8n": "Row 8 without residual norm matching",
-    "8b": "Row 8 + doc<->doc pairs (anchor docs encoded by M_tgt)",
+    "8b": "Row 8 + doc<->doc pairs (anchor docs encoded by M_tgt; default engine)",
     "8h": "Row 8 + Stage-2 hard negatives (teacher top-10 index docs per training proxy)",
     "9n": "Row 8 bridged top-30 + cross-encoder rerank",
     "9": "Row 8 bridged top-60 + cross-encoder rerank",
@@ -55,6 +56,7 @@ BRIDGE_ROWS = {
     "6b": ("tgt_query", "stage1", "query", False),
     "6n": ("tgt_query", "stage1", "query", True),
     "7": ("tgt_query", "auto", "query", True),  # + register_query_language
+    "7b": ("tgt_query", "auto", "query", True),  # + Y_doc_raw + register_query_language
     "8": ("tgt_query", "auto", "query", True),
     "8s": ("tgt_query", "auto", "query", False),
     "8n": ("tgt_query", "auto", "query", True),
@@ -123,11 +125,11 @@ def run_pair(
     E_tgt = enc.docs(ds.titles, ds.texts)
     Q_tgt = enc.queries(ds.queries, ds.task)
     Y_query, mount = enc.timed_encode([tgt.format_query(p, ds.task) for p in proxies])
-    if "7" in rows and ds.query_lang:
+    if {"7", "7b"} & set(rows) and ds.query_lang:
         bank_src, bank_q = load_shift_bank(ds.query_lang)
         Y_bank_src, Y_bank_q = enc.queries(bank_src, ds.task), enc.queries(bank_q, ds.task)
     mount["projected_encode_ms_K2048"] = mount["encode_ms"] * 2048 / K
-    if "8b" in rows:
+    if {"8b", "7b"} & set(rows):
         _, doc_mount = enc.timed_encode([tgt.format_doc(ds.titles[i], ds.texts[i]) for i in anchor_ids])
         mount.update({f"doc_{k}": v for k, v in doc_mount.items()})
     enc.unload()
@@ -136,11 +138,13 @@ def run_pair(
     oracle_ranked = search(Q_tgt, E_tgt, SEARCH_K, device, exclude=ds.self_rows)
     native_pq, oracle_pq = per_query(native_ranked, ds.qrels), per_query(oracle_ranked, ds.qrels)
     anchor_Y = {"src_query": bundle.X_query_raw, "tgt_query": Y_query, "tgt_doc": E_tgt[anchor_ids]}
+    # Rows that run the default engine (doc<->doc pairs on); the identity row pairs source docs with themselves.
+    doc_rows = {"1": bundle.X_doc_raw, "8b": anchor_Y["tgt_doc"], "7b": anchor_Y["tgt_doc"]}
     X_distractor = E_src[bundle.distractor_ids]
 
     global _warm
     if not _warm:  # one untimed fit, so the first row's timing excludes CUDA / cuSOLVER warmup
-        SpaceBridge(device=device).fit(bundle, Y_query, X_distractor=X_distractor)
+        SpaceBridge(device=device, doc_pairs=False).fit(bundle, Y_query, X_distractor=X_distractor)
         _warm = True
     bridged: dict[str, tuple[np.ndarray, dict, float, SpaceBridge]] = {}
 
@@ -149,13 +153,13 @@ def run_pair(
             y_kind, mode, pairs, restore = BRIDGE_ROWS[row]
             bridge = SpaceBridge(
                 device=device, restore_source_mean=restore, match_residual_norm=row not in ("6n", "8n"),
-                hard_negatives=10 if row == "8h" else 0,
+                hard_negatives=10 if row == "8h" else 0, doc_pairs=row in doc_rows,
             )
-            extra = {"Y_doc_raw": anchor_Y["tgt_doc"]} if row == "8b" else {}
+            extra = {"Y_doc_raw": doc_rows[row]} if row in doc_rows else {}
             fit = bridge.fit(bundle, anchor_Y[y_kind], mode=mode, pairs=pairs, X_distractor=X_distractor, **extra)
             Q = Q_src if row == "1" else Q_tgt
             lang = None
-            if row == "7":
+            if row in ("7", "7b"):
                 lang = ds.query_lang
                 bridge.register_query_language(lang, Y_bank_src, Y_bank_q)
             ranked = search(bridge.transform_query(Q, query_lang=lang), E_src, SEARCH_K, device, exclude=ds.self_rows)
@@ -165,7 +169,7 @@ def run_pair(
     base = {"dataset": ds.name, "src": src_key, "tgt": tgt_key, "K": K, "seed": seed, "n_queries": len(ds.queries)}
     records = []
     for row in (r for r in rows if r not in RERANK_DEPTH):
-        if row in ("0c", "7") and not ds.query_lang:
+        if row in ("0c", "7", "7b") and not ds.query_lang:
             continue  # cross-lingual rows only
         rec = {**base, "row": row, "description": ROWS[row]}
         if row in ("0a", "0b"):

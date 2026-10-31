@@ -9,6 +9,11 @@ import numpy as np
 
 CALIBRATION_PATH = Path(__file__).with_name("quality_calibration.json")
 GRADES = ((95.0, "A"), (85.0, "B"), (70.0, "C"))
+# Advisory routing (M2): the score's ±4.3-point transfer error is about half a grade and it over-predicts
+# hard corpora (trec-covid by 8 points), so a grade may widen the rerank pool but never shrink it below
+# the default of 60, where Tier 1 and 3 of 4 Tier 3 pairs meet their end-to-end targets on fiqa.
+DEFAULT_RERANK_POOL = 60
+RERANK_POOL_BY_GRADE = {"A": 60, "B": 60, "C": 100, "D": 100}
 
 
 @dataclass
@@ -17,6 +22,7 @@ class QualityReport:
     score: Optional[float] = None               # predicted % ceiling Recall@30 retention
     band: Optional[tuple[float, float]] = None  # score ± one residual s.d. of the calibration fit
     grade: Optional[str] = None
+    rerank_pool: int = DEFAULT_RERANK_POOL       # advisory routing: candidates to send to the cross-encoder
     experimental: bool = True
     notes: list[str] = field(default_factory=list)
 
@@ -48,4 +54,9 @@ def score_report(report: QualityReport, calibration: Optional[dict]) -> QualityR
     sd = 100.0 * calibration["resid_sd"]
     report.score, report.band, report.grade = score, (score - sd, score + sd), grade(score)
     report.experimental = calibration.get("experimental", True)
+    report.rerank_pool = RERANK_POOL_BY_GRADE[report.grade]
+    if report.grade in "CD":
+        report.notes.append(f"grade {report.grade}: expect noticeable loss vs. re-indexing; rerank pool widened")
+    if report.grade == "D":
+        report.notes.append("recommend native re-indexing with the target model")
     return report

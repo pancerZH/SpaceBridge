@@ -72,7 +72,8 @@ def main() -> None:
         print(f"\n{src} <- {tgt}")
         print(f"{'config':<13} {'ρceil R@30':>10} {'nDCG@10':>8}  " + " ".join(f"{x:>14}" for x in SIGNALS) + "  step")
         for name, (mode, rc, hn, signal) in CONFIGS.items():
-            bridge = SpaceBridge(device=args.device, refine_config=RefineConfig(**rc), hard_negatives=hn, stage2_signal=signal)
+            bridge = SpaceBridge(device=args.device, refine_config=RefineConfig(**rc), hard_negatives=hn, stage2_signal=signal,
+                                 doc_pairs=False)
             fit = bridge.fit(bundle, Y, mode=mode, X_distractor=E[bundle.distractor_ids])
             pq = evaluate(bridge.transform_query(t["q"]), E)
             rec = {
