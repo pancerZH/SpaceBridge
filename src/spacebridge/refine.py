@@ -27,10 +27,15 @@ class RefineConfig:
     beta: Optional[float] = None  # None: 1e-3, or 1e-2 when d_t > K_train
     eval_every: int = 10
     early_stop: bool = True  # False: run all steps and return the final W (validation is only logged)
-    # Checkpoint selection (``select_checkpoint``): "floor" keeps the checkpoint with the best held-out own-doc
-    # MRR among those keeping min_agree_ratio of step 0's teacher agree@10 (the M2 rule).
+    # Checkpoint selection. "floor" (M2): the checkpoint with the best held-out own-doc MRR among those keeping
+    # min_agree_ratio of step 0's teacher agree@10. "tail" (M4): the average of the checkpoints from step
+    # tail_from on, if its own agree@10 clears the gap floor a0 - floor_gap * (1 - a0) (a0: step 0's agree@10, so
+    # the allowed loss scales with Stage 1's disagreement with the teacher and stays tight near the identity);
+    # otherwise the "floor" choice under the gap floor.
     stop_rule: str = "floor"
     min_agree_ratio: float = 0.9
+    floor_gap: float = 0.25
+    tail_from: int = 20
     keep_checkpoints: bool = False  # studies: also return every checkpoint's W (info["checkpoints"])
     # Stage 2 is full-batch (rows x candidates logits). With more candidates than this, each step trains on
     # a random subset of this many candidates and the rows whose positive is in it, so the per-step cost stays
@@ -39,18 +44,24 @@ class RefineConfig:
     batch_candidates: Optional[int] = 1638
 
 
-def floor_scores(curve: Sequence[tuple[int, dict]], min_agree_ratio: float) -> list[float]:
-    """Own-doc MRR of each checkpoint, or -inf when it keeps less than ``min_agree_ratio`` of step 0's agree@10."""
-    floor = min_agree_ratio * curve[0][1]["agree"]
+def agree_floor(a0: float, cfg: RefineConfig) -> float:
+    """Lowest teacher agree@10 a Stage-2 candidate may have, given step 0's ``a0``."""
+    if cfg.stop_rule == "floor":
+        return cfg.min_agree_ratio * a0
+    if cfg.stop_rule == "tail":
+        return a0 - cfg.floor_gap * (1 - a0)
+    raise ValueError(f"unknown Stage-2 stop rule {cfg.stop_rule!r}")
+
+
+def floor_scores(curve: Sequence[tuple[int, dict]], floor: float) -> list[float]:
+    """Own-doc MRR of each checkpoint, or -inf when its agree@10 is below ``floor``."""
     return [s["mrr"] if s["agree"] >= floor else -math.inf for _, s in curve]
 
 
 def select_checkpoint(curve: Sequence[tuple[int, dict]], cfg: RefineConfig) -> int:
-    """Index into ``curve`` (``(step, signals)`` with step 0 first) of the checkpoint Stage 2 returns."""
-    if cfg.stop_rule == "floor":
-        scores = floor_scores(curve, cfg.min_agree_ratio)
-        return max(range(len(scores)), key=lambda i: (scores[i], -i))  # first best: ties keep the earlier step
-    raise ValueError(f"unknown Stage-2 stop rule {cfg.stop_rule!r}")
+    """Index into ``curve`` (``(step, signals)`` with step 0 first) of the best-MRR checkpoint above the floor."""
+    scores = floor_scores(curve, agree_floor(curve[0][1]["agree"], cfg))
+    return max(range(len(scores)), key=lambda i: (scores[i], -i))  # first best: ties keep the earlier step
 
 
 def refine(
@@ -115,14 +126,24 @@ def refine(
                 curve.append((step, val_signals(W.detach())))
             Ws.append(W.detach().clone())
 
+    floor = agree_floor(curve[0][1]["agree"], cfg)
     best = select_checkpoint(curve, cfg) if cfg.early_stop else len(curve) - 1
-    floor = floor_scores(curve, cfg.min_agree_ratio)
+    W_out, best_step, best_sig, averaged = Ws[best], curve[best][0], curve[best][1], False
+    if cfg.early_stop and cfg.stop_rule == "tail":
+        tail = [Wk for (s, _), Wk in zip(curve, Ws) if s >= cfg.tail_from]
+        if tail:
+            W_tail = torch.stack(tail).mean(0)
+            with torch.no_grad():
+                tail_sig = val_signals(W_tail)
+            if tail_sig["agree"] >= floor:  # reported as the last averaged step
+                W_out, best_step, best_sig, averaged = W_tail, curve[-1][0], tail_sig, True
+    rejected = floor_scores(curve, floor)[1:]
     info = {
-        "best_step": curve[best][0], "val_curve": curve, "beta": beta, "steps_run": step, "tau": tau,
+        "best_step": best_step, "averaged": averaged, "val_curve": curve, "beta": beta, "steps_run": step, "tau": tau,
         "teacher_sd": sd, "tau_scaled": tau != cfg.tau,
-        "mrr_gain": curve[best][1]["mrr"] - curve[0][1]["mrr"],
-        "floor_rejected": sum(v == -math.inf for v in floor[1:]) / max(len(floor) - 1, 1),
+        "mrr_gain": best_sig["mrr"] - curve[0][1]["mrr"],
+        "floor_rejected": sum(v == -math.inf for v in rejected) / max(len(rejected), 1),
     }
     if cfg.keep_checkpoints:
         info["checkpoints"] = list(zip((s for s, _ in curve), Ws))
-    return Ws[best], info
+    return W_out, info

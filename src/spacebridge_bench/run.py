@@ -292,7 +292,7 @@ def _score_record(rec: dict, pq: dict, native_pq: dict, oracle_pq: dict) -> dict
 
 
 def _checkpoint_study(bridge: SpaceBridge, Q: np.ndarray, lang: Optional[str], evaluate, ref_pq, native_pq, oracle_pq) -> dict:
-    """Real test retention of every Stage-2 checkpoint, and of two checkpoint averages (stop-rule studies).
+    """Real test retention of every Stage-2 checkpoint and of checkpoint averages (with their label-free signals).
 
     Retention is against ``ref_pq`` (native, for the identity row) or the ceiling min(native, oracle)."""
     def rho(pq):
@@ -305,12 +305,15 @@ def _checkpoint_study(bridge: SpaceBridge, Q: np.ndarray, lang: Optional[str], e
 
     W_sel = bridge.W
     Ws = dict(bridge.stage2_checkpoints)
-    variants = {**{str(s): W for s, W in Ws.items()}, "avg_all": np.mean(list(Ws.values()), 0),
-                "avg_10_50": np.mean([W for s, W in Ws.items() if s > 0], 0)}
+    averages = {"avg_all": np.mean(list(Ws.values()), 0)}
+    for lo in (10, 20, 30):
+        averages[f"avg_{lo}_50"] = np.mean([W for s, W in Ws.items() if s >= lo], 0)
     out = {}
-    for name, W in variants.items():
+    for name, W in {**{str(s): W for s, W in Ws.items()}, **averages}.items():
         bridge.W = W
         out[name] = rho(evaluate(bridge.transform_query(Q, query_lang=lang)))
+        if name in averages and bridge.stage2_signals is not None:
+            out[name]["signals"] = bridge.stage2_signals(W)
     bridge.W = W_sel
     return out
 
@@ -366,7 +369,7 @@ def print_table(records: list[dict]) -> None:
         if "lambda_rel" in fit:
             solver += f" λ={fit['lambda_rel']}"
         if "stage2_best_step" in fit:
-            solver += f" +S2@{fit['stage2_best_step']}"
+            solver += " +S2@tail" if fit.get("stage2_averaged") else f" +S2@{fit['stage2_best_step']}"
         rho_val = f"{fit['rho_val']:.3f}" if "rho_val" in fit else ""
         lo, hi = r["ci_ceil_recall@30"]
         print(

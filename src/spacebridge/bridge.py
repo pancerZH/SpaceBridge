@@ -106,6 +106,7 @@ class SpaceBridge:
         self.metrics: Dict[str, float] = {}
         self.quality: Optional[QualityReport] = None
         self.stage2_checkpoints: list[tuple[int, np.ndarray]] = []  # with RefineConfig(keep_checkpoints=True)
+        self.stage2_signals = None  # with keep_checkpoints: W (numpy) -> the label-free Stage-2 signals
         self._support_anchors: Optional[np.ndarray] = None  # (K_train, d_t) unit-norm centered target proxies
         self._conf_map: Optional[tuple[np.ndarray, np.ndarray]] = None  # isotonic support -> agreement knots
 
@@ -235,6 +236,7 @@ class SpaceBridge:
             self._sync()
             info["stage2_ms"] = 1e3 * (time.perf_counter() - t0)
             info["stage2_best_step"] = r_info["best_step"]
+            info["stage2_averaged"] = r_info["averaged"]
             info["stage2_steps_run"] = r_info["steps_run"]
             info["stage2_tau"] = r_info["tau"]
             info["stage2_gain"] = r_info["mrr_gain"]
@@ -243,6 +245,8 @@ class SpaceBridge:
             info["stage2_teacher_sd"] = r_info["teacher_sd"]
             info["stage2_tau_scaled"] = bool(r_info["tau_scaled"])
             self.stage2_checkpoints = [(s, Wk.cpu().numpy()) for s, Wk in r_info.get("checkpoints", [])]
+            if self.refine_config.keep_checkpoints:  # studies score other candidate maps with the same signals
+                self.stage2_signals = lambda W_np: stage2_signals(self._t(W_np))
 
         self.src_lang = bundle.src_lang
         self.W = W.cpu().numpy()

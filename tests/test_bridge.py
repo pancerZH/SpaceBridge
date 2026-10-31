@@ -186,3 +186,35 @@ def test_stage2_health_flags_blocked_and_compressed_fits(world):
 
     stage1, _ = _fit(world, world.Y_query, mode="stage1")
     assert "stage2" not in stage1.quality_report().details  # no Stage 2, no flag
+
+
+def test_tail_rule_floor_scales_with_stage1_disagreement():
+    from spacebridge.refine import agree_floor, select_checkpoint
+
+    tail = RefineConfig(stop_rule="tail", floor_gap=0.25)
+    assert agree_floor(0.6, tail) == pytest.approx(0.5)  # allowed loss 0.25 * (1 - 0.6)
+    assert agree_floor(1.0, tail) == pytest.approx(1.0)  # no loss allowed at perfect agreement
+    assert agree_floor(0.6, RefineConfig()) == pytest.approx(0.54)  # "floor": 90% of a0
+    curve = [(0, {"agree": 0.6, "mrr": 0.5}), (10, {"agree": 0.52, "mrr": 0.7}), (20, {"agree": 0.45, "mrr": 0.9})]
+    assert select_checkpoint(curve, tail) == 1  # step 20 is below the gap floor 0.5
+    assert select_checkpoint(curve, RefineConfig()) == 0  # both Stage-2 steps fail the 90% floor
+
+
+def test_tail_rule_averages_the_late_checkpoints(world):
+    kw = dict(mode="auto", Y_doc_raw=world.Y_doc)
+    cfg = dict(steps=30, stop_rule="tail", tail_from=20, floor_gap=2.0)  # loose floor: the average is accepted
+    bridge, info = _fit(world, world.Y_query, refine_config=RefineConfig(**cfg, keep_checkpoints=True), **kw)
+    assert info["stage2_averaged"] and info["stage2_best_step"] == 30
+    W20, W30 = (W for s, W in bridge.stage2_checkpoints if s >= 20)
+    np.testing.assert_allclose(bridge.W, (W20 + W30) / 2, atol=1e-5)
+
+    _, blocked = _fit(world, world.Y_query, refine_config=RefineConfig(**{**cfg, "floor_gap": -10.0}), **kw)
+    assert not blocked["stage2_averaged"] and blocked["stage2_best_step"] == 0  # floor above any agreement
+    assert blocked["stage2_floor_rejected"] == 1.0
+
+
+def test_tail_rule_keeps_the_identity(world):
+    bridge, info = _fit(world, world.bundle.X_query_raw, mode="auto", Y_doc_raw=world.bundle.X_doc_raw,
+                        refine_config=RefineConfig(steps=30, stop_rule="tail"))
+    native = top_k(world.Q_src, world.E_src)
+    assert overlap_at_k(native, top_k(bridge.transform_query(world.Q_src), world.E_src)) > 0.97
