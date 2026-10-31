@@ -187,10 +187,12 @@ $$\mathcal{L}(W) = (1 - \alpha)\, \mathcal{L}_{\text{InfoNCE}}\!\left(S_{\text{s
 with $\tau = 0.05$, $\alpha = 0.5$, $\beta = 10^{-3}$ (upgraded to $\beta = 10^{-2}$ when $d_t > K_{\text{train}}$ to prevent high-dimensional overfitting), early-stopped on held-out **own-doc MRR** of the $K_{\text{val}}$ proxies, subject to keeping $\ge 90\%$ of Stage 1's teacher agree@10 (evaluated every 10 steps; Stage-1 selection and Stage-2 stopping score on a fixed 10K-row subsample of the $\rho_{\text{val}}$ pool, all anchors plus random distractors, which keeps the solver at ≤ 152 ms for $K = 2,048$ on `fiqa`). The teacher is the native source ranking, i.e. exactly what the index would return for $M_{\text{src}}$ queries.
 
 > [!WARNING]
-> **Proxy-positive shortcut:** each query proxy is the lead sentence of its own positive document, so InfoNCE positives are lexically easy and may not transfer to real queries. Mitigations evaluated in the ablation: the teacher-KL term (which spreads mass over semantically related anchors), and an optional **doc↔doc term** (Row 8b) that encodes the anchor docs with $M_{\text{tgt}}^{\text{doc}}$ and adds $\mathcal{L}_{\text{InfoNCE}}$ over $\left(\text{Normalize}(\mu_X^{(d)} + \bar{Y}^{(d)} W_d)\right)(X^{(d)})^T$, doubling calibration pairs at the cost of a second encoding pass.
+> **Proxy-positive shortcut:** each query proxy is the lead sentence of its own positive document, so InfoNCE positives are lexically easy and may not transfer to real queries. Mitigations evaluated in the ablation: the teacher-KL term (which spreads mass over semantically related anchors), and a **doc↔doc term** (Row 8b; **on by default since M2**, see the note below) that encodes the anchor docs with $M_{\text{tgt}}^{\text{doc}}$ and adds $\mathcal{L}_{\text{InfoNCE}}$ over $\left(\text{Normalize}(\mu_X^{(d)} + \bar{Y}^{(d)} W_d)\right)(X^{(d)})^T$, doubling calibration pairs at the cost of a second encoding pass.
 
 > [!NOTE]
 > **Implementation finding (Stage-2 stopping, `fiqa`, M2 P4):** v2 early-stopped Stage 2 on teacher agree@10 and stopped at step 0 in ~85% of fits. Run for a fixed 50 steps, Stage 2 improved real $\rho_{\text{ceil}}$ `Recall@30` on 6 of 6 pairs at $K = 2,048$ (mean +1.9 points, `nDCG@10` +2.3) while *lowering* every teacher-agreement signal (agree@10, neighbour recall, score correlation): InfoNCE pulls the bridged query toward its positive document, away from reproducing $M_{\text{src}}$'s neighbours of the proxy. Held-out own-doc MRR was the only label-free signal that rose with the real gain. Used alone it exploits the proxy-positive shortcut (on the identity map it traded 20 points of agree@10 for +0.4 MRR, Row 1 fell to 98.1% of native), hence the 90% agreement floor. With both, Row 8 − Row 6 on `fiqa` is +2.2 points `Recall@30` / +2.5 `nDCG@10` at $K = 2,048$ (6 of 6 pairs positive), +1.8 / +1.3 at 4,096, +0.8 / +0.1 at 1,024; Row 1 stays ≥ 99.2% of native. Hard negatives (Row 8h) did not help (+1.5 vs. +1.9 at a fixed 50 steps). `SpaceBridge(stage2_signal="agree@10")` restores the v2 behaviour.
+>
+> **Default change (2026-10-31): doc↔doc pairs are on.** Across the six M2 BEIR sets, Row 8b was the best first-stage configuration on every dataset except `arguana` (a tie) and on all four Tier 5a pairs, and it recovered most of the `trec-covid` Tier 1 miss (+5.9 points `Recall@30` over Row 8). Cost: one extra $M_{\text{tgt}}^{\text{doc}}$ encoding pass over the $K$ anchor docs at mount (3–30 s for 0.6B-class models) and +50 ms solver time (164 / 174 ms mean / max at $K = 2,048$ on `fiqa`, inside the 250 ms budget). `fit(mode="auto")` therefore requires `Y_doc_raw`; `SpaceBridge(doc_pairs=False)` opts out (ablation Rows 6–8). The identity check (Row 1) now runs with doc pairs ($Y^{(d)} := X^{(d)}$).
 
 #### Operator D: Candidate-Scoped Relative Representation Rescorer (Zero Extra Index)
 Applied strictly in-memory over `Top-200` first-stage candidates $\mathcal{C}_{200}$ against $K_{\text{ref}} = 512$ reference anchor **documents** when moderate drift is detected. Both sides are profiled against the *same* 512 documents, so profile coordinates are comparable across spaces:
@@ -217,6 +219,18 @@ $$\mu_{Y, L_q}^{(q)} = \mu_{Y, L_{\text{src}}}^{(q)} + \left(\mu_{\text{FLORES},
 
   * Centering $q_{\text{raw}}$ by $\mu_{Y, L_q}^{(q)}$ strips the language-ID vector so Chinese/Japanese queries land on the aligned semantic subspace before multiplying by $W^*$.
 * **Query Language Detection:** $L_q$ is taken from the caller when provided; otherwise from a lightweight language-ID model (e.g. fastText `lid.176`). Unregistered languages fall back to $L_{\text{src}}$ centering **with a warning** (§6).
+
+> [!NOTE]
+> **Default change (2026-10-31): $\Delta\mu$ is registered at mount for every expected query language**, on top of the default engine (doc↔doc pairs + Stage 2); queries tagged with a registered $L_q$ are centered on $\mu_{Y, L_q}^{(q)}$. Measured on Tier 5a (`xquad-zh`, 1,190 Chinese questions into an English `bge-large-en` index, 4 multilingual query models; $\Delta\mu$ from 256 Tatoeba `cmn-eng` pairs because FLORES is gated and no token was available), ρceil `Recall@30`, mean over models:
+>
+> | | $K = 2,048$ | $K = 4,096$ |
+> | :--- | :--- | :--- |
+> | Row 8 (Stage 1 + 2) | 0.890 | 0.879 |
+> | Row 7 (Row 8 + $\Delta\mu$) | 0.892 | 0.907 |
+> | Row 8b (+ doc pairs) | 0.907 | 0.898 |
+> | **Row 7b (Row 8b + $\Delta\mu$, new default)** | **0.914** | **0.925** (all 4 models ≥ 0.902) |
+>
+> $\Delta\mu$ never hurt a model beyond noise (7b − 8b from −0.1 to +6.6 points). The gain is concentrated in `multilingual-e5-large` (+2.5 / +6.6 points; at 4,096 the 95% CIs do not overlap) and at larger $K$, where Stage-1 selection picks lightly regularized maps that fit English-proxy structure; for `Qwen3-Embedding-0.6B` it is zero. With it, more anchors help again (0.914 → 0.925 instead of 0.907 → 0.898). The quality score graded all of these fits **A** while real retention was 0.87–0.94: English-proxy validation does not see the language shift, which is one more reason routing stays advisory (§5) and $\rho_{\text{val}, L_q}$ is still needed.
 
 > [!TIP]
 > **Cross-Lingual Retrieval Routing:** Whenever $L_q \neq L_{\text{src}}$, lexical BM25 overlap is near zero (`BM25` weight is automatically disabled or down-weighted), candidate pool widens to `Top-60`, and a **multilingual Cross-Encoder** (`BAAI/bge-reranker-v2-m3` or `Qwen/Qwen3-Reranker-0.6B`) scores `(zh_query, en_doc)` pairs directly.
@@ -260,14 +274,16 @@ Goal: the system cannot be good on every corpus, but it must **never be silently
 
 **Simple mode: one score in $[0, 100]$.** The score is the **predicted ceiling retention of `Recall@30`, in percent**: "87" means "expect about 87% of the retrieval quality that re-indexing with $M_{\text{tgt}}$, or the native $M_{\text{src}}$, whichever is lower, would give". It is produced by a small calibrated regressor (linear to start) from the detailed measurements below to observed retention, fitted on all benchmark runs. It is always reported with a prediction band and a grade:
 
-Approved routing (2026-10-30):
+Approved routing (2026-10-30), **made advisory 2026-10-31** (after the M2 calibration below): the grade may widen the rerank pool but never shrinks it below the default of 60.
 
-| Grade | Score | Default routing |
+| Grade | Score | Default routing (`QualityReport.rerank_pool`) |
 | :--- | :--- | :--- |
-| **A** | $\ge 95$ | Linear ANN, `rerank_pool = 30` |
+| **A** | $\ge 95$ | `rerank_pool = 60` (was 30) |
 | **B** | $85\text{–}95$ | `rerank_pool = 60` (+ Operator D) |
 | **C** | $70\text{–}85$ | `rerank_pool = 100`, warn |
-| **D** | $< 70$ | Warn and recommend native re-indexing |
+| **D** | $< 70$ | `rerank_pool = 100`, warn and recommend native re-indexing |
+
+Unscored reports (no calibration available) also get 60. Why advisory: the score transfers to an unseen corpus with a ±4.3-point error, about half a grade, and it over-predicts hard corpora (`trec-covid` by 8 points), so an A could put a hard corpus at `rerank_pool = 30`, where Tier 3 misses its end-to-end target even on `fiqa` (mean 0.94, worst 0.89–0.91). At 60, `fiqa` meets the Tier 1 end-to-end target on every pair and Tier 3 on 3 of 4 (worst 0.93–0.94). Shrinking the pool for grade A should come back only with a signal that detects hard datasets.
 
 The score is marked **experimental** until its regressor is shown to transfer to held-out datasets (leave-one-dataset-out error within the reported band on $\ge 4$ datasets, §7.1).
 
@@ -323,9 +339,10 @@ class CalibrationBundle:
 
 
 class SpaceBridge:
-    def __init__(self, device: str = "cuda", restore_source_mean: bool = True):
+    def __init__(self, device: str = "cuda", restore_source_mean: bool = True, doc_pairs: bool = True):
         self.device = device
         self.restore_source_mean = restore_source_mean  # False reproduces v2.3 behavior (Ablation Row 3b)
+        self.doc_pairs = doc_pairs  # default: mode="auto" requires Y_doc_raw (Row 8b); False opts out
         self.src_lang: str = "en"
         self.mu_x_query: Optional[np.ndarray] = None
         self.mu_y_by_lang: Dict[str, np.ndarray] = {}
@@ -340,9 +357,11 @@ class SpaceBridge:
         mode: Literal["naive", "stiefel", "ridge", "stage1", "auto"] = "auto",  # auto = best Stage-1 + Stage-2
         pairs: Literal["query", "doc"] = "query",
         X_distractor: Optional[np.ndarray] = None,  # index vectors at bundle.distractor_ids
+        Y_doc_raw: Optional[np.ndarray] = None,     # (K, d_t) anchor docs encoded with the target doc prompt
     ) -> Dict[str, float]:
         """Sets src_lang, mu_x_query, mu_y_by_lang[src_lang] and W (scaled truncated Stiefel or
-        primal/dual ridge, then 150-step GPU InfoNCE/KL), and computes rho_val and status."""
+        primal/dual ridge on query-proxy + doc<->doc pairs, then <= 50-step GPU InfoNCE/KL), and
+        computes rho_val, status and the quality report (score, grade, advisory rerank_pool)."""
         ...
 
     def register_query_language(
@@ -455,7 +474,8 @@ Every test pair runs through the following configurations:
 | **7** | + **FLORES Language-Cone Shift Correction ($\Delta\mu_{L_q \to L_{\text{src}}}$)** *(Tier 5a)* | Gain from stripping language-ID bias when querying an `en` index in `zh`. |
 | **8** | + **Stage-2 GPU InfoNCE + Teacher KL Refinement (150 steps)** | Gain from contrastive ranking optimization over Frobenius MSE (~80ms on 5070 Ti). |
 | **8s** | Row 8 without mean restore | Whether Stage 2 changes the restore-vs-strip comparison of Rows 6 / 6b. |
-| **8b** | + Doc↔Doc pairs in Stage 1 and Stage 2 (anchor docs encoded by $M_{\text{tgt}}^{\text{doc}}$, each pair type centered on its own cone mean) | Whether extra pairs offset the proxy-positive shortcut; costs a second, ~4–5× longer encoding pass. |
+| **8b** | + Doc↔Doc pairs in Stage 1 and Stage 2 (anchor docs encoded by $M_{\text{tgt}}^{\text{doc}}$, each pair type centered on its own cone mean). **Default engine since M2.** | Whether extra pairs offset the proxy-positive shortcut; costs a second, ~4–5× longer encoding pass. |
+| **7b** | Row 8b + $\Delta\mu_{L_q \to L_{\text{src}}}$ *(Tier 5a)*. **Default engine on cross-lingual sets.** | Whether the language shift still helps on top of doc pairs and Stage 2. |
 | **9** | + **Hybrid RRF + Candidate Relative Rescorer + Reranker** (`bge-reranker-v2-m3` and `Qwen3-Reranker-0.6B`) | End-to-end RAG `NDCG@5` & `Recall@5` recovery across all 5 tiers; reranker comparison. Implemented as rows `9n` / `9` / `9w` (rerank bridged top-30 / 60 / 100); native and oracle are reranked at the same depth so $\rho_{\text{ceil}}$ compares like with like. |
 
 ### 7.4 Metrics Logged per Run
