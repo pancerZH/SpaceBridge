@@ -62,6 +62,18 @@ Upgrading an embedding model, querying a massive pre-computed vector dataset ($1
 | $\approx 0.6\text{B}$ | `Qwen3-Embedding-0.6B`, `harrier-oss-v1-0.6b`, `mE5-large` | **$< 4.0\text{ s}$** |
 | $\approx 4\text{B}$ | `Qwen3-Embedding-4B` | **$< 20\text{ s}$** (one-time per mount) |
 
+> [!NOTE]
+> **Measured (M3, `fiqa`, $K = 2,048$, idle RTX 5070 Ti, bf16; budgets above unchanged pending a decision).** Mount = proxy encoding + anchor-doc encoding for doc↔doc pairs (§4.3) + solver:
+>
+> | $M_{\text{tgt}}$ | Proxies | Anchor docs (full / 128 tokens) | Solver | Mount without doc pairs | Mount, default |
+> | :--- | :--- | :--- | :--- | :--- | :--- |
+> | `all-MiniLM-L6-v2` | 0.2 s | 0.5 s | 0.26 s | 0.5 s | 1.0 s |
+> | `bge-large-en-v1.5` | 1.8 s | 5.1 s / 2.2 s | 0.16 s | 2.0 s | 7.1 s |
+> | `Qwen3-Embedding-0.6B`, `harrier-oss-v1-0.6b` | 3.5–4.0 s | 11.5 s / 4.7 s | 0.17 s | 4.2 s | 15.7 s |
+> | `Qwen3-Embedding-4B` | 19.0 s | 51.1 s / ~20 s (projected) | 0.16 s | 19.1 s | 70 s (doc pairs off for this class, §4.3) |
+>
+> Proxies alone are within budget for every class except at the 0.6B boundary; the doc-pair pass is ~3× the proxy pass (anchor docs average 160–280 tokens vs. ~60). Encoding anchor docs truncated to 128 tokens cuts that pass 2.3–2.5× at a cost of 0.3–0.5 points of `Recall@30` retention (3 seeds, `fiqa`). Up-projection into a 2560-d index exceeds the solver budget (262 ms at $K = 2,048$; Stage 2's logits scale with $d_s$).
+
 * **Online Overhead:** Query-time projection must take **$< 0.1\text{ ms}$** on CPU (one $d_t \times d_s$ mat-vec, $\le 10^6$ MACs) with **zero duplicate or rewritten vector indices** on disk. Operator D rescoring (only on `MODERATE_DRIFT`) adds **$\approx 1\text{–}3\text{ ms}$** on CPU.
 
 ### 2.2 Non-Goals (Phase 0)
@@ -195,6 +207,8 @@ with $\tau = 0.05$, $\alpha = 0.5$, $\beta = 10^{-3}$ (upgraded to $\beta = 10^{
 > **Implementation finding (Stage-2 stopping, `fiqa`, M2 P4):** v2 early-stopped Stage 2 on teacher agree@10 and stopped at step 0 in ~85% of fits. Run for a fixed 50 steps, Stage 2 improved real $\rho_{\text{ceil}}$ `Recall@30` on 6 of 6 pairs at $K = 2,048$ (mean +1.9 points, `nDCG@10` +2.3) while *lowering* every teacher-agreement signal (agree@10, neighbour recall, score correlation): InfoNCE pulls the bridged query toward its positive document, away from reproducing $M_{\text{src}}$'s neighbours of the proxy. Held-out own-doc MRR was the only label-free signal that rose with the real gain. Used alone it exploits the proxy-positive shortcut (on the identity map it traded 20 points of agree@10 for +0.4 MRR, Row 1 fell to 98.1% of native), hence the 90% agreement floor. With both, Row 8 − Row 6 on `fiqa` is +2.2 points `Recall@30` / +2.5 `nDCG@10` at $K = 2,048$ (6 of 6 pairs positive), +1.8 / +1.2 at 4,096, +0.8 / +0.1 at 1,024; Row 1 stays ≥ 99.2% of native. Hard negatives (Row 8h) did not help (+1.5 vs. +1.9 at a fixed 50 steps). `SpaceBridge(stage2_signal="agree@10")` restores the v2 behaviour.
 >
 > **Default change (2026-10-31): doc↔doc pairs are on.** Across the six M2 BEIR sets, Row 8b was the best first-stage configuration on every dataset except `arguana` (a tie) and on all four Tier 5a pairs, and it recovered most of the `trec-covid` Tier 1 miss (+5.9 points `Recall@30` over Row 8). Cost: one extra $M_{\text{tgt}}^{\text{doc}}$ encoding pass over the $K$ anchor docs at mount (3–30 s for 0.6B-class models) and +50 ms solver time (164 / 174 ms mean / max at $K = 2,048$ on `fiqa`, inside the 250 ms budget). `fit(mode="auto")` therefore requires `Y_doc_raw`; `SpaceBridge(doc_pairs=False)` opts out (ablation Rows 6–8). The identity check (Row 1) now runs with doc pairs ($Y^{(d)} := X^{(d)}$).
+>
+> **Size-dependent (M3, Tier 4).** For 4B-class query models the doc-pair pass costs 51 s at $K = 2,048$ (70 s mount vs. a 20 s budget) and gives no measurable gain: `Qwen3-Embedding-4B` queries into a MiniLM index, Row 8b − Row 8 = +0.1 ± 3.0 points `Recall@30` (3 seeds; +2.6 ± 0.4 at $K = 4,096$). The mount protocol is therefore doc pairs for query models up to ~0.6B (gains of +1.6 to +7.4 points across `fiqa`, `trec-covid` and the MRL sweep, for seconds of encoding) and `doc_pairs=False` for 4B-class models.
 
 #### Operator D: Candidate-Scoped Relative Representation Rescorer (Zero Extra Index)
 Applied strictly in-memory over `Top-200` first-stage candidates $\mathcal{C}_{200}$ against $K_{\text{ref}} = 512$ reference anchor **documents** when moderate drift is detected. Both sides are profiled against the *same* 512 documents, so profile coordinates are comparable across spaces:
