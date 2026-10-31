@@ -71,9 +71,21 @@ TIERS = {
 }
 
 SEARCH_K = 100
+ANCHOR_CACHE = Path("data/cache/anchors")
 _warm = False
 RERANK_DEPTH = {"9n": 30, "9": 60, "9w": 100}
 CI_METRICS = ("recall@30", "ndcg@5", "ndcg@10")
+
+
+def cached_anchors(ds: RetrievalDataset, src_key: str, E_src: np.ndarray, allowed: np.ndarray, K: int, seed: int) -> np.ndarray:
+    """Anchor doc rows, cached on disk: k-means at K ~ N/2 takes CPU-hours and repeats for every pair."""
+    path = ANCHOR_CACHE / f"{ds.name}_{src_key}_N{ds.N}_n{len(allowed)}_K{K}_s{seed}.npy"
+    if path.exists():
+        return np.load(path)
+    ids = allowed[select_anchors(E_src[allowed], K, seed)]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(path, ids)
+    return ids
 
 
 def run_pair(
@@ -89,7 +101,7 @@ def run_pair(
     Q_src_direct = enc.queries(ds.queries, ds.task) if "0c" in rows else None
     # Split hygiene (design §7.1 rule 3): corpus rows that are test queries (ArguAna) never become anchors.
     allowed = np.setdiff1d(np.arange(ds.N), ds.self_rows)
-    anchor_ids = allowed[select_anchors(E_src[allowed], K, seed)]
+    anchor_ids = cached_anchors(ds, src_key, E_src, allowed, K, seed)
     proxies = [extract_query_proxy(ds.titles[i], ds.texts[i]) for i in anchor_ids]
     train_idx, val_idx = make_split(K, seed=seed)
     bundle = CalibrationBundle(

@@ -13,12 +13,12 @@ from pathlib import Path
 
 import numpy as np
 
-from spacebridge import CalibrationBundle, RefineConfig, SpaceBridge, extract_query_proxy, make_split, sample_distractors, select_anchors
+from spacebridge import CalibrationBundle, RefineConfig, SpaceBridge, extract_query_proxy, make_split, sample_distractors
 from spacebridge_bench.datasets import load_beir
 from spacebridge_bench.encode import Encoder
 from spacebridge_bench.metrics import per_query
 from spacebridge_bench.models import MODELS
-from spacebridge_bench.run import TIERS
+from spacebridge_bench.run import TIERS, cached_anchors
 from spacebridge_bench.search import search
 
 CONFIGS = {  # name -> (mode, RefineConfig kwargs, hard negatives)
@@ -30,7 +30,7 @@ CONFIGS = {  # name -> (mode, RefineConfig kwargs, hard negatives)
     "fixed50+hn": ("auto", {"steps": 50, "early_stop": False}, 10),
     "fixed150+hn": ("auto", {"steps": 150, "early_stop": False}, 10),
 }
-SIGNALS = ("agree@10", "nbr_recall@10", "nbr_recall@30", "nbr_recall@100", "score_corr")
+SIGNALS = ("agree@10", "nbr_recall@10", "nbr_recall@30", "nbr_recall@100", "score_corr", "owndoc_mrr")
 
 
 def main() -> None:
@@ -55,7 +55,7 @@ def main() -> None:
         s, t = emb[src], emb[tgt]
         E = s["docs"]
         allowed = np.setdiff1d(np.arange(ds.N), ds.self_rows)
-        ids = allowed[select_anchors(E[allowed], args.K)]
+        ids = cached_anchors(ds, src, E, allowed, args.K, 0)
         proxies = [extract_query_proxy(ds.titles[i], ds.texts[i]) for i in ids]
         enc = Encoder(MODELS[src], args.device)
         Xq = enc.queries(proxies, ds.task)
