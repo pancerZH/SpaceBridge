@@ -65,16 +65,19 @@ Upgrading an embedding model, querying a massive pre-computed vector dataset ($1
 Mount must also stay far below re-indexing the corpus with $M_{\text{tgt}}$ (FiQA, 57.6K docs: minutes per 0.6B model; millions of docs: hours).
 
 > [!NOTE]
-> **Measured (M3, `fiqa`, $K = 2,048$, idle RTX 5070 Ti, bf16; the basis of the revised budgets).** Mount = proxy encoding + anchor-doc encoding for doc↔doc pairs (§4.3) + solver:
+> **Measured on the default mount protocol (M4, $K = 2,048$, idle RTX 5070 Ti, bf16, one run per pair; `scripts/summarize_mount.py`).** Mount = proxy encoding + anchor-doc encoding at 128 tokens for doc↔doc pairs (§4.3) + solver. `fiqa` has no titles (lead-sentence proxies, ~58 tokens); `scidocs` uses title proxies (~23–37 tokens). Anchor docs at 128 tokens average 105–124 tokens.
 >
-> | $M_{\text{tgt}}$ | Proxies | Anchor docs (full / 128 tokens) | Solver | Mount without doc pairs | Mount, default |
-> | :--- | :--- | :--- | :--- | :--- | :--- |
-> | `all-MiniLM-L6-v2` | 0.2 s | 0.5 s | 0.26 s | 0.5 s | 1.0 s |
-> | `bge-large-en-v1.5` | 1.8 s | 5.1 s / 2.2 s | 0.16 s | 2.0 s | 7.1 s |
-> | `Qwen3-Embedding-0.6B`, `harrier-oss-v1-0.6b` | 3.5–4.0 s | 11.5 s / 4.7 s | 0.17 s | 4.2 s | 15.7 s |
-> | `Qwen3-Embedding-4B` | 19.0 s | 51.1 s / ~20 s (projected) | 0.16 s | 19.1 s | 70 s (doc pairs off for this class, §4.3) |
+> | $M_{\text{tgt}}$ (size class) | Proxies `fiqa` / `scidocs` | Anchor docs, 128 tokens | Solver | Protocol | Mount `fiqa` / `scidocs` | Budget |
+> | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+> | `all-MiniLM-L6-v2` (≤ 0.35B) | 0.3 s | 0.5 s | 0.26 s (into the 2560-d index) | doc pairs | **1.0 s** | 5 s ✓ |
+> | `bge-base-en-v1.5` (≤ 0.35B) | 0.6 / 0.3 s | 0.8–0.9 s | 0.15 s | doc pairs | **1.6 / 1.3 s** | 5 s ✓ |
+> | `bge-large-en-v1.5` (≤ 0.35B) | 1.8 / 0.7 s | 2.3–2.4 s | 0.14–0.16 s | doc pairs | **4.2 / 3.3 s** | 5 s ✓ |
+> | `EmbeddingGemma 2` (≤ 0.35B) | 1.8 s | 2.8 s | 0.16 s | doc pairs | **4.8 s** (tightest) | 5 s ✓ |
+> | `multilingual-e5-large` (≈ 0.6B) | 1.6 s | 2.3 s | 0.17 s | doc pairs | **4.0 s** | 10 s ✓ |
+> | `Qwen3-Embedding-0.6B`, `harrier-oss-v1-0.6b` (≈ 0.6B) | 3.5–3.6 / 2.1–2.2 s | 4.6–5.0 s | 0.17 s | doc pairs | **8.2–8.4 / 7.2–7.4 s** | 10 s ✓ |
+> | `Qwen3-Embedding-4B` (≈ 4B) | 19.1 s | (24.8 s, not used) | 0.09 s | proxies only | **19.2 s** (44.0 s with doc pairs) | 30 s ✓ |
 >
-> Proxies alone are within budget for every class except at the 0.6B boundary; the doc-pair pass is ~3× the proxy pass (anchor docs average 160–280 tokens vs. ~60). Encoding anchor docs truncated to 128 tokens cuts that pass 2.3–2.5× at a cost of 0.3–0.5 points of `Recall@30` retention (3 seeds, `fiqa`). Up-projection into a 2560-d index exceeds the solver budget (262 ms at $K = 2,048$; Stage 2's logits scale with $d_s$).
+> Every class meets its budget. Before truncation (M3, full-length anchor docs, 200–280 tokens) the doc-pair pass was ~3× the proxy pass: 7.1 s for `bge-large-en-v1.5`, 8.8 s for `EmbeddingGemma 2`, 15.7 s for the 0.6B decoders. **Retention cost of 128-token anchor docs** (Row 8b, 128 − full, 3 seeds, Tier 1 + 3, $K$ = 2,048 / 4,096): `fiqa` (decision set) −0.3 to −0.5 points; held-out `hotpotqa` +0.0 [−0.1, +0.1] (36 cells, short passages, so truncation rarely bites); held-out `trec-covid` −0.2 [−0.9, +0.5] pooled (median cell −0.3), with Tier 3 at $K = 2,048$ −1.1 ± 1.6 driven by one Stage-2 stopping flip (−7.9 points in one cell, median −0.5). Query-time projection: 24–54 µs on CPU. Up-projection into a 2560-d index exceeds the solver budget (263 ms at $K = 2,048$; Stage 2's logits scale with $d_s$).
 
 * **Online Overhead:** Query-time projection must take **$< 0.1\text{ ms}$** on CPU (one $d_t \times d_s$ mat-vec, $\le 10^6$ MACs) with **zero duplicate or rewritten vector indices** on disk. Operator D rescoring (only on `MODERATE_DRIFT`) adds **$\approx 1\text{–}3\text{ ms}$** on CPU.
 
