@@ -13,9 +13,13 @@ class RefineConfig:
     steps: int = 50  # gains plateau by step 20-50 (M2 P4 study); the cosine schedule spans all steps
     lr: float = 3e-3
     tau: float = 0.05
-    # If set, tau = tau_scale * the mean per-row s.d. of the teacher's cosine scores, so the softmax has the
-    # same sharpness on indexes whose scores are compressed (multilingual-e5: s.d. 0.02) or spread out (0.06-0.09).
-    tau_scale: Optional[float] = None
+    # Compressed-score indexes: when the mean per-row s.d. of the teacher's cosine scores is below
+    # tau_scale_below_sd, tau = tau_scale * that s.d. multilingual-e5 indexes have s.d. 0.020-0.027 (every other
+    # index measured: 0.057-0.092), so tau = 0.05 is a ~3x softer softmax there and every Stage-2 step failed the
+    # agreement floor (T2Retrieval Row 8b 0.684 -> 0.879 with the rule; held-out fiqa +2 to +5 points). Applied to
+    # all indexes, tau ~= 0.036 moved the identity map on trec-covid, hence the guard. tau_scale=None disables it.
+    tau_scale: Optional[float] = 0.6
+    tau_scale_below_sd: float = 0.04
     alpha: float = 0.5
     # Student and teacher share temperature tau, so the Hinton tau^2 factor would shrink the KL
     # term ~400x relative to InfoNCE; 1.0 keeps the two terms balanced (tau**2 reproduces §4.3).
@@ -57,7 +61,8 @@ def refine(
     batch = cfg.batch_candidates if cfg.batch_candidates and n_cand > cfg.batch_candidates else None
     with torch.no_grad():
         teacher_scores = Xq_train @ Xd_train.T
-        tau = cfg.tau if cfg.tau_scale is None else cfg.tau_scale * teacher_scores.std(dim=1).mean().item()
+        sd = teacher_scores.std(dim=1).mean().item()
+        tau = cfg.tau_scale * sd if cfg.tau_scale is not None and sd < cfg.tau_scale_below_sd else cfg.tau
         teacher_logits = teacher_scores / tau
         teacher = F.log_softmax(teacher_logits, dim=-1) if batch is None else None
     gen = torch.Generator(device=dev).manual_seed(0)

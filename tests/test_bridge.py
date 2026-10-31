@@ -164,9 +164,11 @@ def test_stage2_candidate_minibatches_match_full_batch(world):
     assert info_mini["val_metrics"]["owndoc_mrr"] >= info_full["val_metrics"]["owndoc_mrr"] - 0.05
 
 
-def test_stage2_temperature_can_follow_the_teacher_score_spread(world):
-    _, fixed = _fit(world, world.Y_query, mode="auto", refine_config=RefineConfig(steps=10))
-    assert fixed["stage2_tau"] == pytest.approx(0.05)
+def test_stage2_temperature_follows_compressed_teacher_scores(world):
+    _, default = _fit(world, world.Y_query, mode="auto", refine_config=RefineConfig(steps=10))
     Xq, Xd = world.bundle.X_query_raw[world.bundle.train_idx], world.bundle.X_doc_raw[world.bundle.train_idx]
-    _, scaled = _fit(world, world.Y_query, mode="auto", refine_config=RefineConfig(steps=10, tau_scale=0.6))
-    assert scaled["stage2_tau"] == pytest.approx(0.6 * (Xq @ Xd.T).std(axis=1, ddof=1).mean(), rel=1e-3)
+    sd = (Xq @ Xd.T).std(axis=1, ddof=1).mean()
+    assert sd > 0.04 and default["stage2_tau"] == pytest.approx(0.05)  # ordinary score spread: fixed tau
+    _, scaled = _fit(world, world.Y_query, mode="auto",
+                     refine_config=RefineConfig(steps=10, tau_scale_below_sd=float("inf")))
+    assert scaled["stage2_tau"] == pytest.approx(0.6 * sd, rel=1e-3)

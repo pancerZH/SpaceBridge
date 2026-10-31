@@ -192,7 +192,7 @@ def run_pair(
                 hard_negatives=10 if row == "8h" else 0, doc_pairs=row in doc_rows,
                 refine_config=RefineConfig(
                     **({"batch_candidates": stage2_batch or None} if stage2_batch is not None else {}),
-                    **({"tau_scale": stage2_tau_scale} if stage2_tau_scale else {}),
+                    **({"tau_scale": stage2_tau_scale, "tau_scale_below_sd": float("inf")} if stage2_tau_scale else {}),
                 ),
             )
             extra = {"Y_doc_raw": doc_rows[row]} if row in doc_rows else {}
@@ -373,7 +373,7 @@ def main() -> None:
     p.add_argument("--proxy", default="lead", choices=PROXY_STYLES, help="query-proxy style")
     p.add_argument("--doc-pair-tokens", type=int, default=None, help="truncate anchor docs encoded for doc pairs")
     p.add_argument("--stage2-batch", type=int, default=None, help="Stage-2 candidate mini-batch size (default: the engine's; 0: full batch)")
-    p.add_argument("--stage2-tau-scale", type=float, default=None, help="Stage-2 temperature relative to the teacher score s.d.")
+    p.add_argument("--stage2-tau-scale", type=float, default=None, help="Stage-2 temperature relative to the teacher score s.d., on every index (ablation)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", type=Path, default=Path("outputs/results.jsonl"))
     args = p.parse_args()
