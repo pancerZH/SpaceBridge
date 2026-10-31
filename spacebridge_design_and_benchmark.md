@@ -176,7 +176,7 @@ $$W_{\text{ridge}}(\lambda) = \begin{cases} \left(\bar{Y}_{\text{tr}}^T \bar{Y}_
 The two forms are algebraically identical for every $\lambda > 0$ (the switch is purely computational), and the column space of $W_{\text{ridge}}$ lies in the row space of $\bar{Y}_{\text{tr}}$. Since rows are no longer unit-norm, $\lambda$ is swept relative to the mean eigenvalue: $\lambda = \lambda_{\text{rel}} \cdot \|\bar{Y}_{\text{tr}}\|_F^2 / \min(d_t, K_{\text{train}})$ with $\lambda_{\text{rel}} \in \{0.01, 0.1, 1.0, 5.0, 20.0\}$, selected on $K_{\text{val}}$.
 
 #### Operator C: GPU Contrastive-Distillation Refinement (`~80ms` Stage-2 Booster)
-Initialized from $W_0 \in \{W_{\text{stiefel}}, W_{\text{ridge}}\}$, `SpaceBridge` runs $T = 150$ steps of AdamW (`lr=3e-3`, cosine decay) directly optimizing retrieval logits against the anchor documents **as stored in the index**, using the same affine map that is deployed online:
+Initialized from $W_0 \in \{W_{\text{stiefel}}, W_{\text{ridge}}\}$, `SpaceBridge` runs $T = 50$ steps of AdamW (`lr=3e-3`, cosine decay) directly optimizing retrieval logits against the anchor documents **as stored in the index**, using the same affine map that is deployed online:
 
 $$S_{\text{student}}(W) = \frac{1}{\tau} \text{Normalize}\!\left(\mu_X^{(q)} + \bar{Y}_{\text{train}}^{(q)} W\right) \left(X_{\text{train}}^{(d)}\right)^T, \qquad S_{\text{teacher}} = \frac{1}{\tau} X_{\text{train}}^{(q)} \left(X_{\text{train}}^{(d)}\right)^T$$
 
@@ -184,10 +184,13 @@ $$\mathcal{L}(W) = (1 - \alpha)\, \mathcal{L}_{\text{InfoNCE}}\!\left(S_{\text{s
 
 (The Hinton $\tau^2$ factor is omitted: it compensates for a KL computed at a *higher* temperature than the CE term, but here both share $\tau = 0.05$, so $\tau^2$ would shrink the KL term $\sim 400\times$ relative to InfoNCE. Exposed as `RefineConfig.kl_scale`.)
 
-with $\tau = 0.05$, $\alpha = 0.5$, $\beta = 10^{-3}$ (upgraded to $\beta = 10^{-2}$ when $d_t > K_{\text{train}}$ to prevent high-dimensional overfitting), early-stopped on $K_{\text{val}}$ (evaluated every 10 steps, patience 50 steps; Stage-1 selection and Stage-2 stopping score on a fixed 10K-row subsample of the $\rho_{\text{val}}$ pool, all anchors plus random distractors, which keeps the solver at ≤ 152 ms for $K = 2,048$ on `fiqa`). The teacher is the native source ranking, i.e. exactly what the index would return for $M_{\text{src}}$ queries.
+with $\tau = 0.05$, $\alpha = 0.5$, $\beta = 10^{-3}$ (upgraded to $\beta = 10^{-2}$ when $d_t > K_{\text{train}}$ to prevent high-dimensional overfitting), early-stopped on held-out **own-doc MRR** of the $K_{\text{val}}$ proxies, subject to keeping $\ge 90\%$ of Stage 1's teacher agree@10 (evaluated every 10 steps; Stage-1 selection and Stage-2 stopping score on a fixed 10K-row subsample of the $\rho_{\text{val}}$ pool, all anchors plus random distractors, which keeps the solver at ≤ 152 ms for $K = 2,048$ on `fiqa`). The teacher is the native source ranking, i.e. exactly what the index would return for $M_{\text{src}}$ queries.
 
 > [!WARNING]
 > **Proxy-positive shortcut:** each query proxy is the lead sentence of its own positive document, so InfoNCE positives are lexically easy and may not transfer to real queries. Mitigations evaluated in the ablation: the teacher-KL term (which spreads mass over semantically related anchors), and an optional **doc↔doc term** (Row 8b) that encodes the anchor docs with $M_{\text{tgt}}^{\text{doc}}$ and adds $\mathcal{L}_{\text{InfoNCE}}$ over $\left(\text{Normalize}(\mu_X^{(d)} + \bar{Y}^{(d)} W_d)\right)(X^{(d)})^T$, doubling calibration pairs at the cost of a second encoding pass.
+
+> [!NOTE]
+> **Implementation finding (Stage-2 stopping, `fiqa`, M2 P4):** v2 early-stopped Stage 2 on teacher agree@10 and stopped at step 0 in ~85% of fits. Run for a fixed 50 steps, Stage 2 improved real $\rho_{\text{ceil}}$ `Recall@30` on 6 of 6 pairs at $K = 2,048$ (mean +1.9 points, `nDCG@10` +2.3) while *lowering* every teacher-agreement signal (agree@10, neighbour recall, score correlation): InfoNCE pulls the bridged query toward its positive document, away from reproducing $M_{\text{src}}$'s neighbours of the proxy. Held-out own-doc MRR was the only label-free signal that rose with the real gain. Used alone it exploits the proxy-positive shortcut (on the identity map it traded 20 points of agree@10 for +0.4 MRR, Row 1 fell to 98.1% of native), hence the 90% agreement floor. With both, Row 8 − Row 6 on `fiqa` is +2.2 points `Recall@30` / +2.5 `nDCG@10` at $K = 2,048$ (6 of 6 pairs positive), +1.8 / +1.3 at 4,096, +0.8 / +0.1 at 1,024; Row 1 stays ≥ 99.2% of native. Hard negatives (Row 8h) did not help (+1.5 vs. +1.9 at a fixed 50 steps). `SpaceBridge(stage2_signal="agree@10")` restores the v2 behaviour.
 
 #### Operator D: Candidate-Scoped Relative Representation Rescorer (Zero Extra Index)
 Applied strictly in-memory over `Top-200` first-stage candidates $\mathcal{C}_{200}$ against $K_{\text{ref}} = 512$ reference anchor **documents** when moderate drift is detected. Both sides are profiled against the *same* 512 documents, so profile coordinates are comparable across spaces:
@@ -234,7 +237,7 @@ $$\mu_{Y, L_q}^{(q)} = \mu_{Y, L_{\text{src}}}^{(q)} + \left(\mu_{\text{FLORES},
 
 $$\rho_{\text{val}} = \frac{1}{K_{\text{val}}} \sum_{i \in \mathcal{I}_{\text{val}}} \frac{\left|\text{Top10}_{\mathcal{P}}(\hat{q}_{\text{src}, i}) \cap \text{Top10}_{\mathcal{P}}(X_i^{(q)})\right|}{10}$$
 
-where the student uses $\hat{q}_{\text{src}}$ and the teacher uses native $X^{(q)}$. The same score selects the Stage-1 operator / $\lambda_{\text{rel}}$ and early-stops Stage 2.
+where the student uses $\hat{q}_{\text{src}}$ and the teacher uses native $X^{(q)}$. The same score selects the Stage-1 operator / $\lambda_{\text{rel}}$; Stage 2 early-stops on own-doc MRR under an agreement floor (§4.3, Operator C).
 
 > [!NOTE]
 > **Implementation finding (Stage 1, `scifact`):** the v2.4 draft defined $\rho_{\text{val}}$ as a ratio of own-anchor-doc `Recall@10`. Because each proxy is the lead sentence of its own anchor doc, both teacher and student hit it almost always, so that ratio was $1.000$ for every configuration (including ones with 82% real retention). Solver selection and Stage-2 early stopping were then decided by ties. Own-doc recall is still logged as a diagnostic.
