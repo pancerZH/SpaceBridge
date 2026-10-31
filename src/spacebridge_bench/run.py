@@ -9,10 +9,12 @@ import argparse
 import json
 import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
-from spacebridge import CalibrationBundle, SpaceBridge, extract_query_proxy, make_split, sample_distractors, select_anchors
+from spacebridge import CalibrationBundle, RefineConfig, SpaceBridge, extract_query_proxy, make_split, sample_distractors, select_anchors
+from spacebridge.anchors import _truncate_tokens, count_tokens
 
 from .datasets import DATASETS, RetrievalDataset, load_beir, load_shift_bank
 from .encode import Encoder
@@ -83,6 +85,17 @@ ANCHOR_CACHE = Path("data/cache/anchors")
 _warm = False
 RERANK_DEPTH = {"9n": 30, "9": 60, "9w": 100}
 CI_METRICS = ("recall@30", "ndcg@5", "ndcg@10")
+PROXY_STYLES = ("lead", "short")
+
+
+def make_proxy(title: str, text: str, style: str = "lead") -> str:
+    """``lead``: the design's title + lead sentence (32-64 tokens). ``short``: closer to keyword / question
+    queries: the title alone when it has >= 4 tokens, else title + lead cut to 16 tokens."""
+    if style == "lead":
+        return extract_query_proxy(title, text)
+    if title and count_tokens(title) >= 4:
+        return _truncate_tokens(title.strip(), 16)
+    return extract_query_proxy(title, text, min_tokens=4, max_tokens=16)
 
 
 def cached_anchors(ds: RetrievalDataset, src_key: str, E_src: np.ndarray, allowed: np.ndarray, K: int, seed: int) -> np.ndarray:
@@ -98,7 +111,7 @@ def cached_anchors(ds: RetrievalDataset, src_key: str, E_src: np.ndarray, allowe
 
 def run_pair(
     ds: RetrievalDataset, src_key: str, tgt_key: str, K: int, seed: int, rows: list[str], device: str,
-    rerankers: tuple[str, ...] = (),
+    rerankers: tuple[str, ...] = (), proxy: str = "lead", stage2_batch: Optional[int] = None,
 ) -> list[dict]:
     src, tgt = MODELS[src_key], MODELS[tgt_key]
     K = min(K, ds.N - int((ds.self_rows >= 0).sum()))
@@ -110,7 +123,7 @@ def run_pair(
     # Split hygiene (design §7.1 rule 3): corpus rows that are test queries (ArguAna) never become anchors.
     allowed = np.setdiff1d(np.arange(ds.N), ds.self_rows)
     anchor_ids = cached_anchors(ds, src_key, E_src, allowed, K, seed)
-    proxies = [extract_query_proxy(ds.titles[i], ds.texts[i]) for i in anchor_ids]
+    proxies = [make_proxy(ds.titles[i], ds.texts[i], proxy) for i in anchor_ids]
     train_idx, val_idx = make_split(K, seed=seed)
     bundle = CalibrationBundle(
         src_lang=ds.lang,
@@ -161,6 +174,7 @@ def run_pair(
             bridge = SpaceBridge(
                 device=device, restore_source_mean=restore, match_residual_norm=row not in ("6n", "8n"),
                 hard_negatives=10 if row == "8h" else 0, doc_pairs=row in doc_rows,
+                **({"refine_config": RefineConfig(batch_candidates=stage2_batch)} if stage2_batch else {}),
             )
             extra = {"Y_doc_raw": doc_rows[row]} if row in doc_rows else {}
             fit = bridge.fit(bundle, anchor_Y[y_kind], mode=mode, pairs=pairs, X_distractor=X_distractor, **extra)
@@ -174,6 +188,10 @@ def run_pair(
         return bridged[row]
 
     base = {"dataset": ds.name, "src": src_key, "tgt": tgt_key, "K": K, "seed": seed, "n_queries": len(ds.queries)}
+    if proxy != "lead":
+        base["proxy"] = proxy
+    if stage2_batch:
+        base["stage2_batch"] = stage2_batch
     records = []
     for row in (r for r in rows if r not in RERANK_DEPTH):
         if row in ("0c", "7", "7b") and not ds.query_lang:
@@ -324,6 +342,8 @@ def main() -> None:
     p.add_argument("--rerankers", nargs="*", default=list(RERANKERS), choices=list(RERANKERS))
     p.add_argument("--K", type=int, nargs="*", default=[2048], help="anchor budget(s); one run per value")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--proxy", default="lead", choices=PROXY_STYLES, help="query-proxy style")
+    p.add_argument("--stage2-batch", type=int, default=None, help="Stage-2 candidate mini-batch size (default: engine's)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", type=Path, default=Path("outputs/results.jsonl"))
     args = p.parse_args()
@@ -339,7 +359,7 @@ def main() -> None:
     ds = load_beir(args.dataset)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     for (src, tgt), K in ((pr, K) for pr in pairs for K in args.K):
-        records = run_pair(ds, src, tgt, K, args.seed, args.rows, args.device, tuple(args.rerankers))
+        records = run_pair(ds, src, tgt, K, args.seed, args.rows, args.device, tuple(args.rerankers), args.proxy, args.stage2_batch)
         with args.out.open("a") as f:
             for rec in records:
                 f.write(json.dumps(rec, default=_json_default) + "\n")
