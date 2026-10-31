@@ -88,8 +88,9 @@ def summarize(paths: list[Path], metric: str) -> None:
     for stage in ("stage1", "auto"):
         print(f"\n## Real {metric} ρceil of the candidate each signal picks ({'Stage 1 only' if stage == 'stage1' else 'after Stage 2'}), points vs. the agree@10 pick\n")
         print("Signals are measured on the Stage-1 map in both cases (that is when selection happens).\n")
-        print("| dataset | fits | agree@10 pick (current) | best candidate (oracle) | " + " | ".join(SIGNALS[1:]) + " |")
-        print("| --- | --- | --- | --- | " + " | ".join("---" for _ in SIGNALS[1:]) + " |")
+        fixed = [f"always {op}" if lam is None else f"always ridge {lam}" for op, lam in CANDIDATES]
+        print("| dataset | fits | agree@10 pick (current) | best candidate (oracle) | " + " | ".join(SIGNALS[1:] + tuple(fixed)) + " |")
+        print("| --- | --- | --- | --- | " + " | ".join("---" for _ in SIGNALS[1:] + tuple(fixed)) + " |")
         for d, flist in sorted(by_ds.items()):
             real = lambda c: c[stage]["rho_ceil"][metric]
             pick = lambda cands, s: max(cands, key=lambda c: c["stage1"]["signals"][s])
@@ -98,6 +99,9 @@ def summarize(paths: list[Path], metric: str) -> None:
             cells = []
             for s in SIGNALS[1:]:
                 v = np.array([real(pick(c, s)) for c in flist]) - base
+                cells.append(f"{100 * v.mean():+.1f} ({(v > 1e-9).sum()}+/{(v < -1e-9).sum()}−)")
+            for op, lam in CANDIDATES:
+                v = np.array([real(next(x for x in c if x["op"] == op and x["lambda_rel"] == lam)) for c in flist]) - base
                 cells.append(f"{100 * v.mean():+.1f} ({(v > 1e-9).sum()}+/{(v < -1e-9).sum()}−)")
             print(f"| {d} | {len(flist)} | {base.mean():.3f} | {best.mean():.3f} (+{100 * (best - base).mean():.1f}) | " + " | ".join(cells) + " |")
     print("\n## Mean within-fit Spearman of each signal with real Stage-1 retention\n")
