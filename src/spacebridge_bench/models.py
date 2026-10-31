@@ -51,7 +51,7 @@ MODELS: dict[str, ModelSpec] = {
         ),
         ModelSpec(
             "qwen3-4b", "Qwen/Qwen3-Embedding-4B", 2560, 4.0,
-            "Instruct: {task}\nQuery:{text}", batch_size=8, langs=("multi",),
+            "Instruct: {task}\nQuery:{text}", batch_size=16, langs=("multi",),
             tokenizer_kwargs={"padding_side": "left"},
         ),
         ModelSpec(

@@ -32,12 +32,18 @@ FEATURES = [
 ALPHAS = (0.01, 0.1, 1.0, 10.0, 100.0)
 
 
-def load(paths: list[Path]) -> list[dict]:
+def load(paths: list[Path], extra: dict | None = None) -> list[dict]:
     recs = []
     for path in paths:
         for line in path.open():
             r = json.loads(line)
             if r["row"] in ROWS and "quality" in r.get("fit", {}) and "reranker" not in r:
+                if extra is not None:  # index-only difficulty features (scripts/difficulty_features.py)
+                    version = "sklearn" if path.name.startswith(("m2_", "m2d_")) else "tkm"
+                    f = extra.get((r["dataset"], r["src"], r["K"], r.get("seed", 0), version))
+                    if f is None:
+                        continue
+                    r["fit"]["quality"]["corpus"] = f
                 recs.append(r)
     # One record per configuration (last run wins).
     return list({(r["dataset"], r["src"], r["tgt"], r["K"], r["row"], r.get("seed", 0)): r for r in recs}.values())
@@ -75,8 +81,15 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("results", type=Path, nargs="+")
     p.add_argument("--write", action="store_true", help=f"write {CALIBRATION_PATH.name}")
+    p.add_argument("--features", type=Path, help="difficulty features JSONL: also test rho_val + each corpus feature")
     args = p.parse_args()
-    recs = load(args.results)
+    extra = None
+    if args.features:
+        extra = {}
+        for line in args.features.open():
+            d = json.loads(line)
+            extra[tuple(d.pop("key"))] = d
+    recs = load(args.results, extra)
     datasets = np.array([r["dataset"] for r in recs])
     y = np.array([r["rho_ceil"][TARGET] for r in recs])
     # Inverse-variance weights from each fit's paired-bootstrap CI (50-query sets count less).
@@ -85,7 +98,12 @@ def main() -> None:
     print(f"{len(recs)} fits from {len(set(datasets))} datasets: {dict(zip(*np.unique(datasets, return_counts=True)))}\n")
 
     results = {}
-    for name, feats in (("rho_val only", FEATURES[:1]), ("all measurements", FEATURES)):
+    candidates = [("rho_val only", FEATURES[:1]), ("all measurements", FEATURES)]
+    if extra:
+        corpus = [f"corpus.{k}" for k in next(iter(extra.values()))]
+        candidates += [(f"rho_val + {c}", FEATURES[:1] + [c]) for c in corpus]
+        candidates += [("rho_val + all corpus features", FEATURES[:1] + corpus)]
+    for name, feats in candidates:
         X = np.array([features(r, feats) for r in recs])
         best = min(ALPHAS, key=lambda a: np.average((lodo(X, y, w, datasets, a) - y) ** 2, weights=w))
         pred = lodo(X, y, w, datasets, best)
