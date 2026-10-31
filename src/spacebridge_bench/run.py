@@ -68,6 +68,7 @@ TIERS = {
         ("bge-large-en", "qwen3-0.6b"), ("qwen3-0.6b", "bge-large-en"),
         ("bge-large-en", "harrier-0.6b"), ("harrier-0.6b", "bge-large-en"),
     ],
+    "5a": [("bge-large-en", q) for q in ("qwen3-0.6b", "harrier-0.6b", "me5-large", "embeddinggemma-2")],
 }
 
 SEARCH_K = 100
