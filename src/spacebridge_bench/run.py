@@ -8,6 +8,7 @@ Example:
 import argparse
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
@@ -112,7 +113,7 @@ def cached_anchors(ds: RetrievalDataset, src_key: str, E_src: np.ndarray, allowe
 def run_pair(
     ds: RetrievalDataset, src_key: str, tgt_key: str, K: int, seed: int, rows: list[str], device: str,
     rerankers: tuple[str, ...] = (), proxy: str = "lead", stage2_batch: Optional[int] = None,
-    doc_pair_tokens: Optional[int] = None,
+    doc_pair_tokens: Optional[int] = None, time_mount: bool = False,
 ) -> list[dict]:
     src, tgt = MODELS[src_key], MODELS[tgt_key]
     K = min(K, ds.N - int((ds.self_rows >= 0).sum()))
@@ -143,20 +144,29 @@ def run_pair(
     enc = Encoder(tgt, device)
     E_tgt = enc.docs(ds.titles, ds.texts)
     Q_tgt = enc.queries(ds.queries, ds.task)
-    Y_query, mount = enc.timed_encode([tgt.format_query(p, ds.task) for p in proxies])
+    # Mount timing re-encodes the anchors uncached (~70 s per run for a 4B model), so it is opt-in.
+    mount = None
+    if time_mount:
+        Y_query, mount = enc.timed_encode([tgt.format_query(p, ds.task) for p in proxies])
+        mount["projected_encode_ms_K2048"] = mount["encode_ms"] * 2048 / K
+    else:
+        Y_query = enc.queries(proxies, ds.task)
     rerank_base = "7b" if ds.query_lang else "8b"  # Row 9 reranks the default engine's first stage
     needs = set(rows) | ({rerank_base} if set(rows) & set(RERANK_DEPTH) else set())
     if {"7", "7b"} & needs and ds.query_lang:
         bank_src, bank_q = load_shift_bank(ds.query_lang)
         Y_bank_src, Y_bank_q = enc.queries(bank_src, ds.task), enc.queries(bank_q, ds.task)
-    mount["projected_encode_ms_K2048"] = mount["encode_ms"] * 2048 / K
     Y_doc_pairs = None
-    if {"8b", "7b"} & needs:
+    if {"8b", "7b"} & needs and (time_mount or doc_pair_tokens):
         if doc_pair_tokens:  # cheaper mount: anchor docs for doc pairs encoded truncated
-            enc.model.max_seq_length = doc_pair_tokens
-        Y_doc_pairs, doc_mount = enc.timed_encode([tgt.format_doc(ds.titles[i], ds.texts[i]) for i in anchor_ids])
-        enc.model.max_seq_length = tgt.max_seq_length
-        mount.update({f"doc_{k}": v for k, v in doc_mount.items()})
+            enc.unload()
+            enc = Encoder(replace(tgt, max_seq_length=doc_pair_tokens), device)
+        doc_inputs = [tgt.format_doc(ds.titles[i], ds.texts[i]) for i in anchor_ids]
+        if time_mount:
+            Y_doc_pairs, doc_mount = enc.timed_encode(doc_inputs)
+            mount.update({f"doc_{k}": v for k, v in doc_mount.items()})
+        else:
+            Y_doc_pairs = enc.encode(doc_inputs)
     enc.unload()
 
     native_ranked = search(Q_src, E_src, SEARCH_K, device, exclude=ds.self_rows)
@@ -190,7 +200,8 @@ def run_pair(
                 lang = ds.query_lang
                 bridge.register_query_language(lang, Y_bank_src, Y_bank_q)
             ranked = search(bridge.transform_query(Q, query_lang=lang), E_src, SEARCH_K, device, exclude=ds.self_rows)
-            bridged[row] = (ranked, fit, _projection_latency_us(bridge, Q[0]), bridge)
+            latency = _projection_latency_us(bridge, Q[0]) if time_mount else None
+            bridged[row] = (ranked, fit, latency, bridge)
         return bridged[row]
 
     base = {"dataset": ds.name, "src": src_key, "tgt": tgt_key, "K": K, "seed": seed, "n_queries": len(ds.queries)}
@@ -210,9 +221,11 @@ def run_pair(
         elif row == "0c":
             pq = per_query(search(Q_src_direct, E_src, SEARCH_K, device, exclude=ds.self_rows), ds.qrels)
         else:
-            ranked, rec["fit"], rec["projection_us"], bridge = fit_row(row)
+            ranked, rec["fit"], latency, bridge = fit_row(row)
+            if latency is not None:
+                rec["projection_us"] = latency
             pq = per_query(ranked, ds.qrels)
-            if row != "1":
+            if row != "1" and mount is not None:
                 rec["mount"] = mount
             if bridge.quality is not None and row != "1":
                 rec["quality"] = {"score": bridge.quality.score, "band": bridge.quality.band, "grade": bridge.quality.grade}
@@ -349,7 +362,9 @@ def main() -> None:
                    help="ablation rows; rerank rows 9n/9/9w are opt-in")
     p.add_argument("--rerankers", nargs="*", default=list(RERANKERS), choices=list(RERANKERS))
     p.add_argument("--K", type=int, nargs="*", default=[2048], help="anchor budget(s); one run per value")
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seed", type=int, nargs="*", default=[0], help="one run per seed, in one process")
+    p.add_argument("--time-mount", action="store_true",
+                   help="re-encode anchors uncached to time the mount, and time the projection (use an idle GPU)")
     p.add_argument("--proxy", default="lead", choices=PROXY_STYLES, help="query-proxy style")
     p.add_argument("--doc-pair-tokens", type=int, default=None, help="truncate anchor docs encoded for doc pairs")
     p.add_argument("--stage2-batch", type=int, default=None, help="Stage-2 candidate mini-batch size (default: engine's)")
@@ -367,9 +382,9 @@ def main() -> None:
 
     ds = load_beir(args.dataset)
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    for (src, tgt), K in ((pr, K) for pr in pairs for K in args.K):
-        records = run_pair(ds, src, tgt, K, args.seed, args.rows, args.device, tuple(args.rerankers), args.proxy, args.stage2_batch,
-                           args.doc_pair_tokens)
+    for seed, (src, tgt), K in ((s, pr, K) for s in args.seed for pr in pairs for K in args.K):
+        records = run_pair(ds, src, tgt, K, seed, args.rows, args.device, tuple(args.rerankers), args.proxy, args.stage2_batch,
+                           args.doc_pair_tokens, args.time_mount)
         with args.out.open("a") as f:
             for rec in records:
                 f.write(json.dumps(rec, default=_json_default) + "\n")

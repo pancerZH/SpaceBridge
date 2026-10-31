@@ -4,6 +4,7 @@ import gc
 import hashlib
 import json
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,9 @@ import torch
 from .models import ModelSpec
 
 DEFAULT_CACHE = Path("data/cache/embeddings")
+# In-process memo of recently used cached embeddings, so loops over pairs, K and seeds read each file once.
+MEMO_BYTES = 6 * 2**30
+_MEMO: "OrderedDict[Path, np.ndarray]" = OrderedDict()
 
 
 class Encoder:
@@ -51,12 +55,21 @@ class Encoder:
     def encode(self, inputs: list[str], cache: bool = True) -> np.ndarray:
         """L2-normalized float32 embeddings of fully formatted inputs, cached as float16."""
         path = self.cache_dir / f"{self._key(inputs)}.npy"
+        if cache and path in _MEMO:
+            _MEMO.move_to_end(path)
+            return self._slice(_MEMO[path])
         if cache and path.exists():
-            return self._slice(_l2(np.load(path).astype(np.float32)))
-        emb = self._encode_full(inputs)
+            emb = _l2(np.load(path).astype(np.float32))
+        else:
+            emb = self._encode_full(inputs)
+            if cache:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                np.save(path, emb.astype(np.float16))
+                emb = _l2(emb.astype(np.float16).astype(np.float32))  # same values as a later cache hit
         if cache:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            np.save(path, emb.astype(np.float16))
+            _MEMO[path] = emb
+            while sum(a.nbytes for a in _MEMO.values()) > MEMO_BYTES and len(_MEMO) > 1:
+                _MEMO.popitem(last=False)
         return self._slice(emb)
 
     def _slice(self, emb: np.ndarray) -> np.ndarray:

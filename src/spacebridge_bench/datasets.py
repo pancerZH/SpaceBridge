@@ -1,6 +1,9 @@
 """BEIR-format retrieval datasets from the Hugging Face hub (design §7.1)."""
 
+import hashlib
+import pickle
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -76,7 +79,28 @@ class RetrievalDataset:
         return len(self.doc_ids)
 
 
+DATASET_CACHE = Path("data/cache/datasets")
+
+
 def load_beir(name: str, split: Optional[str] = None, seed: int = 0) -> RetrievalDataset:
+    """The parsed dataset, pickled under data/cache/datasets/ (parsing trec-covid's 171K rows takes ~18 s)."""
+    spec = DATASETS[name]
+    key = hashlib.sha256(repr((spec, split, seed, _LOADER_VERSION)).encode()).hexdigest()[:12]
+    path = DATASET_CACHE / f"{name}_{key}.pkl"
+    if path.exists():
+        with path.open("rb") as f:
+            return pickle.load(f)
+    ds = _load_beir(name, split, seed)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as f:
+        pickle.dump(ds, f, protocol=pickle.HIGHEST_PROTOCOL)
+    return ds
+
+
+_LOADER_VERSION = 1  # bump when parsing changes, so stale pickles are not reused
+
+
+def _load_beir(name: str, split: Optional[str], seed: int) -> RetrievalDataset:
     from datasets import load_dataset
 
     spec = DATASETS[name]
