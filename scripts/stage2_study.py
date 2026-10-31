@@ -1,8 +1,9 @@
 """Does Stage 2 help when it is not early-stopped, and which validation signal tracks its real gain?
 
-For each pair, fits Stage 1 only, the default Stage 2 (early-stopped on held-out own-doc MRR), the v2 default (agree@10), and Stage 2 run for a
-fixed number of steps (optionally with hard negatives), and prints real test retention next to the
-label-free validation signals computed on held-out proxies.
+For each pair, fits Stage 1 only, the default Stage 2 (early-stopped on held-out own-doc MRR) and Stage 2
+run for a fixed number of steps, and prints real test retention next to the label-free validation signals
+computed on held-out proxies. (The M2 study also ran agree@10 stopping and hard negatives; both were removed
+from the engine in M3 after losing to own-doc MRR stopping.)
 
     uv run python scripts/stage2_study.py --dataset fiqa --K 2048
 """
@@ -21,14 +22,12 @@ from spacebridge_bench.models import MODELS
 from spacebridge_bench.run import TIERS, cached_anchors
 from spacebridge_bench.search import search
 
-CONFIGS = {  # name -> (mode, RefineConfig kwargs, hard negatives, Stage-2 stopping signal)
-    "stage1": ("stage1", {}, 0, "owndoc_mrr"),
-    "default": ("auto", {}, 0, "owndoc_mrr"),
-    "v2-agree": ("auto", {"steps": 150}, 0, "agree@10"),
-    "fixed20": ("auto", {"steps": 20, "early_stop": False}, 0, "owndoc_mrr"),
-    "fixed50": ("auto", {"steps": 50, "early_stop": False}, 0, "owndoc_mrr"),
-    "fixed150": ("auto", {"steps": 150, "early_stop": False}, 0, "owndoc_mrr"),
-    "fixed50+hn": ("auto", {"steps": 50, "early_stop": False}, 10, "owndoc_mrr"),
+CONFIGS = {  # name -> (mode, RefineConfig kwargs)
+    "stage1": ("stage1", {}),
+    "default": ("auto", {}),
+    "fixed20": ("auto", {"steps": 20, "early_stop": False}),
+    "fixed50": ("auto", {"steps": 50, "early_stop": False}),
+    "fixed150": ("auto", {"steps": 150, "early_stop": False}),
 }
 SIGNALS = ("agree@10", "nbr_recall@10", "nbr_recall@30", "nbr_recall@100", "score_corr", "owndoc_mrr")
 
@@ -71,9 +70,8 @@ def main() -> None:
         ceil = {m: native[m] if native[m].mean() <= oracle[m].mean() else oracle[m] for m in ("recall@30", "ndcg@10")}
         print(f"\n{src} <- {tgt}")
         print(f"{'config':<13} {'ρceil R@30':>10} {'nDCG@10':>8}  " + " ".join(f"{x:>14}" for x in SIGNALS) + "  step")
-        for name, (mode, rc, hn, signal) in CONFIGS.items():
-            bridge = SpaceBridge(device=args.device, refine_config=RefineConfig(**rc), hard_negatives=hn, stage2_signal=signal,
-                                 doc_pairs=False)
+        for name, (mode, rc) in CONFIGS.items():
+            bridge = SpaceBridge(device=args.device, refine_config=RefineConfig(**rc), doc_pairs=False)
             fit = bridge.fit(bundle, Y, mode=mode, X_distractor=E[bundle.distractor_ids])
             pq = evaluate(bridge.transform_query(t["q"]), E)
             rec = {

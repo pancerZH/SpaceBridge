@@ -37,10 +37,6 @@ def test_stage2_never_lowers_its_stopping_signal(world):
     _, auto = _fit(world, world.Y_query, mode="auto", refine_config=RefineConfig(steps=30))
     assert auto["val_metrics"]["owndoc_mrr"] >= stage1["val_metrics"]["owndoc_mrr"] - 1e-9
     assert "stage2_ms" in auto
-    _, agree = _fit(world, world.Y_query, mode="auto", refine_config=RefineConfig(steps=30), stage2_signal="agree@10")
-    assert agree["rho_val"] >= stage1["rho_val"] - 1e-9
-    with pytest.raises(ValueError):
-        SpaceBridge(device="cpu", stage2_signal="nope")
 
 
 def test_stage2_keeps_most_teacher_agreement_on_the_identity(world):
@@ -138,13 +134,6 @@ def test_per_query_confidence_is_bounded_and_lower_off_distribution(world):
     assert conf.shape == (len(world.Q_tgt),) and np.all((conf >= 0) & (conf <= 1))
     off = l2(np.random.default_rng(5).standard_normal(world.Q_tgt.shape))
     assert bridge.query_support(off).mean() < bridge.query_support(world.Q_tgt).mean() - 0.1
-
-
-def test_stage2_hard_negatives_extend_candidates(world):
-    _, info = _fit(world, world.Y_query, mode="auto", hard_negatives=5, refine_config=RefineConfig(steps=20))
-    n_train = len(world.bundle.train_idx)
-    assert n_train < info["stage2_candidates"] <= n_train + 5 * n_train
-    assert info["rho_val"] > 0.5
 
 
 def test_stage1_candidates_can_be_restricted(world):

@@ -81,8 +81,6 @@ class SpaceBridge:
         refine_config: Optional[RefineConfig] = None,
         match_residual_norm: bool = True,
         selection_pool: int = 10_000,
-        hard_negatives: int = 0,
-        stage2_signal: str = "owndoc_mrr",
         doc_pairs: bool = True,
         stage1_operators: tuple[str, ...] = ("stiefel", "ridge"),
         lambdas_rel: tuple[float, ...] = LAMBDAS_REL,
@@ -96,12 +94,6 @@ class SpaceBridge:
         self.match_residual_norm = match_residual_norm
         self.refine_config = refine_config or RefineConfig()
         self.selection_pool = selection_pool
-        self.hard_negatives = hard_negatives  # per training row: teacher top-k index docs added to Stage 2
-        # Stage-2 early stopping: held-out own-doc MRR, or "agree@10" (teacher agreement, the v2 signal).
-        # Stage 2 lowers teacher agreement even when it improves real retention, so agree@10 stops it at step 0.
-        if stage2_signal not in ("owndoc_mrr", "agree@10"):
-            raise ValueError(f"unknown stage2_signal {stage2_signal!r}")
-        self.stage2_signal = stage2_signal
         # Default mount (M2): ``auto`` fits also use doc<->doc pairs (Row 8b, best first stage on 5 of
         # 6 BEIR sets and on cross-lingual); False is the opt-out for ablation rows without them.
         self.doc_pairs = doc_pairs
@@ -233,16 +225,9 @@ class SpaceBridge:
                 mu_rows = torch.cat([mu_rows, (restore * mu_xd).expand(n, -1)])
                 Y_rows, teacher_rows = torch.cat([Y_rows, Ydc]), torch.cat([teacher_rows, Xd[tr]])
                 labels = torch.cat([labels, labels])
-            cand = Xd[tr]
-            if self.hard_negatives and X_distractor is not None:
-                # The teacher's nearest index docs to each training row become extra candidates, so the
-                # KL term teaches the ranking among close documents, not only among distant anchors.
-                dis = pool[Xd.shape[0]:]
-                nbr = (teacher_rows @ dis.T).topk(min(self.hard_negatives, dis.shape[0]), dim=1).indices.unique()
-                cand = torch.cat([cand, dis[nbr]])
-                info["stage2_candidates"] = int(cand.shape[0])
-            stage2_score = owndoc_score if self.stage2_signal == "owndoc_mrr" else val_score
-            W, r_info = refine(W, mu_rows, Y_rows, teacher_rows, cand, stage2_score, self.refine_config, labels)
+            # Stopping signal: held-out own-doc MRR under the agreement floor. Stage 2 lowers teacher agreement even
+            # when it improves real retention, so stopping on agree@10 (the v2 signal) stopped it at step 0 (M2).
+            W, r_info = refine(W, mu_rows, Y_rows, teacher_rows, Xd[tr], owndoc_score, self.refine_config, labels)
             self._sync()
             info["stage2_ms"] = 1e3 * (time.perf_counter() - t0)
             info["stage2_best_step"] = r_info["best_step"]

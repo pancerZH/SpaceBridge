@@ -41,7 +41,6 @@ ROWS = {
     "8s": "Row 8 without mean restore",
     "8n": "Row 8 without residual norm matching",
     "8b": "Row 8 + doc<->doc pairs (anchor docs encoded by M_tgt; default engine)",
-    "8h": "Row 8 + Stage-2 hard negatives (teacher top-10 index docs per training proxy)",
     "9n": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-30 + cross-encoder rerank",
     "9": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-60 + cross-encoder rerank",
     "9w": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-100 + cross-encoder rerank",
@@ -63,7 +62,6 @@ BRIDGE_ROWS = {
     "8s": ("tgt_query", "auto", "query", False),
     "8n": ("tgt_query", "auto", "query", True),
     "8b": ("tgt_query", "auto", "query", True),  # + Y_doc_raw
-    "8h": ("tgt_query", "auto", "query", True),  # + hard negatives
 }
 
 TIERS = {
@@ -189,7 +187,7 @@ def run_pair(
             y_kind, mode, pairs, restore = BRIDGE_ROWS[row]
             bridge = SpaceBridge(
                 device=device, restore_source_mean=restore, match_residual_norm=row not in ("6n", "8n"),
-                hard_negatives=10 if row == "8h" else 0, doc_pairs=row in doc_rows,
+                doc_pairs=row in doc_rows,
                 refine_config=RefineConfig(
                     **({"batch_candidates": stage2_batch or None} if stage2_batch is not None else {}),
                     **({"tau_scale": stage2_tau_scale, "tau_scale_below_sd": float("inf")} if stage2_tau_scale else {}),
