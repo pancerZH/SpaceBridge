@@ -113,7 +113,7 @@ def cached_anchors(ds: RetrievalDataset, src_key: str, E_src: np.ndarray, allowe
 def run_pair(
     ds: RetrievalDataset, src_key: str, tgt_key: str, K: int, seed: int, rows: list[str], device: str,
     rerankers: tuple[str, ...] = (), proxy: str = "lead", stage2_batch: Optional[int] = None,
-    doc_pair_tokens: Optional[int] = None, time_mount: bool = False,
+    doc_pair_tokens: Optional[int] = None, time_mount: bool = False, stage2_tau_scale: Optional[float] = None,
 ) -> list[dict]:
     src, tgt = MODELS[src_key], MODELS[tgt_key]
     K = min(K, ds.N - int((ds.self_rows >= 0).sum()))
@@ -190,7 +190,10 @@ def run_pair(
             bridge = SpaceBridge(
                 device=device, restore_source_mean=restore, match_residual_norm=row not in ("6n", "8n"),
                 hard_negatives=10 if row == "8h" else 0, doc_pairs=row in doc_rows,
-                **({"refine_config": RefineConfig(batch_candidates=stage2_batch or None)} if stage2_batch is not None else {}),
+                refine_config=RefineConfig(
+                    **({"batch_candidates": stage2_batch or None} if stage2_batch is not None else {}),
+                    **({"tau_scale": stage2_tau_scale} if stage2_tau_scale else {}),
+                ),
             )
             extra = {"Y_doc_raw": doc_rows[row]} if row in doc_rows else {}
             fit = bridge.fit(bundle, anchor_Y[y_kind], mode=mode, pairs=pairs, X_distractor=X_distractor, **extra)
@@ -209,6 +212,8 @@ def run_pair(
         base["proxy"] = proxy
     if stage2_batch is not None:
         base["stage2_batch"] = stage2_batch
+    if stage2_tau_scale:
+        base["stage2_tau_scale"] = stage2_tau_scale
     if doc_pair_tokens:
         base["doc_pair_tokens"] = doc_pair_tokens
     records = []
@@ -368,6 +373,7 @@ def main() -> None:
     p.add_argument("--proxy", default="lead", choices=PROXY_STYLES, help="query-proxy style")
     p.add_argument("--doc-pair-tokens", type=int, default=None, help="truncate anchor docs encoded for doc pairs")
     p.add_argument("--stage2-batch", type=int, default=None, help="Stage-2 candidate mini-batch size (default: the engine's; 0: full batch)")
+    p.add_argument("--stage2-tau-scale", type=float, default=None, help="Stage-2 temperature relative to the teacher score s.d.")
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", type=Path, default=Path("outputs/results.jsonl"))
     args = p.parse_args()
@@ -384,7 +390,7 @@ def main() -> None:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     for seed, (src, tgt), K in ((s, pr, K) for s in args.seed for pr in pairs for K in args.K):
         records = run_pair(ds, src, tgt, K, seed, args.rows, args.device, tuple(args.rerankers), args.proxy, args.stage2_batch,
-                           args.doc_pair_tokens, args.time_mount)
+                           args.doc_pair_tokens, args.time_mount, args.stage2_tau_scale)
         with args.out.open("a") as f:
             for rec in records:
                 f.write(json.dumps(rec, default=_json_default) + "\n")

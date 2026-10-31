@@ -247,6 +247,7 @@ class SpaceBridge:
             info["stage2_ms"] = 1e3 * (time.perf_counter() - t0)
             info["stage2_best_step"] = r_info["best_step"]
             info["stage2_steps_run"] = r_info["steps_run"]
+            info["stage2_tau"] = r_info["tau"]
             info["stage2_gain"] = r_info["best_val"] - r_info["val_curve"][0][1]
 
         self.src_lang = bundle.src_lang

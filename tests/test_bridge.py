@@ -162,3 +162,11 @@ def test_stage2_candidate_minibatches_match_full_batch(world):
     a, b = top_k(full.transform_query(world.Q_tgt), world.E_src), top_k(mini.transform_query(world.Q_tgt), world.E_src)
     assert overlap_at_k(a, b) > 0.8
     assert info_mini["val_metrics"]["owndoc_mrr"] >= info_full["val_metrics"]["owndoc_mrr"] - 0.05
+
+
+def test_stage2_temperature_can_follow_the_teacher_score_spread(world):
+    _, fixed = _fit(world, world.Y_query, mode="auto", refine_config=RefineConfig(steps=10))
+    assert fixed["stage2_tau"] == pytest.approx(0.05)
+    Xq, Xd = world.bundle.X_query_raw[world.bundle.train_idx], world.bundle.X_doc_raw[world.bundle.train_idx]
+    _, scaled = _fit(world, world.Y_query, mode="auto", refine_config=RefineConfig(steps=10, tau_scale=0.6))
+    assert scaled["stage2_tau"] == pytest.approx(0.6 * (Xq @ Xd.T).std(axis=1, ddof=1).mean(), rel=1e-3)

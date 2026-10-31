@@ -13,6 +13,9 @@ class RefineConfig:
     steps: int = 50  # gains plateau by step 20-50 (M2 P4 study); the cosine schedule spans all steps
     lr: float = 3e-3
     tau: float = 0.05
+    # If set, tau = tau_scale * the mean per-row s.d. of the teacher's cosine scores, so the softmax has the
+    # same sharpness on indexes whose scores are compressed (multilingual-e5: s.d. 0.02) or spread out (0.06-0.09).
+    tau_scale: Optional[float] = None
     alpha: float = 0.5
     # Student and teacher share temperature tau, so the Hinton tau^2 factor would shrink the KL
     # term ~400x relative to InfoNCE; 1.0 keeps the two terms balanced (tau**2 reproduces §4.3).
@@ -53,7 +56,9 @@ def refine(
         labels = torch.arange(K_train, device=dev)
     batch = cfg.batch_candidates if cfg.batch_candidates and n_cand > cfg.batch_candidates else None
     with torch.no_grad():
-        teacher_logits = Xq_train @ Xd_train.T / cfg.tau
+        teacher_scores = Xq_train @ Xd_train.T
+        tau = cfg.tau if cfg.tau_scale is None else cfg.tau_scale * teacher_scores.std(dim=1).mean().item()
+        teacher_logits = teacher_scores / tau
         teacher = F.log_softmax(teacher_logits, dim=-1) if batch is None else None
     gen = torch.Generator(device=dev).manual_seed(0)
 
@@ -73,7 +78,7 @@ def refine(
             mu_b, Y_b, cand, lab = mu_x[rows], Yc_train[rows], Xd_train[sel], slot[labels[rows]]
             t = F.log_softmax(teacher_logits[rows][:, sel], dim=-1)
         q = F.normalize(mu_b + Y_b @ W, dim=-1)
-        log_p = F.log_softmax(q @ cand.T / cfg.tau, dim=-1)
+        log_p = F.log_softmax(q @ cand.T / tau, dim=-1)
         ce = F.nll_loss(log_p, lab)
         kl = F.kl_div(log_p, t, log_target=True, reduction="batchmean")
         loss = (1 - cfg.alpha) * ce + cfg.alpha * cfg.kl_scale * kl + beta * (W - W0).pow(2).sum()
@@ -96,4 +101,4 @@ def refine(
     if not cfg.early_stop:
         best_step, best_W, best_score = step, W.detach().clone(), curve[-1][1]
 
-    return best_W, {"best_step": best_step, "best_val": best_score, "val_curve": curve, "beta": beta, "steps_run": step}
+    return best_W, {"best_step": best_step, "best_val": best_score, "val_curve": curve, "beta": beta, "steps_run": step, "tau": tau}
