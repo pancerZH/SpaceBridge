@@ -31,8 +31,9 @@ def main() -> None:
     for f in args.results:
         for line in f.open():
             r = json.loads(line)
-            if "reranker" not in r:
-                ds = r["dataset"] + (f" T{tier_of.get((r['src'], r['tgt']), '?')}" if args.by_tier else "")
+            if "reranker" in r:
+                continue
+            ds = r["dataset"] + (f" T{tier_of.get((r['src'], r['tgt']), '?')}" if args.by_tier else "")
             by[(ds, r["K"], r["row"], r["src"], r["tgt"], r["seed"])] = r  # last run wins
 
     def ret(r):  # identity is judged against native, everything else against the ceiling
