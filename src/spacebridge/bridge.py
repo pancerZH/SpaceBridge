@@ -7,8 +7,10 @@ from typing import Dict, Literal, Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
+from sklearn.isotonic import IsotonicRegression
 
 from .bundle import CalibrationBundle
+from .quality import QualityReport, load_calibration, score_report
 from .refine import RefineConfig, refine
 from .solvers import LAMBDAS_REL, naive_procrustes, ridge_path, stiefel_procrustes
 
@@ -20,6 +22,7 @@ Pairs = Literal["query", "doc"]
 HIGH_CONFIDENCE = 0.58
 MODERATE_DRIFT = 0.40
 VAL_K = 10
+SUPPORT_K = 5
 
 
 def topk_agreement(Q: torch.Tensor, pool: torch.Tensor, teacher_top: torch.Tensor) -> float:
@@ -45,7 +48,9 @@ def validation_metrics(Q_student: torch.Tensor, Q_teacher: torch.Tensor, pool: t
 
     ``nbr_recall@k``: share of the teacher's top-10 *other* docs (own doc excluded, since proxies
     find it trivially) that the student ranks in its top-k. ``score_corr``: mean Pearson
-    correlation of student and teacher scores over the whole pool.
+    correlation of student and teacher scores over the whole pool. ``teacher_gap``: teacher score
+    drop from the 1st to the 30th other doc (``_sd``: in units of the query's pool-score s.d.);
+    small gaps mean crowded neighborhoods, where small query errors reorder many documents.
     """
     S, T = Q_student @ pool.T, Q_teacher @ pool.T
     rows = torch.arange(len(own), device=own.device)
@@ -53,11 +58,15 @@ def validation_metrics(Q_student: torch.Tensor, Q_teacher: torch.Tensor, pool: t
     T_other[rows, own] = -torch.inf
     nbrs = T_other.topk(VAL_K, dim=1).indices
     out = {"agree@10": topk_agreement(Q_student, pool, T.topk(VAL_K, dim=1).indices)}
-    for k in (10, 30):
-        top = S.topk(k, dim=1).indices
+    for k in (10, 30, 100):
+        top = S.topk(min(k, pool.shape[0]), dim=1).indices
         out[f"nbr_recall@{k}"] = (nbrs[:, :, None] == top[:, None, :]).any(-1).float().mean().item()
     Sc, Tc = S - S.mean(1, keepdim=True), T - T.mean(1, keepdim=True)
     out["score_corr"] = ((Sc * Tc).sum(1) / (Sc.norm(dim=1) * Tc.norm(dim=1))).mean().item()
+    top30 = T_other.topk(min(30, pool.shape[0] - 1), dim=1).values
+    gap = top30[:, 0] - top30[:, -1]
+    out["teacher_gap"] = gap.mean().item()
+    out["teacher_gap_sd"] = (gap / T.std(dim=1)).mean().item()
     out["owndoc_mrr"] = retrieval_stats(Q_student, pool, own)["mrr"]
     return out
 
@@ -69,6 +78,8 @@ class SpaceBridge:
         restore_source_mean: bool = True,
         refine_config: Optional[RefineConfig] = None,
         match_residual_norm: bool = True,
+        selection_pool: int = 10_000,
+        hard_negatives: int = 0,
     ):
         if device.startswith("cuda") and not torch.cuda.is_available():
             device = "cpu"
@@ -78,12 +89,17 @@ class SpaceBridge:
         # queries drift toward the average query; rescaling W to the native residual norm undoes it.
         self.match_residual_norm = match_residual_norm
         self.refine_config = refine_config or RefineConfig()
+        self.selection_pool = selection_pool
+        self.hard_negatives = hard_negatives  # per training row: teacher top-k index docs added to Stage 2
         self.src_lang: str = "en"
         self.mu_x_query: Optional[np.ndarray] = None
         self.mu_y_by_lang: Dict[str, np.ndarray] = {}
         self.W: Optional[np.ndarray] = None
         self.status: str = "uninitialized"
         self.metrics: Dict[str, float] = {}
+        self.quality: Optional[QualityReport] = None
+        self._support_anchors: Optional[np.ndarray] = None  # (K_train, d_t) unit-norm centered target proxies
+        self._conf_map: Optional[tuple[np.ndarray, np.ndarray]] = None  # isotonic support -> agreement knots
 
     def _t(self, a: np.ndarray) -> torch.Tensor:
         return torch.as_tensor(np.asarray(a, dtype=np.float32), device=self.device)
@@ -127,9 +143,18 @@ class SpaceBridge:
         # Proxies trivially retrieve their own anchor doc, so validation scores agreement with the
         # native source ranking (teacher top-k over the pool) rather than own-doc recall.
         teacher_top = (Xq[va] @ pool.T).topk(min(VAL_K, pool.shape[0]), dim=1).indices
+        # Model selection (Stage-1 candidates, Stage-2 early stopping) scores on a fixed subsample of
+        # the pool: all anchor docs plus random distractors; the reported rho_val uses the full pool.
+        sel_pool = pool
+        if pool.shape[0] > self.selection_pool:
+            gen = torch.Generator().manual_seed(0)
+            extra = Xd.shape[0] + torch.randperm(pool.shape[0] - Xd.shape[0], generator=gen)
+            keep = torch.cat([torch.arange(Xd.shape[0]), extra[: max(0, self.selection_pool - Xd.shape[0])]])
+            sel_pool = pool[keep.to(self.device)]
+        sel_teacher = (Xq[va] @ sel_pool.T).topk(min(VAL_K, sel_pool.shape[0]), dim=1).indices
 
         def val_score(W: torch.Tensor) -> float:
-            return topk_agreement(self._project(Y[va], mu_y, mu_x, W), pool, teacher_top)
+            return topk_agreement(self._project(Y[va], mu_y, mu_x, W), sel_pool, sel_teacher)
 
         info: Dict[str, float] = {"mode": mode, "pairs": pairs}
         self._sync()
@@ -177,10 +202,20 @@ class SpaceBridge:
                 mu_rows = torch.cat([mu_rows, (restore * mu_xd).expand(n, -1)])
                 Y_rows, teacher_rows = torch.cat([Y_rows, Ydc]), torch.cat([teacher_rows, Xd[tr]])
                 labels = torch.cat([labels, labels])
-            W, r_info = refine(W, mu_rows, Y_rows, teacher_rows, Xd[tr], val_score, self.refine_config, labels)
+            cand = Xd[tr]
+            if self.hard_negatives and X_distractor is not None:
+                # The teacher's nearest index docs to each training row become extra candidates, so the
+                # KL term teaches the ranking among close documents, not only among distant anchors.
+                dis = pool[Xd.shape[0]:]
+                nbr = (teacher_rows @ dis.T).topk(min(self.hard_negatives, dis.shape[0]), dim=1).indices.unique()
+                cand = torch.cat([cand, dis[nbr]])
+                info["stage2_candidates"] = int(cand.shape[0])
+            W, r_info = refine(W, mu_rows, Y_rows, teacher_rows, cand, val_score, self.refine_config, labels)
             self._sync()
             info["stage2_ms"] = 1e3 * (time.perf_counter() - t0)
             info["stage2_best_step"] = r_info["best_step"]
+            info["stage2_steps_run"] = r_info["steps_run"]
+            info["stage2_gain"] = r_info["best_val"] - r_info["val_curve"][0][1]
 
         self.src_lang = bundle.src_lang
         self.W = W.cpu().numpy()
@@ -192,11 +227,14 @@ class SpaceBridge:
         rho = topk_agreement(Q_val, pool, teacher_top)
         self._sync()
         info["val_ms"] = 1e3 * (time.perf_counter() - t0)
-        info.update(
-            rho_val=rho,
-            val_pool_size=int(pool.shape[0]),
-            val_metrics=validation_metrics(Q_val, Xq[va], pool, va),
-        )
+        val_metrics = validation_metrics(Q_val, Xq[va], pool, va)
+        info.update(rho_val=rho, val_pool_size=int(pool.shape[0]), val_metrics=val_metrics)
+        if mode != "naive":
+            self.quality = self._quality_report(
+                val_metrics, Y, X_pairs, Xq, pool, tr, va, mu_y, mu_x, W, info.get("stage2_gain", 0.0), bundle
+            )
+            info["quality"] = self.quality.details
+            self._fit_confidence(Y, mu_y, mu_x, W, Xq, pool, tr, va)
         self.status = (
             "HIGH_CONFIDENCE" if rho >= HIGH_CONFIDENCE
             else "MODERATE_DRIFT" if rho >= MODERATE_DRIFT
@@ -205,6 +243,70 @@ class SpaceBridge:
         info["status"] = self.status
         self.metrics = info
         return info
+
+    def _quality_report(self, val_metrics, Y, X_pairs, Xq, pool, tr, va, mu_y, mu_x, W, stage2_gain, bundle) -> QualityReport:
+        """Measurements of design §5.1 from the calibration data alone (no labeled queries)."""
+        resid_true = X_pairs[va] - mu_x
+        resid_pred = (Y[va] - mu_y) @ W
+        tr_s = tr[: len(va)]
+        teacher_tr = (Xq[tr_s] @ pool.T).topk(min(VAL_K, pool.shape[0]), dim=1).indices
+        train_agree = topk_agreement(self._project(Y[tr_s], mu_y, mu_x, W), pool, teacher_tr)
+        Yc = Y[tr] - mu_y
+        # Participation ratio of the calibration inputs: how many target dimensions the anchors span.
+        part_ratio = float(Yc.pow(2).sum() ** 2 / (Yc.T @ Yc).pow(2).sum())
+        mu_doc = self._t(bundle.mu_x_doc) if bundle.mu_x_doc is not None else pool.mean(0)
+        cone = F.cosine_similarity(Xq[tr].mean(0), mu_doc, dim=0).clamp(-1, 1)
+        d_t, d_s = Y.shape[1], X_pairs.shape[1]
+        details = {
+            "fidelity": {"agree@10": val_metrics["agree@10"], "nbr_recall@30": val_metrics["nbr_recall@30"]},
+            "recoverability": {"nbr_recall@100": val_metrics["nbr_recall@100"]},
+            "fit": {
+                "val_r2": float(1 - (resid_pred - resid_true).pow(2).sum() / resid_true.pow(2).sum()),
+                "val_resid_cos": F.cosine_similarity(resid_pred, resid_true, dim=1).mean().item(),
+                "train_val_gap": train_agree - val_metrics["agree@10"],
+                "rank_ratio": part_ratio / min(d_t, d_s),
+                "stage2_gain": float(stage2_gain),
+            },
+            "difficulty": {
+                "teacher_gap": val_metrics["teacher_gap"],
+                "teacher_gap_sd": val_metrics["teacher_gap_sd"],
+                "cone_angle_deg": float(torch.rad2deg(torch.arccos(cone))),
+            },
+            "coverage": {"K_over_dt": len(bundle.anchor_ids) / d_t},
+        }
+        return score_report(QualityReport(details), load_calibration())
+
+    def _fit_confidence(self, Y, mu_y, mu_x, W, Xq, pool, tr, va) -> None:
+        """Per-query confidence: anchor support of the query in target space, mapped by an isotonic fit
+        on validation proxies to their top-10 agreement with the native ranking."""
+        anchors = F.normalize(Y[tr] - mu_y, dim=-1)
+        self._support_anchors = anchors.cpu().numpy()
+        support = self._support(Y[va] - mu_y, anchors)
+        teacher = (Xq[va] @ pool.T).topk(VAL_K, dim=1).indices
+        student = (self._project(Y[va], mu_y, mu_x, W) @ pool.T).topk(VAL_K, dim=1).indices
+        agree = (student[:, :, None] == teacher[:, None, :]).any(-1).float().mean(1)
+        iso = IsotonicRegression(out_of_bounds="clip").fit(support.cpu().numpy(), agree.cpu().numpy())
+        self._conf_map = (iso.X_thresholds_, iso.y_thresholds_)
+
+    @staticmethod
+    def _support(Yc, anchors):
+        sims = F.normalize(Yc, dim=-1) @ anchors.T
+        return sims.topk(min(SUPPORT_K, anchors.shape[0]), dim=1).values.mean(1)
+
+    def query_support(self, q_tgt_raw: np.ndarray, query_lang: Optional[str] = None) -> np.ndarray:
+        """Mean cosine of each centered target query to its 5 nearest training proxies."""
+        if self._support_anchors is None:
+            raise RuntimeError("fit() must be called (with a centered mode) before query_support()")
+        Yc = np.atleast_2d(q_tgt_raw) - self._mu_y(query_lang)
+        Yc = Yc / (np.linalg.norm(Yc, axis=-1, keepdims=True) + 1e-8)
+        sims = Yc @ self._support_anchors.T
+        k = min(SUPPORT_K, sims.shape[1])
+        return -np.partition(-sims, k - 1, axis=1)[:, :k].mean(1)
+
+    def quality_report(self) -> QualityReport:
+        if self.quality is None:
+            raise RuntimeError("fit() must be called (with a centered mode) before quality_report()")
+        return self.quality
 
     def _project(self, Y: torch.Tensor, mu_y: torch.Tensor, mu_x: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
         q = (Y - mu_y) @ W
@@ -222,10 +324,7 @@ class SpaceBridge:
         shift = Y_flores_query_lang.mean(axis=0) - Y_flores_src_lang.mean(axis=0)
         self.mu_y_by_lang[lang] = self.mu_y_by_lang[self.src_lang] + shift
 
-    def transform_query(self, q_tgt_raw: np.ndarray, query_lang: Optional[str] = None) -> np.ndarray:
-        """Applies language-aware centering, linear projection W, source-mean restore, and L2 norm."""
-        if self.W is None:
-            raise RuntimeError("fit() must be called before transform_query()")
+    def _mu_y(self, query_lang: Optional[str]) -> np.ndarray:
         lang = query_lang or self.src_lang
         mu_y = self.mu_y_by_lang.get(lang)
         if mu_y is None:
@@ -234,7 +333,25 @@ class SpaceBridge:
                 "without language-cone correction"
             )
             mu_y = self.mu_y_by_lang[self.src_lang]
+        return mu_y
+
+    def transform_query(
+        self, q_tgt_raw: np.ndarray, query_lang: Optional[str] = None, return_confidence: bool = False
+    ):
+        """Applies language-aware centering, linear projection W, source-mean restore, and L2 norm.
+
+        With ``return_confidence``, also returns a per-query confidence in [0, 1]: the predicted
+        top-10 agreement with native retrieval, from the query's support among the training anchors.
+        """
+        if self.W is None:
+            raise RuntimeError("fit() must be called before transform_query()")
+        mu_y = self._mu_y(query_lang)
         q_proj = (q_tgt_raw - mu_y) @ self.W
         if self.restore_source_mean:
             q_proj = q_proj + self.mu_x_query
-        return q_proj / (np.linalg.norm(q_proj, axis=-1, keepdims=True) + 1e-8)
+        q_hat = q_proj / (np.linalg.norm(q_proj, axis=-1, keepdims=True) + 1e-8)
+        if not return_confidence:
+            return q_hat
+        if self._conf_map is None:
+            raise RuntimeError("per-query confidence needs a centered fit")
+        return q_hat, np.interp(self.query_support(q_tgt_raw, query_lang), *self._conf_map)

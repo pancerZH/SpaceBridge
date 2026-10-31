@@ -47,3 +47,13 @@ def test_subtracting_doc_mean_preserves_ranking():
     q = rng.standard_normal(32)
     mu_d = E.mean(0)
     assert np.array_equal(np.argsort(-(E @ q)), np.argsort(-((E - mu_d) @ q)))
+
+
+@pytest.mark.parametrize("d_t,d_s", [(24, 40), (40, 24)])  # both Gram-matrix branches
+def test_stiefel_polar_matches_svd_form(d_t, d_s):
+    Yc, Xc = _rand(300, d_t), _rand(300, d_s, seed=1)
+    W, info = stiefel_procrustes(Yc, Xc)
+    U, S, Vh = torch.linalg.svd(Yc.T @ Xc, full_matrices=False)
+    s = S.sum() / Yc.pow(2).sum()
+    torch.testing.assert_close(W, s * U @ Vh)
+    assert info["rank"] == min(d_t, d_s)

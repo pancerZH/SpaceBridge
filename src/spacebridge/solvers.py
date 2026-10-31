@@ -23,12 +23,24 @@ def naive_procrustes(Y: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
 
 
 def stiefel_procrustes(Yc: torch.Tensor, Xc: torch.Tensor, rel_tol: float = 1e-3) -> tuple[torch.Tensor, dict]:
-    """Operator A: scaled, spectrally truncated semi-orthogonal map ``s * U_r V_r^T``."""
-    U, S, Vh = _svd(Yc.T @ Xc)
+    """Operator A: scaled, spectrally truncated semi-orthogonal map ``s * U_r V_r^T``.
+
+    Computed as a polar decomposition from a float64 eigendecomposition of the smaller Gram matrix
+    of ``M = Yc^T Xc``: identical to the SVD form (to ~1e-5) but several times faster than gesvd on
+    GPU. float64 matters: kept modes reach sigma_r / sigma_1 = 1e-3, i.e. eigenvalue ratios of 1e-6.
+    """
+    M = (Yc.T @ Xc).double()
+    left = M.shape[0] < M.shape[1]  # eigendecompose M M^T (d_t x d_t) when d_t < d_s
+    evals, Q = torch.linalg.eigh(M @ M.T if left else M.T @ M)
+    S, Q = evals.flip(0).clamp_min(0).sqrt(), Q.flip(1)
     r = int((S >= rel_tol * S[0]).sum())
-    s = S[:r].sum() / Yc.pow(2).sum()
-    W = s * (U[:, :r] @ Vh[:r])
-    return W, {"rank": r, "scale": float(s), "singular_values": S.cpu()}
+    if left:
+        U, V = Q[:, :r], (M.T @ Q[:, :r]) / S[:r]
+    else:
+        U, V = (M @ Q[:, :r]) / S[:r], Q[:, :r]
+    s = S[:r].sum() / Yc.double().pow(2).sum()
+    W = (s * (U @ V.T)).to(Yc.dtype)
+    return W, {"rank": r, "scale": float(s), "singular_values": S.float().cpu()}
 
 
 def ridge_lambda(Yc: torch.Tensor, lam_rel: float) -> float:

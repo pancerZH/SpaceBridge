@@ -19,6 +19,8 @@ class RefineConfig:
     kl_scale: float = 1.0
     beta: Optional[float] = None  # None: 1e-3, or 1e-2 when d_t > K_train
     eval_every: int = 10
+    patience: int = 50  # stop after this many steps without a validation improvement
+    early_stop: bool = True  # False: run all steps and return the final W (validation is only logged)
 
 
 def refine(
@@ -67,7 +69,14 @@ def refine(
             with torch.no_grad():
                 score = val_score(W.detach())
             curve.append((step, score))
+            if not cfg.early_stop:
+                continue
             if score > best_score:
                 best_score, best_step, best_W = score, step, W.detach().clone()
+            elif step - best_step >= cfg.patience:
+                break
 
-    return best_W, {"best_step": best_step, "best_val": best_score, "val_curve": curve, "beta": beta}
+    if not cfg.early_stop:
+        best_step, best_W, best_score = step, W.detach().clone(), curve[-1][1]
+
+    return best_W, {"best_step": best_step, "best_val": best_score, "val_curve": curve, "beta": beta, "steps_run": step}

@@ -87,3 +87,38 @@ def test_language_registration_and_fallback(world):
     )
     with pytest.warns(UserWarning, match="not registered"):
         bridge.transform_query(world.Q_tgt[:5], query_lang="ja")
+
+
+def test_quality_report_measurements_and_scoring(world):
+    from spacebridge.quality import QualityReport, score_report
+
+    bridge, info = _fit(world, world.Y_query, mode="auto", refine_config=RefineConfig(steps=20))
+    report = bridge.quality_report()
+    assert set(report.details) == {"fidelity", "recoverability", "fit", "difficulty", "coverage"}
+    feats = report.features()
+    assert all(np.isfinite(v) for v in feats.values())
+    assert feats["recoverability.nbr_recall@100"] >= feats["fidelity.nbr_recall@30"]
+    assert 0 < feats["fit.rank_ratio"] <= 1
+
+    calib = {"features": ["fidelity.agree@10"], "mean": [0.0], "scale": [1.0], "coef": [0.5],
+             "intercept": 0.5, "resid_sd": 0.03}
+    scored = score_report(QualityReport(report.details), calib)
+    assert scored.score == pytest.approx(100 * (0.5 + 0.5 * feats["fidelity.agree@10"]))
+    assert scored.band == pytest.approx((scored.score - 3, scored.score + 3))
+    assert scored.grade in "ABCD"
+
+
+def test_per_query_confidence_is_bounded_and_lower_off_distribution(world):
+    bridge, _ = _fit(world, world.Y_query, mode="stage1")
+    q_hat, conf = bridge.transform_query(world.Q_tgt, return_confidence=True)
+    np.testing.assert_allclose(q_hat, bridge.transform_query(world.Q_tgt))
+    assert conf.shape == (len(world.Q_tgt),) and np.all((conf >= 0) & (conf <= 1))
+    off = l2(np.random.default_rng(5).standard_normal(world.Q_tgt.shape))
+    assert bridge.query_support(off).mean() < bridge.query_support(world.Q_tgt).mean() - 0.1
+
+
+def test_stage2_hard_negatives_extend_candidates(world):
+    _, info = _fit(world, world.Y_query, mode="auto", hard_negatives=5, refine_config=RefineConfig(steps=20))
+    n_train = len(world.bundle.train_idx)
+    assert n_train < info["stage2_candidates"] <= n_train + 5 * n_train
+    assert info["rho_val"] > 0.5
