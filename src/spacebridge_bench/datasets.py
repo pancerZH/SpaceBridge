@@ -13,6 +13,10 @@ class DatasetSpec:
     task: str                         # retrieval instruction for instruction-tuned query encoders
     max_docs: Optional[int] = None    # positive-preserving subsample size for large corpora
     query_lang: Optional[str] = None  # cross-lingual sets: language of the test queries
+    max_queries: Optional[int] = None  # random query subsample (fixed seed) before the corpus subsample
+    split: str = "test"               # qrels split
+    corpus_split: str = "corpus"      # split names of the corpus / queries configs
+    queries_split: str = "queries"
 
 
 DATASETS: dict[str, DatasetSpec] = {
@@ -26,6 +30,22 @@ DATASETS: dict[str, DatasetSpec] = {
     # Full 171K corpus: its 17.5K judged-relevant docs would make up 35% of a 50K subsample.
     "trec-covid": DatasetSpec("mteb/trec-covid", "en", "Given a query on COVID-19, retrieve documents that answer the query"),
     "nq": DatasetSpec("mteb/nq", "en", "Given a question, retrieve Wikipedia passages that answer the question", max_docs=50_000),
+    # M3 held-out sets (never used to choose a default). 2,000 of 7,405 hotpotqa test queries keep their
+    # 4K positives at 8% of a 50K subsample; all 14.8K would be 30%.
+    "hotpotqa": DatasetSpec(
+        "mteb/hotpotqa", "en", "Given a multi-hop question, retrieve documents that can help answer the question",
+        max_docs=50_000, max_queries=2_000,
+    ),
+    "quora": DatasetSpec(
+        "mteb/quora", "en", "Given a question, retrieve questions that are semantically equivalent to the given question",
+        max_docs=50_000, max_queries=2_000,
+    ),
+    # Tier 2 (native Chinese): T2Ranking web passages and real search queries; only a dev split exists.
+    # 2,000 of 22.8K queries (~10K positives) in a 50K-passage subsample.
+    "t2retrieval": DatasetSpec(
+        "mteb/T2Retrieval", "zh", "Given a Chinese search query, retrieve web passages that answer the question",
+        max_docs=50_000, max_queries=2_000, split="dev", corpus_split="dev", queries_split="dev",
+    ),
     # Tier 5a: XQuAD questions (human-translated) against all ~21K English SQuAD v1.1 paragraphs.
     "xquad-zh": DatasetSpec(
         "google/xquad", "en", "Given a question, retrieve Wikipedia passages that answer the question", query_lang="zh"
@@ -56,15 +76,17 @@ class RetrievalDataset:
         return len(self.doc_ids)
 
 
-def load_beir(name: str, split: str = "test", seed: int = 0) -> RetrievalDataset:
+def load_beir(name: str, split: Optional[str] = None, seed: int = 0) -> RetrievalDataset:
     from datasets import load_dataset
 
     spec = DATASETS[name]
     if spec.repo == "google/xquad":
         return _load_xquad(name, spec)
-    corpus = load_dataset(spec.repo, "corpus", split="corpus")
-    queries = load_dataset(spec.repo, "queries", split="queries")
-    qrels = load_dataset(spec.repo, "default", split=split)
+    corpus = load_dataset(spec.repo, "corpus", split=spec.corpus_split)
+    queries = load_dataset(spec.repo, "queries", split=spec.queries_split)
+    qrels = load_dataset(spec.repo, "default", split=split or spec.split)
+    if spec.max_queries is not None:
+        qrels = qrels.select(_query_subsample(qrels["query-id"], qrels["score"], spec.max_queries, seed))
 
     all_ids = [str(i) for i in corpus["_id"]]
     if spec.max_docs is not None and len(all_ids) > spec.max_docs:
@@ -99,6 +121,15 @@ def self_match_rows(queries: list[str], texts: list[str]) -> np.ndarray:
     corpus arguments), else -1. Matched on text: query and corpus ids live in separate namespaces."""
     row_of_text = {t: i for i, t in enumerate(texts) if t}
     return np.array([row_of_text.get(q, -1) for q in queries], dtype=np.int64)
+
+
+def _query_subsample(query_ids: list, scores: list, n: int, seed: int) -> np.ndarray:
+    """Qrels rows of ``n`` random queries that have at least one positive (all rows if fewer)."""
+    qids = sorted({str(q) for q, s in zip(query_ids, scores) if s > 0})
+    if len(qids) <= n:
+        return np.arange(len(query_ids))
+    keep = set(np.random.default_rng(seed).choice(qids, n, replace=False).tolist())
+    return np.array([i for i, q in enumerate(query_ids) if str(q) in keep])
 
 
 def _positive_preserving_subsample(doc_ids: list[str], qrels, n: int, seed: int) -> np.ndarray:

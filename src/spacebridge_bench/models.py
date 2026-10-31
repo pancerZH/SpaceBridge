@@ -1,6 +1,7 @@
 """Embedding model registry with native prompts (design §7.1 prompt table)."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -16,6 +17,8 @@ class ModelSpec:
     langs: tuple[str, ...] = ("en",)
     tokenizer_kwargs: dict = field(default_factory=dict)
     config_kwargs: dict = field(default_factory=dict)
+    truncate_dim: Optional[int] = None  # MRL slice: keep the first dims and re-normalize
+    cache_key: str = ""                 # embedding cache directory; MRL slices share the full model's
 
     def format_query(self, text: str, task: str) -> str:
         return self.query_template.format(task=task, text=text)
@@ -62,3 +65,10 @@ MODELS: dict[str, ModelSpec] = {
         ),
     ]
 }
+
+# Tier 4b: Matryoshka slices of the full embeddings (the encoder caches full vectors and slices them).
+for _base in ("embeddinggemma-2", "qwen3-0.6b"):
+    for _d in (128, 256, 512, 768):
+        _spec = MODELS[_base]
+        if _d < _spec.dim:
+            MODELS[f"{_base}-{_d}"] = replace(_spec, key=f"{_base}-{_d}", dim=_d, truncate_dim=_d, cache_key=_base)

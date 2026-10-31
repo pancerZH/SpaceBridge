@@ -70,6 +70,11 @@ TIERS = {
         ("bge-large-en", "qwen3-0.6b"), ("qwen3-0.6b", "bge-large-en"),
         ("bge-large-en", "harrier-0.6b"), ("harrier-0.6b", "bge-large-en"),
     ],
+    "2": [("bge-large-zh", "me5-large"), ("me5-large", "bge-large-zh")],
+    # 4a: index <- queries; ("qwen3-4b", "minilm") is up-projection (384d queries into a 2560d index).
+    "4a": [("qwen3-4b", "minilm"), ("minilm", "qwen3-4b")],
+    "4b": [("bge-large-en", f"{m}-{d}") for m in ("embeddinggemma-2", "qwen3-0.6b") for d in (128, 256, 512)]
+    + [("bge-large-en", "embeddinggemma-2"), ("bge-large-en", "qwen3-0.6b-768")],
     "5a": [("bge-large-en", q) for q in ("qwen3-0.6b", "harrier-0.6b", "me5-large", "embeddinggemma-2")],
 }
 
