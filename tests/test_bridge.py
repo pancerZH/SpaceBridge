@@ -108,7 +108,7 @@ def test_quality_report_measurements_and_scoring(world):
 
     bridge, info = _fit(world, world.Y_query, mode="auto", refine_config=RefineConfig(steps=20))
     report = bridge.quality_report()
-    assert set(report.details) == {"fidelity", "recoverability", "fit", "difficulty", "coverage"}
+    assert set(report.details) == {"fidelity", "recoverability", "fit", "difficulty", "coverage", "stage2"}
     feats = report.features()
     assert all(np.isfinite(v) for v in feats.values())
     assert feats["recoverability.nbr_recall@100"] >= feats["fidelity.nbr_recall@30"]
@@ -161,3 +161,31 @@ def test_stage2_temperature_follows_compressed_teacher_scores(world):
     _, scaled = _fit(world, world.Y_query, mode="auto",
                      refine_config=RefineConfig(steps=10, tau_scale_below_sd=float("inf")))
     assert scaled["stage2_tau"] == pytest.approx(0.6 * sd, rel=1e-3)
+
+
+def test_stage2_health_flags_blocked_and_compressed_fits(world, monkeypatch):
+    import spacebridge.bridge as bridge_mod
+
+    cfg = RefineConfig(steps=20)
+    healthy, info = _fit(world, world.Y_query, mode="auto", Y_doc_raw=world.Y_doc, refine_config=cfg)
+    assert info["stage2_best_step"] > 0 and not info["stage2_tau_scaled"]
+    assert healthy.quality_report().details["stage2"]["health_flag"] == 0.0
+    assert not any("stage 2" in n or "compressed" in n for n in healthy.quality_report().notes)
+
+    monkeypatch.setattr(bridge_mod, "STAGE2_MIN_AGREE_RATIO", 2.0)  # the floor rejects every checkpoint
+    blocked, info = _fit(world, world.Y_query, mode="auto", Y_doc_raw=world.Y_doc, refine_config=cfg)
+    h = blocked.quality_report().details["stage2"]
+    assert info["stage2_best_step"] == 0 and info["stage2_floor_rejected"] == 1.0
+    assert h["blocked"] == h["health_flag"] == 1.0 and h["compressed_scores"] == 0.0
+    assert any("stage 2 blocked" in n for n in blocked.quality_report().notes)
+    assert blocked.quality_report().rerank_pool == 100
+    monkeypatch.undo()
+
+    compressed, info = _fit(world, world.Y_query, mode="auto", Y_doc_raw=world.Y_doc,
+                            refine_config=RefineConfig(steps=20, tau_scale_below_sd=float("inf")))
+    h = compressed.quality_report().details["stage2"]
+    assert info["stage2_tau_scaled"] and h["compressed_scores"] == h["health_flag"] == 1.0
+    assert any("compressed index scores" in n for n in compressed.quality_report().notes)
+
+    stage1, _ = _fit(world, world.Y_query, mode="stage1")
+    assert "stage2" not in stage1.quality_report().details  # no Stage 2, no flag

@@ -106,4 +106,7 @@ def refine(
     if not cfg.early_stop:
         best_step, best_W, best_score = step, W.detach().clone(), curve[-1][1]
 
-    return best_W, {"best_step": best_step, "best_val": best_score, "val_curve": curve, "beta": beta, "steps_run": step, "tau": tau}
+    return best_W, {
+        "best_step": best_step, "best_val": best_score, "val_curve": curve, "beta": beta, "steps_run": step, "tau": tau,
+        "teacher_sd": sd, "tau_scaled": tau != cfg.tau,
+    }

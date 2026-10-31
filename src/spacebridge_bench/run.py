@@ -235,7 +235,8 @@ def run_pair(
             if row != "1" and mount is not None:
                 rec["mount"] = mount
             if bridge.quality is not None and row != "1":
-                rec["quality"] = {"score": bridge.quality.score, "band": bridge.quality.band, "grade": bridge.quality.grade}
+                q = bridge.quality
+                rec["quality"] = {"score": q.score, "band": q.band, "grade": q.grade, "rerank_pool": q.rerank_pool, "notes": q.notes}
                 rec["confidence"] = _confidence_study(bridge, Q_tgt, ranked, native_ranked, pq, native_pq, oracle_pq)
         records.append(_score_record(rec, pq, native_pq, oracle_pq))
 

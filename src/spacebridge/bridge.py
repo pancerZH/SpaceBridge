@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from sklearn.isotonic import IsotonicRegression
 
 from .bundle import CalibrationBundle
-from .quality import QualityReport, load_calibration, score_report
+from .quality import QualityReport, load_calibration, score_report, stage2_health
 from .refine import RefineConfig, refine
 from .solvers import LAMBDAS_REL, naive_procrustes, ridge_path, stiefel_procrustes
 
@@ -234,6 +234,10 @@ class SpaceBridge:
             info["stage2_steps_run"] = r_info["steps_run"]
             info["stage2_tau"] = r_info["tau"]
             info["stage2_gain"] = r_info["best_val"] - r_info["val_curve"][0][1]
+            checks = [v for step, v in r_info["val_curve"] if step > 0]
+            info["stage2_floor_rejected"] = sum(v == -math.inf for v in checks) / max(len(checks), 1)
+            info["stage2_teacher_sd"] = r_info["teacher_sd"]
+            info["stage2_tau_scaled"] = bool(r_info["tau_scaled"])
 
         self.src_lang = bundle.src_lang
         self.W = W.cpu().numpy()
@@ -251,6 +255,8 @@ class SpaceBridge:
             self.quality = self._quality_report(
                 val_metrics, Y, X_pairs, Xq, pool, tr, va, mu_y, mu_x, W, info.get("stage2_gain", 0.0), bundle
             )
+            if mode == "auto":
+                stage2_health(self.quality, info["stage2_best_step"], info["stage2_floor_rejected"], info["stage2_tau_scaled"])
             info["quality"] = self.quality.details
             self._fit_confidence(Y, mu_y, mu_x, W, Xq, pool, tr, va)
         self.status = (

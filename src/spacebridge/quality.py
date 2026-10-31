@@ -14,6 +14,11 @@ GRADES = ((95.0, "A"), (85.0, "B"), (70.0, "C"))
 # the default of 60, where all Tier 1 and 3-4 of 4 Tier 3 fiqa pairs (by reranker) meet end-to-end targets.
 DEFAULT_RERANK_POOL = 60
 RERANK_POOL_BY_GRADE = {"A": 60, "B": 60, "C": 100, "D": 100}
+# Stage-2 health (M4). The calibrated score cannot see a failed Stage 2: with the agreement floor rejecting
+# every checkpoint on a multilingual-e5 index (T2Retrieval, K = 4,096) it predicted 89 for a real 74. A fit is
+# flagged when Stage 2 kept step 0 while the floor rejected at least this share of its checkpoints, or when the
+# compressed-score temperature rule fired (teacher score s.d. < 0.04: an index regime the calibration never saw).
+STAGE2_BLOCKED_SHARE = 0.5
 
 
 @dataclass
@@ -28,6 +33,28 @@ class QualityReport:
 
     def features(self) -> dict[str, float]:
         return {f"{group}.{name}": v for group, vals in self.details.items() for name, v in vals.items()}
+
+
+def stage2_health(report: QualityReport, best_step: int, floor_rejected: float, compressed: bool) -> QualityReport:
+    """Adds the label-free Stage-2 health flag (``details["stage2"]``, a note, a widened rerank pool)."""
+    blocked = best_step == 0 and floor_rejected >= STAGE2_BLOCKED_SHARE
+    report.details["stage2"] = {
+        "best_step": float(best_step), "floor_rejected": float(floor_rejected),
+        "blocked": float(blocked), "compressed_scores": float(compressed), "health_flag": float(blocked or compressed),
+    }
+    if blocked:
+        report.notes.append(
+            f"stage 2 blocked: the agreement floor rejected {floor_rejected:.0%} of its checkpoints and step 0 was kept; "
+            "the score likely over-predicts retention"
+        )
+    if compressed:
+        report.notes.append(
+            "compressed index scores (teacher score s.d. < 0.04): Stage 2 ran with a scaled temperature, outside the "
+            "score's calibration data"
+        )
+    if blocked or compressed:
+        report.rerank_pool = max(report.rerank_pool, RERANK_POOL_BY_GRADE["D"])
+    return report
 
 
 def grade(score: float) -> str:
