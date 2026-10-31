@@ -43,11 +43,13 @@ Upgrading an embedding model, querying a massive pre-computed vector dataset ($1
 
 | Migration Tier | Example Test Case | Pure Vector `Recall@30` $\rho_{\text{ceil}}$ | End-to-End `NDCG@5` $\rho_{\text{ceil}}$ (RRF + Reranker) |
 | :--- | :--- | :--- | :--- |
-| **Tier 1: Intra-Family Moderate Dim** | `bge-base-en-v1.5 (768d)` $\leftrightarrow$ `bge-large-en-v1.5 (1024d)` | **$\ge 95\%$** (`< 5%` loss) | **$\ge 98\%$** |
+| **Tier 1: Intra-Family Moderate Dim** | `bge-base-en-v1.5 (768d)` $\leftrightarrow$ `bge-large-en-v1.5 (1024d)` | **$\ge 88\%$** at $K = 2,048$; **$\ge 90\%$** at $K = 4,096$ † | **$\ge 98\%$** |
 | **Tier 2: Cross-Family Same-Dim** | `bge-large-zh-v1.5 (1024d)` $\leftrightarrow$ `multilingual-e5-large (1024d)` | **$\ge 88\%$** (`6–12%` loss) | **$\ge 96\%$** |
-| **Tier 3: Encoder $\leftrightarrow$ Decoder-LLM** | `bge-large-en-v1.5 (1024d)` $\leftrightarrow$ `Qwen3-Embedding-0.6B` / `harrier-oss-v1-0.6b (1024d)` | **$\ge 82\%$** (`10–18%` loss) | **$\ge 94\%$** |
+| **Tier 3: Encoder $\leftrightarrow$ Decoder-LLM** | `bge-large-en-v1.5 (1024d)` $\leftrightarrow$ `Qwen3-Embedding-0.6B` / `harrier-oss-v1-0.6b (1024d)` | **$\ge 82\%$** at $K = 2,048$; **$\ge 87\%$** at $K = 4,096$ † | **$\ge 94\%$** |
 | **Tier 4: Extreme Low $\leftrightarrow$ High Dim** | `MiniLM (384d)` / MRL $(128\text{–}768\text{d})$ $\leftrightarrow$ `Qwen3-4B (2560d)` ($6.7\times$–$20\times$) | **$\ge 80\%$** (Up-Proj) / **$\ge 85\%$\*** (Down-Proj, ceiling = $384\text{d}$ native) | **$\ge 92\%$** |
 | **Tier 5: Cross-Language (`zh` $\leftrightarrow$ `en`)** | `zh` Query (`Qwen3`/`mE5`/`harrier`/`EmbeddingGemma 2`) $\to$ Monolingual `en` Index (`bge-en`) *(BM25 = 0)* | **$\ge 78\%$** | **$\ge 90\%$** *(via Cross-Lingual Reranker)* |
+
+† **Revised and approved 2026-10-30** after Milestone 1, stated for a hard domain (`fiqa`). The original Tier 1 target ($\ge 95\%$) proved out of reach for a linear query map on `fiqa` (observed 89.4–92.2% at $K = 2,048$; 90.4–92.3% at $K = 4,096$ with doc pairs), while it is met on the easy `scifact` corpus (96.8–97.3%). Tier 3 meets its target (83.1–91.1% at $K = 2,048$). **All tiers additionally target `Recall@100` $\rho_{\text{ceil}} \ge 90\%$** (reranker recoverability; observed 92.8% mean on `fiqa`). End-to-end targets are unchanged until Ablation Row 9 is measured. Tiers 2, 4 and 5 keep their original targets until first measured. As the benchmark broadens (§7.1), targets should be read as the median across datasets, with the worst dataset reported alongside.
 
 \* Provisional: re-baseline after Stage 1 smoke test. In v2.3 this target was stated against the $2560\text{d}$ oracle, which can exceed the source-capacity ceiling itself.
 
@@ -237,6 +239,8 @@ where the student uses $\hat{q}_{\text{src}}$ and the teacher uses native $X^{(q
 
 **Per-language validation (Regime L1).** English-anchor $\rho_{\text{val}}$ says nothing about Chinese queries. For each registered $L_q$, a second score $\rho_{\text{val}, L_q}$ uses FLORES `devtest` pairs (disjoint from the 256 `dev` sentences used for $\Delta\mu$): $L_q$ sentences are projected as queries and must retrieve their $L_{\text{src}}$ counterparts, encoded once by $M_{\text{src}}^{\text{doc}}$ and mixed into $\mathcal{P}$. Routing uses $\rho_{\text{val}, L_q}$ for queries in $L_q$.
 
+**Interim routing** (used until the §5.1 quality score is calibrated; the §5.1 grade table is the approved target design):
+
 | Validation Retention $\rho_{\text{val}}$ | Alignment Status | Online Retrieval Pipeline Action |
 | :--- | :--- | :--- |
 | **$\rho_{\text{val}} \ge 0.58$** | `HIGH_CONFIDENCE` | Linear ANN ($W^*$) + BM25 (if $L_q == L_{\text{src}}$) (`rerank_pool = 30`) $\to$ Cross-Encoder Top-5. |
@@ -250,6 +254,8 @@ The thresholds come from the calibration study (§7.4): over 180 `scifact` fits 
 Goal: the system cannot be good on every corpus, but it must **never be silently bad**. Every mount produces a quality report computed from the calibration bundle alone (no labeled queries), and every online query carries a confidence value.
 
 **Simple mode: one score in $[0, 100]$.** The score is the **predicted ceiling retention of `Recall@30`, in percent**: "87" means "expect about 87% of the retrieval quality that re-indexing with $M_{\text{tgt}}$, or the native $M_{\text{src}}$, whichever is lower, would give". It is produced by a small calibrated regressor (linear to start) from the detailed measurements below to observed retention, fitted on all benchmark runs. It is always reported with a prediction band and a grade:
+
+Approved routing (2026-10-30):
 
 | Grade | Score | Default routing |
 | :--- | :--- | :--- |
