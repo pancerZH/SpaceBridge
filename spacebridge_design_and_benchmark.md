@@ -166,6 +166,8 @@ Singular modes below $\tau_{\sigma} = 10^{-3} \cdot \sigma_1$ are truncated ($r 
 
 $$W_{\text{stiefel}} = s\, U_{:, :r} V_{:, :r}^T \in \mathbb{R}^{d_t \times d_s}, \qquad s = \frac{\sum_{i \le r} \sigma_i}{\|\bar{Y}_{\text{train}}^{(q)}\|_F^2}$$
 
+**Implementation note (Milestone 2):** $W_{\text{stiefel}}$ is computed as a polar decomposition from a float64 eigendecomposition of the smaller Gram matrix of $M$ ($M^T M$ or $M M^T$), which equals the SVD form to $\sim 10^{-5}$ and is several times faster than `gesvd` on GPU. Float64 is required: kept modes reach $\sigma_r / \sigma_1 = 10^{-3}$, eigenvalue ratios of $10^{-6}$, where float32 errs by ~15%. Effective ranks on `fiqa` at $K = 2,048$ are only 540–650 of 1024.
+
 #### Operator B: Adaptive Primal / Dual (Woodbury) Ridge Projection
 To support non-uniform spectral scaling at any target dimension $d_t$, including ultra-wide models ($d_t = 2560$ or $4096 > K_{\text{train}}$), `SpaceBridge` switches automatically between Primal and Dual (Woodbury) forms:
 
@@ -182,7 +184,7 @@ $$\mathcal{L}(W) = (1 - \alpha)\, \mathcal{L}_{\text{InfoNCE}}\!\left(S_{\text{s
 
 (The Hinton $\tau^2$ factor is omitted: it compensates for a KL computed at a *higher* temperature than the CE term, but here both share $\tau = 0.05$, so $\tau^2$ would shrink the KL term $\sim 400\times$ relative to InfoNCE. Exposed as `RefineConfig.kl_scale`.)
 
-with $\tau = 0.05$, $\alpha = 0.5$, $\beta = 10^{-3}$ (upgraded to $\beta = 10^{-2}$ when $d_t > K_{\text{train}}$ to prevent high-dimensional overfitting), early-stopped on $K_{\text{val}}$. The teacher is the native source ranking, i.e. exactly what the index would return for $M_{\text{src}}$ queries.
+with $\tau = 0.05$, $\alpha = 0.5$, $\beta = 10^{-3}$ (upgraded to $\beta = 10^{-2}$ when $d_t > K_{\text{train}}$ to prevent high-dimensional overfitting), early-stopped on $K_{\text{val}}$ (evaluated every 10 steps, patience 50 steps; Stage-1 selection and Stage-2 stopping score on a fixed 10K-row subsample of the $\rho_{\text{val}}$ pool, all anchors plus random distractors, which keeps the solver at ≤ 152 ms for $K = 2,048$ on `fiqa`). The teacher is the native source ranking, i.e. exactly what the index would return for $M_{\text{src}}$ queries.
 
 > [!WARNING]
 > **Proxy-positive shortcut:** each query proxy is the lead sentence of its own positive document, so InfoNCE positives are lexically easy and may not transfer to real queries. Mitigations evaluated in the ablation: the teacher-KL term (which spreads mass over semantically related anchors), and an optional **doc↔doc term** (Row 8b) that encodes the anchor docs with $M_{\text{tgt}}^{\text{doc}}$ and adds $\mathcal{L}_{\text{InfoNCE}}$ over $\left(\text{Normalize}(\mu_X^{(d)} + \bar{Y}^{(d)} W_d)\right)(X^{(d)})^T$, doubling calibration pairs at the cost of a second encoding pass.
