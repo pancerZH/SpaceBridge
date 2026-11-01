@@ -1,7 +1,8 @@
-"""Cross-encoder reranking for end-to-end rows (design §7.3 Row 9), with an on-disk score cache."""
+"""Cross-encoder reranking for end-to-end rows (design §7.3 Row 9), with a crash-safe on-disk score cache."""
 
 import gc
 import hashlib
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,7 +10,14 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from . import durable
+from .encode import CPU_BATCH_TOKENS, _longest_first, run_token_batches, token_lengths
+from .store import release_gpu
+
 DEFAULT_CACHE = Path("data/cache/rerank")
+_LOG_RECORD = np.dtype([("key", "<u8"), ("score", "<f4")])
+SAVE_EVERY_SECONDS = 30  # new scores reach the disk this often, whatever the speed (858 pairs/s on GPU, 5 on CPU)
+_CACHES: dict[Path, dict[int, float]] = {}  # one copy per process: loading takes seconds, and every pair needs it
 
 
 @dataclass(frozen=True)
@@ -17,7 +25,7 @@ class RerankerSpec:
     key: str
     hf_id: str
     instructed: bool          # takes the dataset's task instruction as its prompt
-    batch_size: int = 64
+    batch_tokens: int = 10_000
     max_length: int = 512
 
 
@@ -25,42 +33,51 @@ RERANKERS: dict[str, RerankerSpec] = {
     spec.key: spec
     for spec in [
         RerankerSpec("bge-reranker-v2-m3", "BAAI/bge-reranker-v2-m3", instructed=False),
-        RerankerSpec("qwen3-reranker-0.6b", "Qwen/Qwen3-Reranker-0.6B", instructed=True, batch_size=32),
+        RerankerSpec("qwen3-reranker-0.6b", "Qwen/Qwen3-Reranker-0.6B", instructed=True, batch_tokens=5_000),
     ]
 }
 
 
 class Reranker:
-    """Scores (query, doc) pairs; scores are cached per (instruction, query, doc) text."""
+    """Scores (query, doc) pairs; scores are cached per (instruction, query, doc) text.
+
+    The cache is a read-only ``.npz`` from earlier runs plus one append-only log per process, so concurrent jobs
+    cannot overwrite each other and a crash loses at most the last ``SAVE_EVERY_SECONDS`` of scoring.
+    """
 
     def __init__(self, spec: RerankerSpec, device: str = "cuda", cache_dir: Path = DEFAULT_CACHE):
         self.spec = spec
         self.device = device if torch.cuda.is_available() else "cpu"
         self.cache_path = cache_dir / f"{spec.key}_L{spec.max_length}.npz"
         self._model = None
-        self._cache: dict[int, float] | None = None
 
     @property
     def model(self):
         if self._model is None:
             from sentence_transformers import CrossEncoder
 
+            release_gpu()
             self._model = CrossEncoder(
                 self.spec.hf_id,
                 device=self.device,
-                model_kwargs={"torch_dtype": torch.bfloat16},
+                model_kwargs={"torch_dtype": torch.bfloat16 if self.device.startswith("cuda") else torch.float32},
                 max_length=self.spec.max_length,
             )
         return self._model
 
     @property
     def cache(self) -> dict[int, float]:
-        if self._cache is None:
-            self._cache = {}
+        if self.cache_path not in _CACHES:
+            cache: dict[int, float] = {}
             if self.cache_path.exists():
                 with np.load(self.cache_path) as z:
-                    self._cache = dict(zip(z["keys"].tolist(), z["scores"].tolist()))
-        return self._cache
+                    cache.update(zip(z["keys"].tolist(), z["scores"].tolist()))
+            for log in sorted(self.cache_path.parent.glob(f"{self.cache_path.stem}.*.scores")):
+                n = log.stat().st_size // _LOG_RECORD.itemsize  # a power loss can tear the last record
+                records = np.fromfile(log, dtype=_LOG_RECORD, count=n)
+                cache.update(zip(records["key"].tolist(), records["score"].tolist()))
+            _CACHES[self.cache_path] = cache
+        return _CACHES[self.cache_path]
 
     def unload(self) -> None:
         self._model = None
@@ -68,23 +85,31 @@ class Reranker:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def save_cache(self) -> None:
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        keys = np.fromiter(self.cache.keys(), dtype=np.uint64, count=len(self.cache))
-        scores = np.fromiter(self.cache.values(), dtype=np.float32, count=len(self.cache))
-        np.savez(self.cache_path, keys=keys, scores=scores)
+    def _save_scores(self, keys: list[int], scores: np.ndarray) -> None:
+        records = np.empty(len(keys), dtype=_LOG_RECORD)
+        records["key"], records["score"] = np.array(keys, dtype=np.uint64), scores
+        durable.append_bytes(self.cache_path.parent / f"{self.cache_path.stem}.{os.getpid()}.scores", records.tobytes())
 
-    def score(self, queries: list[str], docs: list[str], task: str, chunk: int = 16_384) -> np.ndarray:
+    def score(self, queries: list[str], docs: list[str], task: str, chunk: int = 1_024) -> np.ndarray:
         """Relevance scores of the pairs ``(queries[i], docs[i])``; higher is more relevant."""
         prompt = task if self.spec.instructed else ""
         keys = [_pair_key(prompt, q, d) for q, d in zip(queries, docs)]
-        todo = list({k: i for i, k in enumerate(keys) if k not in self.cache}.values())
-        for s in range(0, len(todo), chunk):
-            part = todo[s : s + chunk]
+        cache = self.cache
+        todo = list({k: i for i, k in enumerate(keys) if k not in cache}.values())
+        pos, t_begin = 0, time.perf_counter()
+        while pos < len(todo):
+            t0 = time.perf_counter()
+            part = todo[pos : pos + chunk]
             new = self._predict([queries[i] for i in part], [docs[i] for i in part], prompt)
-            self.cache.update(zip((keys[i] for i in part), new.tolist()))
-            self.save_cache()  # per chunk, so an interrupted run keeps its progress
-        return np.array([self.cache[k] for k in keys], dtype=np.float32)
+            part_keys = [keys[i] for i in part]
+            cache.update(zip(part_keys, new.tolist()))
+            self._save_scores(part_keys, new)
+            pos += len(part)
+            # Sized to the speed, so a slow device still saves often.
+            chunk = int(np.clip(len(part) * SAVE_EVERY_SECONDS / max(time.perf_counter() - t0, 1e-3), 64, 65_536))
+            rate = pos / max(time.perf_counter() - t_begin, 1e-9)
+            durable.progress(f"rerank {self.spec.key}: {pos:,} / {len(todo):,} pairs, {rate:.0f} pairs/s, {(len(todo) - pos) / rate / 60:.0f} min left")
+        return np.array([cache[k] for k in keys], dtype=np.float32)
 
     def timed_ms_per_query(self, query: str, docs: list[str], task: str, repeats: int = 3) -> float:
         """Uncached wall-clock to rerank one query's candidate list (excludes model load and warmup)."""
@@ -103,14 +128,22 @@ class Reranker:
 
     def _predict(self, queries: list[str], docs: list[str], prompt: str) -> np.ndarray:
         kwargs = {"prompt": prompt} if self.spec.instructed else {}
-        scores = self.model.predict(
-            list(zip(queries, docs)),
-            batch_size=self.spec.batch_size,
-            convert_to_numpy=True,
-            show_progress_bar=len(queries) > 20 * self.spec.batch_size,
-            **kwargs,
-        )
-        return np.asarray(scores, dtype=np.float32).reshape(-1)
+        lengths = token_lengths(self.model.tokenizer, queries, docs, max_length=self.spec.max_length)
+        out = np.empty(len(queries), dtype=np.float32)
+
+        def handle(batch: np.ndarray) -> None:
+            scores = self.model.predict(
+                [(queries[i], docs[i]) for i in batch],
+                batch_size=len(batch),
+                convert_to_numpy=True,
+                show_progress_bar=False,
+                **kwargs,
+            )
+            out[batch] = np.asarray(scores, dtype=np.float32).reshape(-1)
+
+        budget = self.spec.batch_tokens if self.device.startswith("cuda") else CPU_BATCH_TOKENS
+        run_token_batches(lengths, _longest_first(lengths), budget, handle)
+        return out
 
 
 def _pair_key(prompt: str, query: str, doc: str) -> int:
@@ -122,7 +155,7 @@ def _pair_key(prompt: str, query: str, doc: str) -> int:
 
 
 def rerank(
-    reranker: Reranker, ranked: np.ndarray, depth: int, queries: list[str], doc_texts: list[str], task: str
+    reranker: Reranker, ranked: np.ndarray, depth: int, queries: list[str], doc_texts, task: str
 ) -> np.ndarray:
     """Reorders each query's first-stage top-``depth`` by reranker score; returns (n_queries, depth) row ids."""
     cand = ranked[:, :depth]
