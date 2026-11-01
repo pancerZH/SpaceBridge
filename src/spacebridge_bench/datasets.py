@@ -3,7 +3,7 @@
 import hashlib
 import json
 import pickle
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +23,10 @@ class DatasetSpec:
     split: str = "test"               # qrels split
     corpus_split: str = "corpus"      # split names of the corpus / queries configs
     queries_split: str = "queries"
+    # Whole corpus with rows ordered so every prefix is a fair sample (design §7.1): positives first, then the distractors
+    # of the ``nested_docs`` subsample (same seed, so that many rows hold exactly that subsample's documents), then the
+    # rest, shuffled. repr=False keeps the parsed-dataset cache keys of every other dataset.
+    nested_docs: Optional[int] = field(default=None, repr=False)
 
 
 DATASETS: dict[str, DatasetSpec] = {
@@ -66,6 +70,14 @@ DATASETS: dict[str, DatasetSpec] = {
     # Second large corpus for the scale finding: real Google queries, 1M of the 2.68M Wikipedia passages.
     "nq-1m": DatasetSpec(
         "mteb/nq", "en", "Given a question, retrieve Wikipedia passages that answer the question", max_docs=1_000_000,
+    ),
+    # Phase 1 size curves: the whole corpus, with msmarco-1m's 2,000 queries, nq-1m's queries and row order for prefixes.
+    "msmarco-full": DatasetSpec(
+        "mteb/msmarco", "en", "Given a web search query, retrieve relevant passages that answer the query",
+        max_queries=2_000, split="dev", nested_docs=1_000_000,
+    ),
+    "nq-full": DatasetSpec(
+        "mteb/nq", "en", "Given a question, retrieve Wikipedia passages that answer the question", nested_docs=1_000_000,
     ),
     # Tier 5a: XQuAD questions (human-translated) against all ~21K English SQuAD v1.1 paragraphs.
     "xquad-zh": DatasetSpec(
@@ -146,7 +158,9 @@ def _load_beir(name: str, split: Optional[str], seed: int) -> RetrievalDataset:
         qrels = qrels.select(_query_subsample(qrels["query-id"], qrels["score"], spec.max_queries, seed))
 
     all_ids = [str(i) for i in corpus["_id"]]
-    if spec.max_docs is not None and len(all_ids) > spec.max_docs:
+    if spec.nested_docs is not None:
+        corpus = corpus.select(_nested_order(all_ids, qrels, spec.nested_docs, seed))
+    elif spec.max_docs is not None and len(all_ids) > spec.max_docs:
         corpus = corpus.select(_positive_preserving_subsample(all_ids, qrels, spec.max_docs, seed))
     doc_ids = [str(i) for i in corpus["_id"]]
 
@@ -189,17 +203,31 @@ def _query_subsample(query_ids: list, scores: list, n: int, seed: int) -> np.nda
     return np.array([i for i, q in enumerate(query_ids) if str(q) in keep])
 
 
-def _positive_preserving_subsample(doc_ids: list[str], qrels, n: int, seed: int) -> np.ndarray:
-    """Corpus rows: every positive of the split's qrels, then uniform random distractors up to ``n``
-    (design §7.1 rule 1). Rows are returned shuffled so positives are not clustered."""
+def _draw_subsample(doc_ids: list[str], qrels, n: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(positive rows, the random distractors filling a subsample of ``n``, every distractor row)."""
     positives = {str(d) for d, s in zip(qrels["corpus-id"], qrels["score"]) if s > 0}
     is_pos = np.array([d in positives for d in doc_ids])
-    rng = np.random.default_rng(seed)
     pos_rows = np.flatnonzero(is_pos)
     if len(pos_rows) >= n:
         raise ValueError(f"{len(pos_rows)} positives do not fit in a {n}-document subsample")
-    rest = rng.choice(np.flatnonzero(~is_pos), n - len(pos_rows), replace=False)
+    others = np.flatnonzero(~is_pos)
+    return pos_rows, rng.choice(others, n - len(pos_rows), replace=False), others
+
+
+def _positive_preserving_subsample(doc_ids: list[str], qrels, n: int, seed: int) -> np.ndarray:
+    """Corpus rows: every positive of the split's qrels, then uniform random distractors up to ``n``
+    (design §7.1 rule 1). Rows are returned shuffled so positives are not clustered."""
+    rng = np.random.default_rng(seed)
+    pos_rows, rest, _ = _draw_subsample(doc_ids, qrels, n, rng)
     return rng.permutation(np.concatenate([pos_rows, rest]))
+
+
+def _nested_order(doc_ids: list[str], qrels, n: int, seed: int) -> np.ndarray:
+    """All corpus rows: positives, then the ``_positive_preserving_subsample(n)`` distractors, then the rest, both
+    shuffled. Every prefix holds all positives and a uniform sample of distractors."""
+    rng = np.random.default_rng(seed)
+    pos_rows, rest, others = _draw_subsample(doc_ids, qrels, n, rng)
+    return np.concatenate([pos_rows, rest, rng.permutation(np.setdiff1d(others, rest, assume_unique=True))])
 
 
 def _load_xquad(name: str, spec: DatasetSpec) -> RetrievalDataset:

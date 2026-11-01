@@ -3,7 +3,7 @@ import json
 import numpy as np
 import pytest
 
-from spacebridge_bench.datasets import _positive_preserving_subsample, self_match_rows
+from spacebridge_bench.datasets import _nested_order, _positive_preserving_subsample, self_match_rows
 from spacebridge_bench.rerank import rerank, topk_jaccard
 from spacebridge_bench.search import search
 
@@ -29,6 +29,15 @@ class _FakeReranker:
 
     def score(self, queries, docs, task):
         return np.array([float(d.split()[-1]) for d in docs])
+
+
+def test_nested_order_prefixes_keep_positives_and_match_the_subsample():
+    doc_ids = [f"d{i}" for i in range(1000)]
+    qrels = {"corpus-id": ["d5", "d900", "d7"], "score": [1, 1, 0]}
+    order = _nested_order(doc_ids, qrels, 100, seed=0)
+    assert sorted(order.tolist()) == list(range(1000))
+    assert set(order[:2].tolist()) == {5, 900}
+    assert set(order[:100].tolist()) == set(_positive_preserving_subsample(doc_ids, qrels, 100, seed=0).tolist())
 
 
 def test_rerank_reorders_within_depth_only():
