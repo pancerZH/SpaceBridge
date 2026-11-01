@@ -37,6 +37,11 @@ def resolve_anchor_method(N: int, method: str = "auto") -> str:
     return method
 
 
+def random_anchors(N: int, K: int, seed: int = 0) -> np.ndarray:
+    """K distinct rows of an index of N documents, chosen without reading its vectors."""
+    return np.arange(N) if K == N else np.sort(np.random.default_rng(seed).choice(N, K, replace=False))
+
+
 def select_anchors(E: np.ndarray, K: int, seed: int = 0, device: str = "cuda", method: str = "auto") -> np.ndarray:
     """Returns K distinct row ids of E. ``kmeans``: k-means medoids when N >= 5,000, farthest-point sampling
     below. ``random``: a uniform sample. ``auto``: :func:`resolve_anchor_method`."""
@@ -47,7 +52,7 @@ def select_anchors(E: np.ndarray, K: int, seed: int = 0, device: str = "cuda", m
         return np.arange(N)
     method = resolve_anchor_method(N, method)
     if method == "random":
-        return np.sort(np.random.default_rng(seed).choice(N, K, replace=False))
+        return random_anchors(N, K, seed)
     if method != "kmeans":
         raise ValueError(f"unknown anchor selection {method!r}")
     E = _l2(np.asarray(E, dtype=np.float32))
