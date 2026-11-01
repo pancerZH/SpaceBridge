@@ -79,3 +79,15 @@ def test_hnsw_backend_serves_the_saved_index(tmp_path):
     build_hnsw(E, tmp_path / "i.faiss", M=16, ef_construction=40)
     ids, scores = HnswBackend(tmp_path / "i.faiss", ef_search=100).search(E[3:4], 10)
     assert ids[0] == 3 and scores[0] == pytest.approx(1.0, abs=1e-5) and len(ids) == 10
+
+
+def test_real_query_overlap_is_one_for_the_identity_and_lower_for_a_new_model():
+    from spacebridge.serving import real_query_overlap
+
+    vectors, index, src, tgt = make_mount_world(n_docs=800)
+    bundle = freeze(index, src, K=300, device="cpu")
+    queries = [f"question {i}" for i in range(40)]
+    backend = ExactBackend(vectors)
+    same = real_query_overlap(mount(bundle, index, src, device="cpu"), queries, src, src, backend)
+    other = real_query_overlap(mount(bundle, index, tgt, device="cpu"), queries, src, tgt, backend)
+    assert same.mean() > 0.85 and same.mean() > other.mean() > 0.1 and other.shape == (40,)

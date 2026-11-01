@@ -103,6 +103,22 @@ def build_hnsw(
     return index
 
 
+def real_query_overlap(
+    bridge: SpaceBridge, queries: list[str], src_encoder: QueryEncoder, tgt_encoder: QueryEncoder, backend: SearchBackend,
+    k: int = 30, query_lang: Optional[str] = None, src_queries: Optional[list[str]] = None,
+) -> np.ndarray:
+    """Per query, the share of the native top-k that the bridged query also returns. Needs unlabeled real queries and the
+    source model. ``src_queries`` are the parallel queries in the index language when ``queries`` are not."""
+    q_tgt = bridge.transform_query(tgt_encoder.encode_queries(queries), query_lang=query_lang)
+    q_src = src_encoder.encode_queries(src_queries if src_queries is not None else queries)
+    out = np.empty(len(queries))
+    for i in range(len(queries)):
+        native, _ = backend.search(q_src[i : i + 1], k)
+        bridged, _ = backend.search(q_tgt[i : i + 1], k)
+        out[i] = len(set(native.tolist()) & set(bridged.tolist())) / k
+    return out
+
+
 @dataclass
 class SearchResult:
     ids: np.ndarray                 # row ids, best first

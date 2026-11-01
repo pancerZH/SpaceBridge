@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 
 from spacebridge import Index, freeze, mount
+from spacebridge.anchors import _truncate_tokens
 from spacebridge_bench import durable
 from spacebridge_bench.datasets import load_beir
 from spacebridge_bench.encode import Encoder, MountEncoder
@@ -38,6 +39,20 @@ def finished(path: Path) -> set[str]:
         with durable.atomic_file(path) as f:
             f.write("".join(json.dumps(r) + "\n" for r in kept).encode())
     return done
+
+
+def top_overlap(a: np.ndarray, b: np.ndarray, k: int) -> np.ndarray:
+    return np.array([len(set(x[:k].tolist()) & set(y[:k].tolist())) / k for x, y in zip(a, b)])
+
+
+def proxy_agreement(bridge, proxies: list[str], src, tgt, E_src, sizes, device) -> dict[int, float]:
+    """Label-free candidate (W7): top-10 agreement of bridged and native proxies over the whole index, by size."""
+    X, Y = src.encode_queries(proxies), tgt.encode_queries(proxies)
+    src.unload()
+    tgt.unload()
+    teacher = search_nested(X, E_src, sizes, 10, device)
+    student = search_nested(bridge.transform_query(Y), E_src, sizes, 10, device)
+    return {size: float(top_overlap(student[size], teacher[size], 10).mean()) for size in sizes}
 
 
 def ranked_for(key: str, ds, sizes, queries, device) -> tuple:
@@ -87,6 +102,9 @@ def main() -> None:
         t_fit = time.perf_counter() - t0
         Q_hat = bridge.transform_query(Q_tgt)
         ranked = search_nested(Q_hat, E_src, sizes, 1_000, args.device, exclude=ds.self_rows)
+        val = [bundle.anchor_query_texts[i] for i in bundle.val_idx[:1024]]
+        agree_val = proxy_agreement(bridge, val, src, tgt, E_src, sizes, args.device)
+        agree_short = proxy_agreement(bridge, [_truncate_tokens(t, 8) for t in val], src, tgt, E_src, sizes, args.device)
         records = []
         for size in sizes:
             pq, native_pq, oracle_pq = per_query(ranked[size], ds.qrels), per_query(native[size], ds.qrels), per_query(oracle[size], ds.qrels)
@@ -99,6 +117,9 @@ def main() -> None:
                 "metrics": bridged_m, "native": native_m, "oracle": oracle_m, "rho_ceil": rho_ceil, "rho_oracle": rho_oracle,
                 "ci_ceil": {m: bootstrap_ratio_ci(pq[m], ceil(m)) for m in ("recall@30", "recall@300", "ndcg@10")},
                 "rho_val": bridge.metrics["rho_val"], "solver": bridge.metrics.get("solver"), "mount": bridge.metrics["mount"],
+                "overlap": {k: float(top_overlap(ranked[size], native[size], k).mean()) for k in (10, 30, 100)},
+                "overlap30_sd": float(top_overlap(ranked[size], native[size], 30).std()),
+                "agree_val_full": agree_val[size], "agree_short_full": agree_short[size],
                 "score": bridge.quality.score, "cell": cell, "cell_records": len(sizes),
             })
         durable.append_lines(args.out, [json.dumps(r) for r in records])
