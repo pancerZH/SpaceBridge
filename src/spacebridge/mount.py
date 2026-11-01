@@ -164,7 +164,8 @@ def mount(
         timing[f"{name}_ms"] = 1e3 * (time.perf_counter() - t0)
         return out
 
-    use_doc_pairs = tgt_encoder.size_class != "large" if doc_pairs is None else doc_pairs
+    # Doc pairs are all a source-model-free fit has, whatever the model's size.
+    use_doc_pairs = bundle.X_query_raw is None or tgt_encoder.size_class != "large" if doc_pairs is None else doc_pairs
     static = bundle.tgt_anchor_texts is not None
     Y_query = timed("encode_proxies", lambda: tgt_encoder.encode_queries(bundle.tgt_anchor_texts if static else bundle.anchor_query_texts))
     Y_doc = None
@@ -185,7 +186,12 @@ def mount(
     X_distractor = timed("read_distractors", lambda: index.vectors(bundle.distractor_ids))
 
     bridge = SpaceBridge(device=device, doc_pairs=use_doc_pairs, refine_config=refine_config)
-    timed("fit", lambda: bridge.fit(bundle, Y_query, X_distractor=X_distractor, Y_doc_raw=Y_doc))
+    if bundle.X_query_raw is None:
+        if Y_doc is None:
+            raise ValueError("a source-model-free mount needs doc pairs")
+        timed("fit", lambda: bridge.fit_source_free(bundle, Y_query, Y_doc, X_distractor))
+    else:
+        timed("fit", lambda: bridge.fit(bundle, Y_query, X_distractor=X_distractor, Y_doc_raw=Y_doc))
     for lang, (Y_src, Y_lang) in shifts.items():
         bridge.register_query_language(lang, Y_src, Y_lang)
         if lang in validation:

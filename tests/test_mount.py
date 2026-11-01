@@ -203,3 +203,38 @@ def test_an_interrupted_or_corrupted_save_does_not_load(mounted, tmp_path):
 def test_saving_a_bridge_needs_a_fit(tmp_path):
     with pytest.raises(RuntimeError, match="fit"):
         SpaceBridge(device="cpu").save(tmp_path / "bridge")
+
+
+def test_source_free_fit_needs_no_source_model_and_says_what_it_cannot_report():
+    vectors, index, src, tgt = make_mount_world(n_docs=1500)
+    bundle = freeze(index, None, K=400, device="cpu")
+    assert bundle.X_query_raw is None
+    with pytest.raises(ValueError, match="fit_source_free"):
+        SpaceBridge(device="cpu").fit(bundle, tgt.encode_queries(bundle.anchor_query_texts), Y_doc_raw=tgt.encode_docs(bundle.anchor_doc_titles, bundle.anchor_doc_texts))
+    bridge = mount(bundle, index, tgt, device="cpu")
+    assert bridge.status == "NO_TEACHER" and tgt.doc_calls[-1] == spacebridge.DOC_PAIR_TOKENS
+    report = bridge.quality_report()
+    assert report.score is None and report.grade is None and report.rerank_pool >= 100 and "owndoc_mrr" in report.details["recoverability"]
+    assert any("without the source model" in n for n in report.notes)
+    q_rows = [f"question {i}" for i in np.random.default_rng(1).choice(len(vectors), 200, replace=False)]
+    q_hat, conf = bridge.transform_query(tgt.encode_queries(q_rows), return_confidence=True)
+    assert np.isnan(conf).all() and conf.shape == (200,)
+    native = top_k(src.encode_queries(q_rows), vectors)
+    assert overlap_at_k(native, top_k(q_hat, vectors)) > 0.2
+
+
+def test_a_large_model_still_gets_doc_pairs_without_the_source_model():
+    _, index, _, tgt = make_mount_world(n_docs=800)
+    tgt.size_class = "large"
+    bundle = freeze(index, None, K=300, device="cpu")
+    assert mount(bundle, index, tgt, device="cpu").metrics["doc_pairs"] > 0
+
+
+def test_source_free_bridge_round_trip(tmp_path):
+    _, index, _, tgt = make_mount_world(n_docs=800)
+    bridge = mount(freeze(index, None, K=300, device="cpu"), index, tgt, device="cpu")
+    bridge.save(tmp_path / "b")
+    loaded = SpaceBridge.load(tmp_path / "b", device="cpu")
+    Y = tgt.encode_queries(["question 3"])
+    np.testing.assert_array_equal(bridge.transform_query(Y), loaded.transform_query(Y))
+    assert loaded.quality.score is None and loaded.status == "NO_TEACHER"

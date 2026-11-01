@@ -2,7 +2,7 @@
 
 import time
 import warnings
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Dict, Literal, Optional
 
@@ -13,7 +13,7 @@ from sklearn.isotonic import IsotonicRegression
 
 from . import storage
 from .bundle import CalibrationBundle
-from .quality import QualityReport, index_size_check, language_score, load_calibration, score_report, stage2_health
+from .quality import RERANK_POOL_BY_GRADE, QualityReport, index_size_check, language_score, load_calibration, score_report, stage2_health
 from .refine import RefineConfig, refine
 from .solvers import LAMBDAS_REL, naive_procrustes, ridge_path, stiefel_procrustes
 
@@ -199,6 +199,8 @@ class SpaceBridge:
                 doc<->doc pairs (each centered on its own doc-cone mean) to Stage 1 and 2; validation stays on
                 query proxies.
         """
+        if bundle.X_query_raw is None:
+            raise ValueError("this bundle has no source-model embeddings: use fit_source_free()")
         if mode == "auto" and pairs != "query":
             raise ValueError("Stage-2 refinement needs query-proxy pairs")
         if Y_doc_raw is not None and (pairs != "query" or mode == "naive"):
@@ -337,6 +339,91 @@ class SpaceBridge:
             else "LOW_ALIGNMENT_WARN"
         )
         info["status"] = self.status
+        self.metrics = info
+        return info
+
+    def fit_source_free(
+        self, bundle: CalibrationBundle, Y_query_raw: np.ndarray, Y_doc_raw: np.ndarray, X_distractor: Optional[np.ndarray] = None,
+        stage2: bool = True,
+    ) -> Dict[str, float]:
+        """Fits without the source model, for an index whose model is gone (design §4.5): only stored vectors and M_tgt.
+
+        Queries stay in the target model's own geometry: they are centered on its *doc* mean and restored on the source
+        doc mean, so a doc-pair map carries the target's query/doc relation across. With no teacher, Stage-1 selection and
+        Stage 2 use the proxies' own-doc retrieval, Stage 2 has no KL term, and the quality report has no score.
+        """
+        Yq, Yd, Xd = self._t(Y_query_raw), self._t(Y_doc_raw), self._t(bundle.X_doc_raw)
+        tr = torch.as_tensor(bundle.train_idx, device=self.device)
+        va = torch.as_tensor(bundle.val_idx, device=self.device)
+        pool = Xd if X_distractor is None else torch.cat([Xd, self._t(X_distractor)])
+        sel_pool = pool
+        if pool.shape[0] > self.selection_pool:
+            gen = torch.Generator().manual_seed(0)
+            extra = Xd.shape[0] + torch.randperm(pool.shape[0] - Xd.shape[0], generator=gen)
+            keep = torch.cat([torch.arange(Xd.shape[0]), extra[: max(0, self.selection_pool - Xd.shape[0])]])
+            sel_pool = pool[keep.to(self.device)]
+        mu_y, mu_x = Yd[tr].mean(0), Xd[tr].mean(0)
+        Ydc, Xdc = Yd - mu_y, Xd - mu_x
+        Yqc = Yq - mu_y
+        target_norm = Xdc[tr].norm(dim=1).mean()
+        rescale = (lambda W: W * (target_norm / (Ydc[tr] @ W).norm(dim=1).mean())) if self.match_residual_norm else (lambda W: W)
+
+        def mrr(W: torch.Tensor, pool_: torch.Tensor) -> float:
+            return retrieval_stats(self._project(Yq[va], mu_y, mu_x, W), pool_, va)["mrr"]
+
+        info: Dict[str, float] = {"mode": "source_free", "pairs": "doc", "doc_pairs": len(tr)}
+        t0 = time.perf_counter()
+        candidates = []
+        W_s, s_info = stiefel_procrustes(Ydc[tr], Xdc[tr])
+        W_s = rescale(W_s)
+        candidates.append((mrr(W_s, sel_pool), W_s, {"solver": "stiefel", "rank": s_info["rank"], "scale": s_info["scale"]}))
+        for lam_rel, W_r in ridge_path(Ydc[tr], Xdc[tr], self.lambdas_rel):
+            W_r = rescale(W_r)
+            candidates.append((mrr(W_r, sel_pool), W_r, {"solver": "ridge", "lambda_rel": lam_rel}))
+        _, W, chosen = max(candidates, key=lambda c: c[0])
+        info.update(chosen)
+        self._sync()
+        info["stage1_ms"] = 1e3 * (time.perf_counter() - t0)
+        step0_mrr = mrr(W, sel_pool)
+        if stage2:
+            t0 = time.perf_counter()
+            n = len(tr)
+            mu_rows = mu_x.expand(2 * n, -1)
+            Y_rows, labels = torch.cat([Yqc[tr], Ydc[tr]]), torch.cat([torch.arange(n, device=self.device)] * 2)
+            cfg = replace(self.refine_config, alpha=0.0, stop_rule="tail")
+
+            def signals(W_: torch.Tensor) -> dict:  # no teacher: the agreement floor is always passed
+                return {"agree": 1.0, "mrr": mrr(W_, sel_pool)}
+
+            W, r_info = refine(W, mu_rows, Y_rows, Xd[tr][labels], Xd[tr], signals, cfg, labels)
+            self._sync()
+            info.update(stage2_ms=1e3 * (time.perf_counter() - t0), stage2_gain=r_info["mrr_gain"], stage2_tau=r_info["tau"],
+                        stage2_averaged=r_info["averaged"], stage2_best_step=r_info["best_step"], stage2_curve=[{"step": s, **sig} for s, sig in r_info["val_curve"]])
+
+        self.src_lang = bundle.src_lang
+        self.W = W.cpu().numpy()
+        self.mu_x_query = mu_x.cpu().numpy()
+        self.mu_y_by_lang = {self.src_lang: mu_y.cpu().numpy()}
+        resid_true, resid_pred = Xdc[va], Ydc[va] @ W
+        stats = retrieval_stats(self._project(Yq[va], mu_y, mu_x, W), pool, va)
+        self.quality = QualityReport({
+            "fit": {
+                "val_r2": float(1 - (resid_pred - resid_true).pow(2).sum() / resid_true.pow(2).sum()),
+                "val_resid_cos": F.cosine_similarity(resid_pred, resid_true, dim=1).mean().item(),
+                "stage2_gain": float(info.get("stage2_gain", 0.0)),
+            },
+            "recoverability": {"owndoc_mrr": stats["mrr"], "owndoc_recall@10": stats["recall"], "owndoc_mrr_stage1": step0_mrr},
+            "coverage": {"K_over_dt": bundle.K / Y_query_raw.shape[1]},
+        })
+        self.quality.notes.append(
+            "fitted without the source model: no teacher, so no rho_val, no calibrated score and no per-query confidence"
+        )
+        if bundle.index_size is not None:
+            index_size_check(self.quality, bundle.index_size)
+        self.quality.rerank_pool = max(self.quality.rerank_pool, RERANK_POOL_BY_GRADE["D"])
+        self._support_anchors = F.normalize(Yqc[tr], dim=-1).cpu().numpy()
+        info.update(val_pool_size=int(pool.shape[0]), quality=self.quality.details, status="NO_TEACHER")
+        self.status = "NO_TEACHER"
         self.metrics = info
         return info
 
@@ -498,6 +585,6 @@ class SpaceBridge:
         q_hat = q_proj / (np.linalg.norm(q_proj, axis=-1, keepdims=True) + 1e-8)
         if not return_confidence:
             return q_hat
-        if self._conf_map is None:
-            raise RuntimeError("per-query confidence needs a centered fit")
+        if self._conf_map is None:  # a source-model-free fit has no teacher to calibrate it on
+            return q_hat, np.full(q_hat.shape[:-1] if q_hat.ndim > 1 else (1,), np.nan)
         return q_hat, np.interp(self.query_support(q_tgt_raw, query_lang), *self._conf_map)

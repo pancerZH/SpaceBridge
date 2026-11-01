@@ -47,6 +47,8 @@ ROWS = {
     "8s": "Row 8 without mean restore",
     "8n": "Row 8 without residual norm matching",
     "8b": "Row 8 + doc<->doc pairs (anchor docs encoded by M_tgt; default engine)",
+    "6f": "Source-model-free: doc<->doc pairs only, Stage 1 (no M_src at any point)",
+    "8f": "Source-model-free: doc<->doc pairs, Stage 1 + InfoNCE-only Stage 2 (no M_src at any point)",
     "9t": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-10 + cross-encoder rerank",
     "9u": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-20 + cross-encoder rerank",
     "9n": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-30 + cross-encoder rerank",
@@ -73,6 +75,8 @@ BRIDGE_ROWS = {
     "8s": ("tgt_query", "auto", "query", False),
     "8n": ("tgt_query", "auto", "query", True),
     "8b": ("tgt_query", "auto", "query", True),  # + Y_doc_raw
+    "6f": ("tgt_query", "source_free", "doc", True),
+    "8f": ("tgt_query", "source_free", "doc", True),
 }
 
 TIERS = {
@@ -131,7 +135,7 @@ def run_pair(
     rerankers: tuple[str, ...] = (), proxy: str = "title", stage2_batch: Optional[int] = None,
     doc_pair_tokens: int = DOC_PAIR_TOKENS, time_mount: bool = False, stage2_tau_scale: Optional[float] = None,
     stage2_curves: bool = False, stage2_rule: Optional[str] = None, shift_bank: str = "auto", anchor_bank: str = "corpus",
-    anchor_select: str = "auto", full_index_diagnostics: bool = False,
+    anchor_select: str = "auto", full_index_diagnostics: bool = False, rerank_row: Optional[str] = None,
 ) -> list[dict]:
     src, tgt = MODELS[src_key], MODELS[tgt_key]
     K = min(K or default_anchor_count(ds.N), ds.N - int((ds.self_rows >= 0).sum()))
@@ -175,7 +179,7 @@ def run_pair(
     Q_tgt = enc.queries(ds.queries, ds.task)
     # Mount timing re-encodes the anchors uncached (~70 s per run for a 4B model), so it is opt-in.
     mount_timing = None
-    rerank_base = "7b" if ds.query_lang else "8b"  # Row 9 reranks the default engine's first stage
+    rerank_base = rerank_row or ("7b" if ds.query_lang else "8b")  # Row 9 reranks the default engine's first stage
     needs = set(rows) | ({rerank_base} if set(rows) & set(RERANK_DEPTH) else set())
     if time_mount:
         _, mount_timing = enc.timed_encode([tgt.format_query(p, ds.task) for p in tgt_proxies])
@@ -228,7 +232,13 @@ def run_pair(
                 **({"stop_rule": stage2_rule} if stage2_rule else {}),
                 keep_checkpoints=stage2_curves,
             )
-            if row in ("8b", "7b"):  # the default engine, through the call that ships
+            if row in ("6f", "8f"):
+                bridge = SpaceBridge(device=device, doc_pairs=True, refine_config=config)
+                free = replace(bundle, X_query_raw=None)
+                Y_doc = tgt_mount.encode_docs(free.anchor_doc_titles, free.anchor_doc_texts, max_tokens=doc_pair_tokens or None)
+                tgt_mount.unload()
+                fit = bridge.fit_source_free(free, Y_query, Y_doc, X_distractor, stage2=row == "8f")
+            elif row in ("8b", "7b"):  # the default engine, through the call that ships
                 bridge = mount(
                     bundle, index, tgt_mount, [ds.query_lang] if row == "7b" else (), device, doc_pair_tokens or None,
                     doc_pairs=True, refine_config=config, shift_banks={ds.query_lang: (bank_src, bank_q)} if row == "7b" else None,
@@ -306,7 +316,8 @@ def run_pair(
                 q = bridge.quality
                 rec["quality"] = {"score": q.score, "band": q.band, "grade": q.grade, "rerank_pool": q.rerank_pool, "notes": q.notes,
                                   "by_language": q.by_language}
-                rec["confidence"] = _confidence_study(bridge, Q_tgt, ranked, native_ranked, pq, native_pq, oracle_pq)
+                if row not in ("6f", "8f"):
+                    rec["confidence"] = _confidence_study(bridge, Q_tgt, ranked, native_ranked, pq, native_pq, oracle_pq)
         records.append(_score_record(rec, pq, native_pq, oracle_pq))
 
     rerank_rows = [r for r in rows if r in RERANK_DEPTH]
@@ -528,6 +539,8 @@ def main() -> None:
                    help="also score the validation proxies over the whole index (rho_val_full, owndoc_full; two extra searches per fit)")
     p.add_argument("--max-queries", type=int, default=None,
                    help="evaluate on the first N queries only: for screening grids, confirm winners on all queries")
+    p.add_argument("--rerank-row", default=None, choices=sorted(BRIDGE_ROWS),
+                   help="first stage the rerank rows reorder (default: the default engine)")
     p.add_argument("--max-docs", type=int, default=None,
                    help="index only the first N rows of a nested corpus (msmarco-full, nq-full), sharing its embeddings")
     p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
@@ -560,7 +573,7 @@ def main() -> None:
         durable.progress(f"cell {n}/{len(cells)} {cell}: start")
         records = run_pair(ds, src, tgt, K, seed, args.rows, args.device, tuple(args.rerankers), args.proxy, args.stage2_batch,
                            args.doc_pair_tokens, args.time_mount, args.stage2_tau_scale, args.stage2_curves, args.stage2_rule,
-                           args.shift_bank, args.anchor_bank, args.anchor_select, args.full_index_diagnostics)
+                           args.shift_bank, args.anchor_bank, args.anchor_select, args.full_index_diagnostics, args.rerank_row)
         durable.append_lines(args.out, [
             json.dumps({**rec, "cell": cell, "cell_records": len(records)}, default=_json_default) for rec in records
         ])

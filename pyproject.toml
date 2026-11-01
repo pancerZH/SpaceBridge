@@ -40,6 +40,11 @@ bench = [
 dev = [
     "pytest>=8.0",
 ]
+# Translation baseline only (W6): machine translation stays out of calibration.
+translate = [
+    "sentencepiece>=0.2",
+    "protobuf>=5.0",
+]
 
 [project.scripts]
 spacebridge-bench = "spacebridge_bench.run:main"
