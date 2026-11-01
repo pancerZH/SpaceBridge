@@ -9,6 +9,8 @@ from typing import Optional
 
 import numpy as np
 
+from . import durable
+
 
 @dataclass(frozen=True)
 class DatasetSpec:
@@ -121,8 +123,7 @@ def load_beir(name: str, split: Optional[str] = None, seed: int = 0) -> Retrieva
         with path.open("rb") as f:
             return pickle.load(f)
     ds = _load_beir(name, split, seed)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("wb") as f:
+    with durable.atomic_file(path) as f:
         pickle.dump(ds, f, protocol=pickle.HIGHEST_PROTOCOL)
     return ds
 
