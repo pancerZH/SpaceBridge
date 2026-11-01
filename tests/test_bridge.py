@@ -218,3 +218,20 @@ def test_tail_rule_keeps_the_identity(world):
                         refine_config=RefineConfig(steps=30, stop_rule="tail"))
     native = top_k(world.Q_src, world.E_src)
     assert overlap_at_k(native, top_k(bridge.transform_query(world.Q_src), world.E_src)) > 0.97
+
+
+def test_stage2_batch_shrinks_for_wide_indexes():
+    import torch
+
+    from spacebridge.refine import refine
+
+    gen = torch.Generator().manual_seed(0)
+    n, d_t, d_s = 300, 16, 64
+    Y, Xq, Xd = (torch.randn(n, d, generator=gen) for d in (d_t, d_s, d_s))
+    W0 = 0.1 * torch.randn(d_t, d_s, generator=gen)
+    signals = lambda W: {"agree": 1.0, "mrr": 0.0}
+    for ref_dim, cap, expected in ((64, 200, 200), (16, 200, 100), (64, 400, None)):
+        # d_s = 4x the reference dimension halves the cap (sqrt); a cap above the candidate count means full batch
+        cfg = RefineConfig(steps=2, batch_candidates=cap, batch_ref_dim=ref_dim)
+        _, info = refine(W0, torch.zeros(d_s), Y, Xq, Xd, signals, cfg)
+        assert info["batch"] == expected

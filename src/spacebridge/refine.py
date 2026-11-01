@@ -44,6 +44,11 @@ class RefineConfig:
     # at the default K = 2,048 level (1,638 training anchors). At K = 4,096 this takes Row 8b from 454 to 199 ms
     # (fiqa) at -0.4 / +0.1 points Recall@30 (fiqa / scidocs, 3 seeds). None: always full batch.
     batch_candidates: Optional[int] = 1638
+    # The per-step cost is rows x candidates x d_s with rows proportional to candidates, so for indexes wider than
+    # batch_ref_dim the cap shrinks by sqrt(batch_ref_dim / d_s) to keep the cost of a 1024-d index: 1,035 candidates
+    # into the 2560-d Qwen3-4B index (M4: -0.1 / -0.4 points at K = 2,048 / 4,096, 3 seeds; a cap scaled by
+    # batch_ref_dim / d_s, 655 candidates, lost 1.2 points at K = 4,096).
+    batch_ref_dim: int = 1024
 
 
 def agree_floor(a0: float, cfg: RefineConfig) -> float:
@@ -90,7 +95,10 @@ def refine(
     mu_x = mu_x.expand(K_train, -1) if mu_x.dim() == 1 else mu_x
     if labels is None:
         labels = torch.arange(K_train, device=dev)
-    batch = cfg.batch_candidates if cfg.batch_candidates and n_cand > cfg.batch_candidates else None
+    cap = None
+    if cfg.batch_candidates:
+        cap = int(cfg.batch_candidates * min(1.0, math.sqrt(cfg.batch_ref_dim / Xd_train.shape[1])))
+    batch = cap if cap is not None and n_cand > cap else None
     with torch.no_grad():
         teacher_scores = Xq_train @ Xd_train.T
         sd = teacher_scores.std(dim=1).mean().item()
@@ -142,7 +150,7 @@ def refine(
     rejected = floor_scores(curve, floor)[1:]
     info = {
         "best_step": best_step, "averaged": averaged, "val_curve": curve, "beta": beta, "steps_run": step, "tau": tau,
-        "teacher_sd": sd, "tau_scaled": tau != cfg.tau,
+        "teacher_sd": sd, "tau_scaled": tau != cfg.tau, "batch": batch,
         "mrr_gain": best_sig["mrr"] - curve[0][1]["mrr"],
         "floor_rejected": sum(v == -math.inf for v in rejected) / max(len(rejected), 1),
     }
