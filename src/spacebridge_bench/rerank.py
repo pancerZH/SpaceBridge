@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from spacebridge.encoders import CPU_BATCH_TOKENS, default_dtype, longest_first as _longest_first, run_token_batches, token_lengths
+from spacebridge.encoders import CPU_BATCH_TOKENS, default_dtype, predict_pairs
 
 from . import durable
 from .store import release_gpu
@@ -129,22 +129,8 @@ class Reranker:
 
     def _predict(self, queries: list[str], docs: list[str], prompt: str) -> np.ndarray:
         kwargs = {"prompt": prompt} if self.spec.instructed else {}
-        lengths = token_lengths(self.model.tokenizer, queries, docs, max_length=self.spec.max_length)
-        out = np.empty(len(queries), dtype=np.float32)
-
-        def handle(batch: np.ndarray) -> None:
-            scores = self.model.predict(
-                [(queries[i], docs[i]) for i in batch],
-                batch_size=len(batch),
-                convert_to_numpy=True,
-                show_progress_bar=False,
-                **kwargs,
-            )
-            out[batch] = np.asarray(scores, dtype=np.float32).reshape(-1)
-
         budget = self.spec.batch_tokens if self.device.startswith("cuda") else CPU_BATCH_TOKENS
-        run_token_batches(lengths, _longest_first(lengths), budget, handle)
-        return out
+        return predict_pairs(self.model, queries, docs, budget, self.spec.max_length, **kwargs)
 
 
 def _pair_key(prompt: str, query: str, doc: str) -> int:

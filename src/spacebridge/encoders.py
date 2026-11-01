@@ -9,6 +9,7 @@ import torch.nn.functional as F
 TOKENIZE_CHUNK = 100_000  # bulk tokenizing keeps only lengths; 8.8M token lists would not fit in RAM
 CPU_BATCH_TOKENS = 1_024  # smaller is faster on this CPU: 10.0 s vs. 17.4 s to rerank 60 pairs at 16,384
 GPU_BATCH_TOKENS = 20_000
+GPU_RERANK_TOKENS = 10_000
 SIZE_CLASS_LARGE_PARAMS = 2e9  # ~4B models and above: the doc-pair pass costs far more than it gains (M3)
 
 
@@ -110,3 +111,34 @@ class SentenceTransformerEncoder:
             return out
         finally:
             self.model.max_seq_length = saved
+
+
+def predict_pairs(model, queries: list[str], docs: list[str], budget: int, max_length: int, **kwargs) -> np.ndarray:
+    """Cross-encoder scores of ``(queries[i], docs[i])``, in token-budgeted batches."""
+    lengths = token_lengths(model.tokenizer, queries, docs, max_length=max_length)
+    out = np.empty(len(queries), dtype=np.float32)
+
+    def handle(batch: np.ndarray) -> None:
+        scores = model.predict(
+            [(queries[i], docs[i]) for i in batch], batch_size=len(batch), convert_to_numpy=True, show_progress_bar=False, **kwargs,
+        )
+        out[batch] = np.asarray(scores, dtype=np.float32).reshape(-1)
+
+    run_token_batches(lengths, longest_first(lengths), budget, handle)
+    return out
+
+
+class CrossEncoderReranker:
+    """A ``spacebridge.serving.Reranker`` over a ``sentence-transformers`` cross-encoder. ``bge-reranker-v2-m3`` is the
+    reference: multilingual, Apache-2.0, and stable under bf16."""
+
+    def __init__(self, model: str = "BAAI/bge-reranker-v2-m3", device: str = "cuda", batch_tokens: Optional[int] = None, max_length: int = 512):
+        from sentence_transformers import CrossEncoder
+
+        self.device = device if torch.cuda.is_available() else "cpu"
+        self.max_length = max_length
+        self.batch_tokens = batch_tokens or (GPU_RERANK_TOKENS if self.device.startswith("cuda") else CPU_BATCH_TOKENS)
+        self.model = CrossEncoder(model, device=self.device, model_kwargs={"torch_dtype": default_dtype(self.device)}, max_length=max_length)
+
+    def score(self, query: str, docs: list[str]) -> np.ndarray:
+        return predict_pairs(self.model, [query] * len(docs), docs, self.batch_tokens, self.max_length)

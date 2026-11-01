@@ -23,6 +23,11 @@ banks = [
     "huggingface-hub>=0.30",
 ]
 
+# An HNSW index for the serving path; exact search needs nothing extra.
+hnsw = [
+    "faiss-cpu>=1.9",
+]
+
 [dependency-groups]
 bench = [
     "datasets>=3.0",
