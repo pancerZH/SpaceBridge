@@ -1,8 +1,9 @@
 """BEIR-format retrieval datasets from the Hugging Face hub (design §7.1)."""
 
 import hashlib
+import json
 import pickle
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -65,6 +66,20 @@ DATASETS: dict[str, DatasetSpec] = {
         "google/xquad", "en", "Given a question, retrieve Wikipedia passages that answer the question", query_lang="zh"
     ),
 }
+# Close-out (FLORES): other XQuAD query languages against the same English index, held out from every Tier 5a
+# decision, to check per-language validation (rho_val,Lq) on language shifts other than zh's.
+for _lang in ("de", "es", "ru", "ar", "hi", "vi"):
+    DATASETS[f"xquad-{_lang}"] = replace(DATASETS["xquad-zh"], query_lang=_lang)
+# MLQA (test split, Wikipedia paragraphs without titles, parallel questions by id; CC BY-SA 3.0), from the hub's
+# parquet conversion. ``mlqa-zh``: Chinese questions into an English index of all MLQA English contexts (a second
+# Tier 5a set, held out from every decision). ``mlqa-l2``: English questions into a Chinese index of all MLQA
+# Chinese contexts (Tier 5b, Regime L2); the native ceiling uses the parallel Chinese questions.
+DATASETS["mlqa-zh"] = DatasetSpec(
+    "facebook/mlqa", "en", "Given a question, retrieve Wikipedia passages that answer the question", query_lang="zh"
+)
+DATASETS["mlqa-l2"] = DatasetSpec(
+    "facebook/mlqa", "zh", "Given a question, retrieve Wikipedia passages that answer the question", query_lang="en"
+)
 
 
 @dataclass
@@ -117,6 +132,8 @@ def _load_beir(name: str, split: Optional[str], seed: int) -> RetrievalDataset:
     spec = DATASETS[name]
     if spec.repo == "google/xquad":
         return _load_xquad(name, spec)
+    if spec.repo == "facebook/mlqa":
+        return _load_mlqa(name, spec)
     corpus = load_dataset(spec.repo, "corpus", split=spec.corpus_split)
     queries = load_dataset(spec.repo, "queries", split=spec.queries_split)
     qrels = load_dataset(spec.repo, "default", split=split or spec.split)
@@ -216,15 +233,124 @@ def _load_xquad(name: str, spec: DatasetSpec) -> RetrievalDataset:
     )
 
 
-def load_shift_bank(query_lang: str, n: int = 256) -> tuple[list[str], list[str]]:
-    """Parallel (English, query-language) sentences for the language-cone shift (design §4.4).
+FLORES_REPO = "openlanguagedata/flores_plus"   # gated (CC BY-SA 4.0): needs an HF token with accepted terms
+BELEBELE_REPO = "facebook/belebele"             # its passages are FLORES-200 passages (CC BY-SA 4.0)
+FLORES_CODES = {
+    "en": "eng_Latn", "zh": "cmn_Hans", "de": "deu_Latn", "es": "spa_Latn", "ru": "rus_Cyrl", "ar": "arb_Arab",
+    "vi": "vie_Latn", "hi": "hin_Deva", "tr": "tur_Latn", "el": "ell_Grek", "th": "tha_Thai", "ro": "ron_Latn",
+}
+FLORES_CACHE = Path("data/flores")
+FLORES_SPLITS = ("dev", "devtest")
+_FLORES_VERSION = 1  # bump when filtering changes
 
-    FLORES (gated) needs an HF token; without one this uses human-translated Tatoeba pairs from
-    ``mteb/tatoeba-bitext-mining`` as a stand-in. Returns the first ``n`` pairs.
+
+def load_flores(lang: str, belebele_filter: bool = True) -> dict[str, dict]:
+    """Row-aligned human-translated (English, ``lang``) FLORES+ sentence pairs per split (design §4.4, §7.1).
+
+    Rule 6 of §7.1: sentences whose English text occurs inside a Belebele passage are dropped
+    (``belebele_filter``; Belebele evaluates on FLORES text), and so are sentences that occur in both
+    ``dev`` and ``devtest``. Returns ``{split: {"en": [...], lang: [...], "ids": [...]}}`` plus
+    ``"counts"`` (sentences before / after each filter). Downloads at runtime and caches only the filtered
+    pairs under the git-ignored ``data/flores/``; raises if the gated repo is not accessible.
     """
+    tag = "belebele-filtered" if belebele_filter else "unfiltered"
+    path = FLORES_CACHE / f"flores_en-{lang}_{tag}_v{_FLORES_VERSION}.json"
+    if path.exists():
+        return json.loads(path.read_text())
+    from huggingface_hub import hf_hub_download
+
+    def rows(split: str, code: str) -> list[dict]:
+        local = hf_hub_download(FLORES_REPO, f"{split}/{code}.jsonl", repo_type="dataset")
+        return [json.loads(line) for line in Path(local).open()]
+
+    norm = lambda t: " ".join(t.split())
+    raw = {}
+    for split in FLORES_SPLITS:
+        en, xx = rows(split, FLORES_CODES["en"]), rows(split, FLORES_CODES[lang])
+        if [r["id"] for r in en] != [r["id"] for r in xx]:
+            raise ValueError(f"FLORES {split} en / {lang} are not row-aligned")
+        raw[split] = (en, xx)
+    passages: list[str] = []
+    if belebele_filter:
+        local = hf_hub_download(BELEBELE_REPO, f"data/{FLORES_CODES['en']}.jsonl", repo_type="dataset")
+        passages = sorted({norm(json.loads(line)["flores_passage"]) for line in Path(local).open()})
+    texts = {s: {norm(r["text"]) for pair in raw[s] for r in pair} for s in FLORES_SPLITS}
+    both = texts["dev"] & texts["devtest"]
+    out: dict[str, dict] = {"counts": {}}
+    for split, (en, xx) in raw.items():
+        keep = [
+            i for i in range(len(en))
+            if norm(en[i]["text"]) not in both and norm(xx[i]["text"]) not in both
+            and not any(norm(en[i]["text"]) in p for p in passages)
+        ]
+        out[split] = {"ids": [en[i]["id"] for i in keep], "en": [en[i]["text"] for i in keep], lang: [xx[i]["text"] for i in keep]}
+        out["counts"][split] = {"raw": len(en), "kept": len(keep)}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(out, ensure_ascii=False))
+    return out
+
+
+def flores_available(lang: str) -> bool:
+    """Whether FLORES pairs for ``lang`` are cached or downloadable (the gated repo is accessible)."""
+    if lang not in FLORES_CODES:
+        return False
+    try:
+        load_flores(lang)
+    except Exception:  # no token, terms not accepted, offline
+        return False
+    return True
+
+
+SHIFT_BANKS = ("auto", "flores", "flores-unfiltered", "tatoeba")
+
+
+def _load_mlqa(name: str, spec: DatasetSpec) -> RetrievalDataset:
+    """MLQA test questions in ``spec.query_lang`` against every context of the ``spec.lang`` side (test + dev);
+    each question's positive is its own paragraph, and the parallel ``spec.lang`` question (same id) gives the
+    native ceiling."""
+    import pandas as pd
+    from huggingface_hub import hf_hub_download
+
+    def part(config: str, split: str):
+        local = hf_hub_download(spec.repo, f"mlqa.{config}/{split}/0000.parquet", repo_type="dataset",
+                                revision="refs/convert/parquet")
+        return pd.read_parquet(local)
+
+    c, q = spec.lang, spec.query_lang
+    native = part(f"{c}.{c}", "test")
+    cross = part(f"{c}.{q}", "test").merge(native[["id", "question"]], on="id", suffixes=("", "_src"))
+    contexts = list(dict.fromkeys([*native["context"], *part(f"{c}.{c}", "validation")["context"]]))
+    row_of = {t: i for i, t in enumerate(contexts)}
+    return RetrievalDataset(
+        name=name,
+        lang=spec.lang,
+        task=spec.task,
+        doc_ids=[str(i) for i in range(len(contexts))],
+        titles=[""] * len(contexts),
+        texts=contexts,
+        queries=list(cross["question"]),
+        qrels=[{row_of[t]: 1} for t in cross["context"]],
+        self_rows=np.full(len(cross), -1, dtype=np.int64),
+        query_lang=q,
+        src_queries=list(cross["question_src"]),
+    )
+
+
+def load_shift_bank(query_lang: str, n: int = 256, bank: str = "auto") -> tuple[list[str], list[str], str]:
+    """Parallel (English, query-language) sentences for the language-cone shift (design §4.4), and the bank's name.
+
+    ``auto``: the Belebele-filtered FLORES ``dev`` split when the gated repo is accessible (at most ``n`` pairs;
+    the filter leaves 94 of 997 for zh, all of them used), else the first ``n`` human-translated Tatoeba pairs
+    from ``mteb/tatoeba-bitext-mining``. ``flores-unfiltered`` (ablation) skips the Belebele filter.
+    """
+    if bank == "auto":
+        bank = "flores" if flores_available(query_lang) else "tatoeba"
+    if bank in ("flores", "flores-unfiltered"):
+        dev = load_flores(query_lang, belebele_filter=bank == "flores")["dev"]
+        return dev["en"][:n], dev[query_lang][:n], bank
     from datasets import load_dataset
 
     config = {"zh": "cmn-eng"}[query_lang]
     ds = load_dataset("mteb/tatoeba-bitext-mining", config, split="test")
     pairs = [(e.strip(), q.strip()) for q, e in zip(ds["sentence1"], ds["sentence2"])][:n]
-    return [e for e, _ in pairs], [q for _, q in pairs]
+    return [e for e, _ in pairs], [q for _, q in pairs], "tatoeba"

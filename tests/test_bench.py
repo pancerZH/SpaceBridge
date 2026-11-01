@@ -69,3 +69,35 @@ def test_query_subsample_keeps_whole_queries():
     kept = {qids[i] for i in rows}
     assert len(kept) == 2 and "d" not in kept
     assert all(qids[i] in kept for i in rows) and sum(q in kept for q in qids) == len(rows)
+
+
+def test_flores_filter_drops_belebele_and_cross_split_sentences(tmp_path, monkeypatch):
+    import json
+
+    import huggingface_hub
+
+    from spacebridge_bench import datasets
+
+    files = {
+        "dev/eng_Latn.jsonl": ["A cat sat.", "Shared  sentence.", "Kept dev one."],
+        "dev/cmn_Hans.jsonl": ["猫坐着。", "共享的句子。", "保留的。"],
+        "devtest/eng_Latn.jsonl": ["Shared sentence.", "Inside a passage.", "Kept devtest."],
+        "devtest/cmn_Hans.jsonl": ["共享的句子。", "在段落里。", "保留测试。"],
+    }
+    belebele = [{"flores_passage": "Intro. A cat  sat. More."}, {"flores_passage": "Inside a passage. End."}]
+
+    def fake_download(repo, filename, repo_type):
+        path = tmp_path / "hub" / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rows = belebele if repo == datasets.BELEBELE_REPO else [{"id": i, "text": t} for i, t in enumerate(files[filename])]
+        path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows))
+        return str(path)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    monkeypatch.setattr(datasets, "FLORES_CACHE", tmp_path / "flores")
+    out = datasets.load_flores("zh")
+    assert out["dev"]["en"] == ["Kept dev one."] and out["dev"]["zh"] == ["保留的。"] and out["dev"]["ids"] == [2]
+    assert out["devtest"]["en"] == ["Kept devtest."] and out["counts"]["devtest"] == {"raw": 3, "kept": 1}
+    unfiltered = datasets.load_flores("zh", belebele_filter=False)
+    assert unfiltered["dev"]["en"] == ["A cat sat.", "Kept dev one."]  # cross-split duplicates still go
+    assert datasets.load_flores("zh") == out  # cached
