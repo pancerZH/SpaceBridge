@@ -61,6 +61,10 @@ DATASETS: dict[str, DatasetSpec] = {
         "mteb/msmarco", "en", "Given a web search query, retrieve relevant passages that answer the query",
         max_docs=1_000_000, max_queries=2_000, split="dev",
     ),
+    # Second large corpus for the scale finding: real Google queries, 1M of the 2.68M Wikipedia passages.
+    "nq-1m": DatasetSpec(
+        "mteb/nq", "en", "Given a question, retrieve Wikipedia passages that answer the question", max_docs=1_000_000,
+    ),
     # Tier 5a: XQuAD questions (human-translated) against all ~21K English SQuAD v1.1 paragraphs.
     "xquad-zh": DatasetSpec(
         "google/xquad", "en", "Given a question, retrieve Wikipedia passages that answer the question", query_lang="zh"

@@ -15,13 +15,9 @@ import numpy as np
 
 from spacebridge_bench.models import MODELS
 
-# Size class (B params) -> end-to-end mount budget, s (design §2.1, set from M3 measurements: 128-token
-# anchor docs for doc pairs up to 0.6B, no doc pairs for 4B-class query models).
-BUDGET_S = ((0.35, 5.0), (0.6, 10.0), (4.0, 30.0))
-
-
-def budget(params_b: float) -> float:
-    return next(b for p, b in BUDGET_S if params_b <= p)
+# Mount budget (design §2.1): encoding work relative to re-indexing the corpus with the same model, in tokens, so it
+# holds on any hardware. Seconds are reference measurements of the machine the run used, not a pass / fail.
+BUDGET_RATIO = 0.10
 
 
 def main() -> None:
@@ -37,24 +33,28 @@ def main() -> None:
             f = r["fit"]
             solver = f["stage1_ms"] + f.get("stage2_ms", 0) + f["val_ms"]
             if r["row"] in ("8b", "7b"):
-                cells[r["tgt"], r["K"]].append((r["mount"]["encode_ms"], r["mount"].get("doc_encode_ms", np.nan), solver))
+                m = r["mount"]
+                cells[r["dataset"], r["tgt"], r["K"]].append((
+                    m["encode_ms"], m.get("doc_encode_ms", np.nan), solver, m["n_tokens"], m.get("doc_n_tokens", np.nan),
+                    m.get("corpus_tokens_est", np.nan),
+                ))
             elif r["row"] == "8":  # the mount without doc pairs (4B-class protocol) runs Row 8's solver
-                solver8[r["tgt"], r["K"]].append(solver)
-    print("| query model (params) | K | runs | proxies encode s | anchor docs encode s | solver ms (8 / 8b) | "
-          "mount s (no doc pairs) | mount s (doc pairs) | budget s | protocol | within budget |")
+                solver8[r["dataset"], r["tgt"], r["K"]].append(solver)
+    print("| dataset | query model (params) | K | runs | proxies s | anchor docs s | solver ms (8 / 8b) | mount s, this machine | "
+          "protocol | mount / re-index tokens | within budget |")
     print("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
-    for (tgt, K), v in sorted(cells.items(), key=lambda kv: (MODELS[kv[0][0]].params_b, kv[0])):
-        v = np.array(v)
-        enc, doc, solver = v.mean(0)
-        s8 = np.mean(solver8[tgt, K]) if solver8[tgt, K] else solver
+    for (ds, tgt, K), v in sorted(cells.items(), key=lambda kv: (kv[0][0], MODELS[kv[0][1]].params_b, kv[0])):
+        enc, doc, solver, tok, doc_tok, corpus = np.array(v).mean(0)
+        s8 = np.mean(solver8[ds, tgt, K]) if solver8[ds, tgt, K] else solver
         spec = MODELS[tgt]
-        no_pairs, pairs = (enc + s8) / 1e3, (enc + doc + solver) / 1e3
         # Mount protocol (design §2.1): doc pairs up to ~0.6B query models, proxies only for the 4B class.
-        protocol = "proxies only" if spec.params_b > 0.6 else "doc pairs"
-        mount = no_pairs if spec.params_b > 0.6 else pairs
-        b = budget(spec.params_b)
-        print(f"| {tgt} ({spec.params_b:g}B) | {K} | {len(v)} | {enc / 1e3:.1f} | {doc / 1e3:.1f} | {s8:.0f} / {solver:.0f} | "
-              f"{no_pairs:.1f} | {pairs:.1f} | {b:g} | {protocol} | {'✓' if mount < b else '✗'} {mount:.1f} s |")
+        proxies_only = spec.params_b > 0.6
+        mount = (enc + s8) / 1e3 if proxies_only else (enc + doc + solver) / 1e3
+        ratio = (tok if proxies_only else tok + doc_tok) / corpus
+        status = "n/a (older record)" if np.isnan(ratio) else f"{'✓' if ratio <= BUDGET_RATIO else '✗'}"
+        print(f"| {ds} | {tgt} ({spec.params_b:g}B) | {K} | {len(v)} | {enc / 1e3:.1f} | {doc / 1e3:.1f} | {s8:.0f} / {solver:.0f} | "
+              f"{mount:.1f} | {'proxies only' if proxies_only else 'doc pairs'} | {ratio:.2%} | {status} |")
+
 
 if __name__ == "__main__":
     main()

@@ -16,7 +16,7 @@ import numpy as np
 
 from spacebridge import (
     DOC_PAIR_TOKENS, CalibrationBundle, RefineConfig, SpaceBridge, extract_query_proxy, make_query_proxies, make_split, sample_distractors,
-    select_anchors,
+    default_anchor_count, resolve_anchor_method, select_anchors,
 )
 
 from .datasets import DATASETS, FLORES_SPLITS, SHIFT_BANKS, RetrievalDataset, flores_available, load_beir, load_flores, load_shift_bank
@@ -47,6 +47,7 @@ ROWS = {
     "9n": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-30 + cross-encoder rerank",
     "9": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-60 + cross-encoder rerank",
     "9w": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-100 + cross-encoder rerank",
+    "9x": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-300 + cross-encoder rerank",
 }
 
 # row -> (anchor embeddings used as Y, fit mode, pair type, restore source mean)
@@ -87,7 +88,7 @@ SEARCH_K = 100
 VAL_K = 10  # rho_val's top-k (spacebridge.bridge.VAL_K)
 ANCHOR_CACHE = Path("data/cache/anchors")
 _warm = False
-RERANK_DEPTH = {"9n": 30, "9": 60, "9w": 100}
+RERANK_DEPTH = {"9n": 30, "9": 60, "9w": 100, "9x": 300}
 CI_METRICS = ("recall@30", "ndcg@5", "ndcg@10")
 PROXY_STYLES = ("title", "title-any", "lead", "short")
 
@@ -103,12 +104,16 @@ def make_proxies(titles: list[str], texts: list[str], style: str = "title") -> l
     return [extract_query_proxy(t, x, **kwargs) for t, x in zip(titles, texts)]
 
 
-def cached_anchors(ds: RetrievalDataset, src_key: str, E_src: np.ndarray, allowed: np.ndarray, K: int, seed: int) -> np.ndarray:
-    """Anchor doc rows, cached on disk so every pair and row of a dataset reuses one selection."""
+def cached_anchors(
+    ds: RetrievalDataset, src_key: str, E_src: np.ndarray, allowed: np.ndarray, K: int, seed: int, method: str = "auto",
+) -> np.ndarray:
+    """Anchor doc rows; k-means selections are cached on disk so every pair and row of a dataset reuses one."""
+    if resolve_anchor_method(len(allowed), method) == "random":
+        return allowed[select_anchors(E_src[allowed], K, seed, method="random")]
     path = ANCHOR_CACHE / f"{ds.name}_{src_key}_N{ds.N}_n{len(allowed)}_K{K}_s{seed}_tkm.npy"  # _tkm: torch k-means
     if path.exists():
         return np.load(path)
-    ids = allowed[select_anchors(E_src[allowed], K, seed)]
+    ids = allowed[select_anchors(E_src[allowed], K, seed, method="kmeans")]
     path.parent.mkdir(parents=True, exist_ok=True)
     np.save(path, ids)
     return ids
@@ -119,9 +124,10 @@ def run_pair(
     rerankers: tuple[str, ...] = (), proxy: str = "title", stage2_batch: Optional[int] = None,
     doc_pair_tokens: int = DOC_PAIR_TOKENS, time_mount: bool = False, stage2_tau_scale: Optional[float] = None,
     stage2_curves: bool = False, stage2_rule: Optional[str] = None, shift_bank: str = "auto", anchor_bank: str = "corpus",
+    anchor_select: str = "auto",
 ) -> list[dict]:
     src, tgt = MODELS[src_key], MODELS[tgt_key]
-    K = min(K, ds.N - int((ds.self_rows >= 0).sum()))
+    K = min(K or default_anchor_count(ds.N), ds.N - int((ds.self_rows >= 0).sum()))
     static = anchor_bank != "corpus"
     if static:  # Regime L2 (design §4.4): FLORES dev + devtest pairs replace corpus anchors; none is an index row
         fl = load_flores(ds.lang if ds.lang != "en" else ds.query_lang, belebele_filter=anchor_bank == "flores")
@@ -150,7 +156,7 @@ def run_pair(
         proxies, tgt_proxies = bank[ds.lang], bank[ds.query_lang]
         X_doc_anchor = enc.docs([""] * K, proxies)
     else:
-        anchor_ids = cached_anchors(ds, src_key, E_src, allowed, K, seed)
+        anchor_ids = cached_anchors(ds, src_key, E_src, allowed, K, seed, anchor_select)
         proxies = make_proxies([ds.titles[i] for i in anchor_ids], [ds.texts[i] for i in anchor_ids], proxy)
         tgt_proxies, X_doc_anchor = proxies, E_src[anchor_ids]
     train_idx, val_idx = make_split(K, seed=seed)
@@ -165,6 +171,7 @@ def run_pair(
         val_idx=val_idx,
         distractor_ids=sample_distractors(ds.N, anchor_ids[anchor_ids >= 0], seed=seed),
         mu_x_doc=E_src.mean(0),
+        index_size=ds.N,
     )
     enc.unload()
 
@@ -175,6 +182,11 @@ def run_pair(
     mount = None
     if time_mount:
         Y_query, mount = enc.timed_encode([tgt.format_query(p, ds.task) for p in tgt_proxies])
+        # Corpus token estimate: the mount budget is relative to the encoding work of re-indexing (design §2.1).
+        sample = np.random.default_rng(0).choice(ds.N, min(3_000, ds.N), replace=False)
+        doc_tokens = enc.model.tokenizer([tgt.format_doc(ds.titles[i], ds.texts[i]) for i in sample],
+                                         truncation=True, max_length=tgt.max_seq_length)["input_ids"]
+        mount["corpus_tokens_est"] = sum(map(len, doc_tokens)) / len(sample) * ds.N
         mount["projected_encode_ms_K2048"] = mount["encode_ms"] * 2048 / K
     else:
         Y_query = enc.queries(tgt_proxies, ds.task)
@@ -199,8 +211,9 @@ def run_pair(
             Y_doc_pairs = enc.encode(doc_inputs)
     enc.unload()
 
-    native_ranked = search(Q_src, E_src, SEARCH_K, device, exclude=ds.self_rows)
-    oracle_ranked = search(Q_tgt, E_tgt, SEARCH_K, device, exclude=ds.self_rows)
+    search_k = max([SEARCH_K] + [RERANK_DEPTH[r] for r in rows if r in RERANK_DEPTH])
+    native_ranked = search(Q_src, E_src, search_k, device, exclude=ds.self_rows)
+    oracle_ranked = search(Q_tgt, E_tgt, search_k, device, exclude=ds.self_rows)
     native_pq, oracle_pq = per_query(native_ranked, ds.qrels), per_query(oracle_ranked, ds.qrels)
     anchor_Y = {"src_query": bundle.X_query_raw, "tgt_query": Y_query, "tgt_doc": None if static else E_tgt[anchor_ids]}
     # Rows that run the default engine (doc<->doc pairs on); the identity row pairs source docs with themselves.
@@ -242,7 +255,7 @@ def run_pair(
                     tag: bridge.validate_query_language(lang, v["Y_lang"], v["Y_src"], v["X_query"], v["X_doc"])
                     for tag, v in lang_val.items()
                 }
-            ranked = search(bridge.transform_query(Q, query_lang=lang), E_src, SEARCH_K, device, exclude=ds.self_rows)
+            ranked = search(bridge.transform_query(Q, query_lang=lang), E_src, search_k, device, exclude=ds.self_rows)
             student = search(bridge.transform_query(anchor_Y[y_kind][bundle.val_idx]), E_src, VAL_K, device)
             fit["rho_val_full"] = float(np.mean([len(set(a) & set(b)) / VAL_K for a, b in zip(student, val_teacher_full)]))
             own = bundle.anchor_ids[bundle.val_idx]  # each validation proxy's own anchor doc (-1 for a static bank)
@@ -256,6 +269,7 @@ def run_pair(
         return bridged[row]
 
     base = {"dataset": ds.name, "src": src_key, "tgt": tgt_key, "K": K, "seed": seed, "n_queries": len(ds.queries)}
+    base["anchor_select"] = resolve_anchor_method(ds.N, anchor_select)
     base["proxy"] = proxy  # records without this field (before M3's title default) used lead proxies
     if static:
         base["anchor_bank"] = anchor_bank
@@ -453,7 +467,8 @@ def main() -> None:
     p.add_argument("--rows", nargs="*", default=[r for r in ROWS if r not in RERANK_DEPTH], choices=list(ROWS),
                    help="ablation rows; rerank rows 9n/9/9w are opt-in")
     p.add_argument("--rerankers", nargs="*", default=list(RERANKERS), choices=list(RERANKERS))
-    p.add_argument("--K", type=int, nargs="*", default=[2048], help="anchor budget(s); one run per value")
+    p.add_argument("--K", type=int, nargs="*", default=[0],
+                   help="anchor budget(s); one run per value (0: spacebridge.default_anchor_count of the index)")
     p.add_argument("--seed", type=int, nargs="*", default=[0], help="one run per seed, in one process")
     p.add_argument("--time-mount", action="store_true",
                    help="re-encode anchors uncached to time the mount, and time the projection (use an idle GPU)")
@@ -469,6 +484,8 @@ def main() -> None:
                    help="parallel sentences for the language-cone shift (auto: filtered FLORES dev if accessible, else Tatoeba)")
     p.add_argument("--anchor-bank", default="corpus", choices=("corpus", "flores", "flores-unfiltered"),
                    help="calibration anchors: corpus medoids, or the static FLORES dev + devtest bank (Tier 5b, Regime L2)")
+    p.add_argument("--anchor-select", default="auto", choices=("auto", "kmeans", "random"),
+                   help="how corpus anchors are chosen (auto: spacebridge.resolve_anchor_method)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", type=Path, default=Path("outputs/results.jsonl"))
     args = p.parse_args()
@@ -486,7 +503,7 @@ def main() -> None:
     for seed, (src, tgt), K in ((s, pr, K) for s in args.seed for pr in pairs for K in args.K):
         records = run_pair(ds, src, tgt, K, seed, args.rows, args.device, tuple(args.rerankers), args.proxy, args.stage2_batch,
                            args.doc_pair_tokens, args.time_mount, args.stage2_tau_scale, args.stage2_curves, args.stage2_rule,
-                           args.shift_bank, args.anchor_bank)
+                           args.shift_bank, args.anchor_bank, args.anchor_select)
         with args.out.open("a") as f:
             for rec in records:
                 f.write(json.dumps(rec, default=_json_default) + "\n")

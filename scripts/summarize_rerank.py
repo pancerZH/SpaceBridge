@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-RERANK_ROWS = ("9n", "9", "9w")
+RERANK_ROWS = ("9n", "9", "9w", "9x")
 
 
 def table(header: list[str], rows: list[list[str]]) -> str:
@@ -59,7 +59,7 @@ def main() -> None:
             means.append(f"**{np.mean(v):.3f}**" if v else "")
         rows.append(means)
         print(table(
-            ["dataset", "index ← queries", "first stage", "9n (top-30)", "9 (top-60)", "9w (top-100)",
+            ["dataset", "index ← queries", "first stage", "9n (top-30)", "9 (top-60)", "9w (top-100)", "9x (top-300)",
              "nDCG@5 native / oracle / bridge (top-60)", "ρceil R@5 (top-60)", "J@5 bridge–oracle (native–oracle)"],
             rows,
         ))
