@@ -8,6 +8,7 @@ Example:
 import argparse
 import json
 import time
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from typing import Optional
@@ -15,16 +16,18 @@ from typing import Optional
 import numpy as np
 
 from spacebridge import (
-    DOC_PAIR_TOKENS, CalibrationBundle, RefineConfig, SpaceBridge, extract_query_proxy, make_query_proxies, make_split, sample_distractors,
-    default_anchor_count, resolve_anchor_method, select_anchors,
+    DOC_PAIR_TOKENS, CalibrationBundle, RefineConfig, SpaceBridge, extract_query_proxy, make_query_proxies, make_split, random_anchors,
+    sample_distractors, default_anchor_count, resolve_anchor_method, select_anchors,
 )
 
+from . import durable
 from .datasets import DATASETS, FLORES_SPLITS, SHIFT_BANKS, RetrievalDataset, flores_available, load_beir, load_flores, load_shift_bank
 from .encode import Encoder
 from .metrics import bootstrap_ratio_ci, per_query, retention
 from .models import MODELS
 from .rerank import RERANKERS, Reranker, rerank, topk_jaccard
-from .search import search
+from .search import cached_search, search
+from .store import EmbeddingStore
 
 ROWS = {
     "0a": "Oracle full re-index (M_tgt docs + M_tgt queries)",
@@ -44,10 +47,14 @@ ROWS = {
     "8s": "Row 8 without mean restore",
     "8n": "Row 8 without residual norm matching",
     "8b": "Row 8 + doc<->doc pairs (anchor docs encoded by M_tgt; default engine)",
+    "9t": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-10 + cross-encoder rerank",
+    "9u": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-20 + cross-encoder rerank",
     "9n": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-30 + cross-encoder rerank",
     "9": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-60 + cross-encoder rerank",
     "9w": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-100 + cross-encoder rerank",
     "9x": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-300 + cross-encoder rerank",
+    "9y": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-500 + cross-encoder rerank",
+    "9z": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-1,000 + cross-encoder rerank",
 }
 
 # row -> (anchor embeddings used as Y, fit mode, pair type, restore source mean)
@@ -84,11 +91,11 @@ TIERS = {
     "5b": [("bge-large-zh", "bge-large-en")],
 }
 
-SEARCH_K = 100
+SEARCH_K = 1_000  # as fast as top-100, and reports recall at rerank depth
 VAL_K = 10  # rho_val's top-k (spacebridge.bridge.VAL_K)
 ANCHOR_CACHE = Path("data/cache/anchors")
 _warm = False
-RERANK_DEPTH = {"9n": 30, "9": 60, "9w": 100, "9x": 300}
+RERANK_DEPTH = {"9t": 10, "9u": 20, "9n": 30, "9": 60, "9w": 100, "9x": 300, "9y": 500, "9z": 1_000}
 CI_METRICS = ("recall@30", "ndcg@5", "ndcg@10")
 PROXY_STYLES = ("title", "title-any", "lead", "short")
 
@@ -105,17 +112,17 @@ def make_proxies(titles: list[str], texts: list[str], style: str = "title") -> l
 
 
 def cached_anchors(
-    ds: RetrievalDataset, src_key: str, E_src: np.ndarray, allowed: np.ndarray, K: int, seed: int, method: str = "auto",
+    ds: RetrievalDataset, src_key: str, E_src: np.ndarray | EmbeddingStore, allowed: np.ndarray, K: int, seed: int, method: str = "auto",
 ) -> np.ndarray:
     """Anchor doc rows; k-means selections are cached on disk so every pair and row of a dataset reuses one."""
     if resolve_anchor_method(len(allowed), method) == "random":
-        return allowed[select_anchors(E_src[allowed], K, seed, method="random")]
+        return allowed[random_anchors(len(allowed), K, seed)]
     path = ANCHOR_CACHE / f"{ds.name}_{src_key}_N{ds.N}_n{len(allowed)}_K{K}_s{seed}_tkm.npy"  # _tkm: torch k-means
     if path.exists():
         return np.load(path)
     ids = allowed[select_anchors(E_src[allowed], K, seed, method="kmeans")]
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(path, ids)
+    durable.save_npy(path, ids)
     return ids
 
 
@@ -124,7 +131,7 @@ def run_pair(
     rerankers: tuple[str, ...] = (), proxy: str = "title", stage2_batch: Optional[int] = None,
     doc_pair_tokens: int = DOC_PAIR_TOKENS, time_mount: bool = False, stage2_tau_scale: Optional[float] = None,
     stage2_curves: bool = False, stage2_rule: Optional[str] = None, shift_bank: str = "auto", anchor_bank: str = "corpus",
-    anchor_select: str = "auto",
+    anchor_select: str = "auto", full_index_diagnostics: bool = False,
 ) -> list[dict]:
     src, tgt = MODELS[src_key], MODELS[tgt_key]
     K = min(K or default_anchor_count(ds.N), ds.N - int((ds.self_rows >= 0).sum()))
@@ -137,7 +144,7 @@ def run_pair(
         bank = {l: [v[i] for i in pick] for l, v in bank.items()}
 
     enc = Encoder(src, device)
-    E_src = enc.docs(ds.titles, ds.texts)
+    E_src = enc.docs_store(ds.titles, ds.texts)
     Q_src = enc.queries(ds.index_lang_queries, ds.task)
     Q_src_direct = enc.queries(ds.queries, ds.task) if "0c" in rows else None
     # Per-language validation (design §5): held-out FLORES devtest pairs, Belebele-filtered (the canonical set) and
@@ -170,13 +177,13 @@ def run_pair(
         train_idx=train_idx,
         val_idx=val_idx,
         distractor_ids=sample_distractors(ds.N, anchor_ids[anchor_ids >= 0], seed=seed),
-        mu_x_doc=E_src.mean(0),
+        mu_x_doc=E_src.mean(device),
         index_size=ds.N,
     )
     enc.unload()
 
     enc = Encoder(tgt, device)
-    E_tgt = enc.docs(ds.titles, ds.texts)
+    E_tgt = enc.docs_store(ds.titles, ds.texts)
     Q_tgt = enc.queries(ds.queries, ds.task)
     # Mount timing re-encodes the anchors uncached (~70 s per run for a 4B model), so it is opt-in.
     mount = None
@@ -212,18 +219,18 @@ def run_pair(
     enc.unload()
 
     search_k = max([SEARCH_K] + [RERANK_DEPTH[r] for r in rows if r in RERANK_DEPTH])
-    native_ranked = search(Q_src, E_src, search_k, device, exclude=ds.self_rows)
-    oracle_ranked = search(Q_tgt, E_tgt, search_k, device, exclude=ds.self_rows)
+    native_ranked = cached_search(Q_src, E_src, search_k, device, exclude=ds.self_rows)
+    oracle_ranked = cached_search(Q_tgt, E_tgt, search_k, device, exclude=ds.self_rows)
     native_pq, oracle_pq = per_query(native_ranked, ds.qrels), per_query(oracle_ranked, ds.qrels)
     anchor_Y = {"src_query": bundle.X_query_raw, "tgt_query": Y_query, "tgt_doc": None if static else E_tgt[anchor_ids]}
     # Rows that run the default engine (doc<->doc pairs on); the identity row pairs source docs with themselves.
     Y_doc = Y_doc_pairs if doc_pair_tokens else anchor_Y["tgt_doc"]
     doc_rows = {"1": bundle.X_doc_raw, "8b": Y_doc, "7b": Y_doc}
     X_distractor = E_src[bundle.distractor_ids]
-    # Diagnostic: rho_val over the whole index. The engine's pool holds the anchors + <= 50K distractors, so on a
-    # larger index it cannot see the extra crowding (msmarco-1m, trec-covid); this scores the same validation proxies
-    # against the teacher's top 10 over all N rows.
-    val_teacher_full = search(bundle.X_query_raw[bundle.val_idx], E_src, VAL_K, device)
+    # Diagnostic (opt-in, 2 of a cell's searches): rho_val over the whole index. The engine's pool holds the anchors
+    # + <= 50K distractors, so on a larger index it cannot see the extra crowding (msmarco-1m, trec-covid); this scores
+    # the same validation proxies against the teacher's top 10 over all N rows.
+    val_teacher_full = search(bundle.X_query_raw[bundle.val_idx], E_src, VAL_K, device) if full_index_diagnostics else None
 
     global _warm
     if not _warm:  # one untimed fit, so the first row's timing excludes CUDA / cuSOLVER warmup
@@ -256,14 +263,15 @@ def run_pair(
                     for tag, v in lang_val.items()
                 }
             ranked = search(bridge.transform_query(Q, query_lang=lang), E_src, search_k, device, exclude=ds.self_rows)
-            student = search(bridge.transform_query(anchor_Y[y_kind][bundle.val_idx]), E_src, VAL_K, device)
-            fit["rho_val_full"] = float(np.mean([len(set(a) & set(b)) / VAL_K for a, b in zip(student, val_teacher_full)]))
-            own = bundle.anchor_ids[bundle.val_idx]  # each validation proxy's own anchor doc (-1 for a static bank)
-            if (own >= 0).all():  # exploratory: does the student find the proxy's own doc as often as the teacher does?
-                fit["owndoc_full"] = {
-                    f"{who}_r{k}": float(np.mean((top[:, :k] == own[:, None]).any(1)))
-                    for who, top in (("student", student), ("teacher", val_teacher_full)) for k in (1, 10)
-                }
+            if full_index_diagnostics:
+                student = search(bridge.transform_query(anchor_Y[y_kind][bundle.val_idx]), E_src, VAL_K, device)
+                fit["rho_val_full"] = float(np.mean([len(set(a) & set(b)) / VAL_K for a, b in zip(student, val_teacher_full)]))
+                own = bundle.anchor_ids[bundle.val_idx]  # each validation proxy's own anchor doc (-1 for a static bank)
+                if (own >= 0).all():  # exploratory: does the student find the proxy's own doc as often as the teacher does?
+                    fit["owndoc_full"] = {
+                        f"{who}_r{k}": float(np.mean((top[:, :k] == own[:, None]).any(1)))
+                        for who, top in (("student", student), ("teacher", val_teacher_full)) for k in (1, 10)
+                    }
             latency = _projection_latency_us(bridge, Q[0]) if time_mount else None
             bridged[row] = (ranked, fit, latency, bridge)
         return bridged[row]
@@ -314,7 +322,7 @@ def run_pair(
     rerank_rows = [r for r in rows if r in RERANK_DEPTH]
     if rerank_rows and rerankers:
         ranked8, fit8, _, _ = fit_row(rerank_base)
-        docs = [f"{t}\n{x}" if t else x for t, x in zip(ds.titles, ds.texts)]
+        docs = _DocTexts(ds.titles, ds.texts)
         for rr_key in rerankers:
             rr = Reranker(RERANKERS[rr_key], device)
             for row in rerank_rows:
@@ -335,6 +343,39 @@ def run_pair(
                 records.append(_score_record(rec, pqs["bridge"], pqs["native"], pqs["oracle"]))
             rr.unload()
     return records
+
+
+class _DocTexts:
+    """Document text by row, built on demand: only the candidates are ever needed."""
+
+    def __init__(self, titles: list[str], texts: list[str]):
+        self.titles, self.texts = titles, texts
+
+    def __getitem__(self, i: int) -> str:
+        return f"{self.titles[i]}\n{self.texts[i]}" if self.titles[i] else self.texts[i]
+
+
+def _first_queries(ds: RetrievalDataset, n: int) -> RetrievalDataset:
+    """The dataset with its first ``n`` queries, for screening grids (CI about 2x wider at 500 of 2,000 queries)."""
+    return replace(
+        ds, queries=ds.queries[:n], qrels=ds.qrels[:n], self_rows=ds.self_rows[:n],
+        src_queries=None if ds.src_queries is None else ds.src_queries[:n],
+    )
+
+
+def finished_cells(path: Path) -> set[str]:
+    """Cells (seed, pair, K) fully recorded in a results file. A crash can tear the last line or leave a cell's records
+    incomplete; those are removed from the file, so the rerun repeats that cell and nothing else."""
+    if not path.exists():
+        return set()
+    records, clean = durable.read_jsonl(path)
+    counts = Counter(r["cell"] for r in records if "cell" in r)
+    done = {r["cell"] for r in records if "cell" in r and counts[r["cell"]] == r["cell_records"]}
+    kept = [r for r in records if "cell" not in r or r["cell"] in done]
+    if not clean or len(kept) != len(records):
+        with durable.atomic_file(path) as f:
+            f.write("".join(json.dumps(r, default=_json_default) + "\n" for r in kept).encode())
+    return done
 
 
 def _score_record(rec: dict, pq: dict, native_pq: dict, oracle_pq: dict) -> dict:
@@ -486,6 +527,12 @@ def main() -> None:
                    help="calibration anchors: corpus medoids, or the static FLORES dev + devtest bank (Tier 5b, Regime L2)")
     p.add_argument("--anchor-select", default="auto", choices=("auto", "kmeans", "random"),
                    help="how corpus anchors are chosen (auto: spacebridge.resolve_anchor_method)")
+    p.add_argument("--full-index-diagnostics", action="store_true",
+                   help="also score the validation proxies over the whole index (rho_val_full, owndoc_full; two extra searches per fit)")
+    p.add_argument("--max-queries", type=int, default=None,
+                   help="evaluate on the first N queries only: for screening grids, confirm winners on all queries")
+    p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
+                   help="skip cells already complete in --out, so rerunning a crashed command continues it (default: on)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", type=Path, default=Path("outputs/results.jsonl"))
     args = p.parse_args()
@@ -499,14 +546,24 @@ def main() -> None:
                 p.error(f"unknown model {key!r}; choose from {sorted(MODELS)}")
 
     ds = load_beir(args.dataset)
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    for seed, (src, tgt), K in ((s, pr, K) for s in args.seed for pr in pairs for K in args.K):
+    if args.max_queries is not None:
+        ds = _first_queries(ds, args.max_queries)
+    done = finished_cells(args.out) if args.resume else set()
+    cells = [(s, pr, K) for s in args.seed for pr in pairs for K in args.K]
+    for n, (seed, (src, tgt), K) in enumerate(cells, 1):
+        cell = f"{ds.name}|{src}|{tgt}|K{K}|s{seed}"
+        if cell in done:
+            durable.progress(f"cell {n}/{len(cells)} {cell}: already recorded, skipped")
+            continue
+        t0 = time.perf_counter()
+        durable.progress(f"cell {n}/{len(cells)} {cell}: start")
         records = run_pair(ds, src, tgt, K, seed, args.rows, args.device, tuple(args.rerankers), args.proxy, args.stage2_batch,
                            args.doc_pair_tokens, args.time_mount, args.stage2_tau_scale, args.stage2_curves, args.stage2_rule,
-                           args.shift_bank, args.anchor_bank, args.anchor_select)
-        with args.out.open("a") as f:
-            for rec in records:
-                f.write(json.dumps(rec, default=_json_default) + "\n")
+                           args.shift_bank, args.anchor_bank, args.anchor_select, args.full_index_diagnostics)
+        durable.append_lines(args.out, [
+            json.dumps({**rec, "cell": cell, "cell_records": len(records)}, default=_json_default) for rec in records
+        ])
+        durable.progress(f"cell {n}/{len(cells)} {cell}: done in {time.perf_counter() - t0:.0f} s")
         print_table(records)
 
 

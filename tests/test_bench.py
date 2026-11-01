@@ -1,4 +1,7 @@
+import json
+
 import numpy as np
+import pytest
 
 from spacebridge_bench.datasets import _positive_preserving_subsample, self_match_rows
 from spacebridge_bench.rerank import rerank, topk_jaccard
@@ -72,8 +75,6 @@ def test_query_subsample_keeps_whole_queries():
 
 
 def test_flores_filter_drops_belebele_and_cross_split_sentences(tmp_path, monkeypatch):
-    import json
-
     import huggingface_hub
 
     from spacebridge_bench import datasets
@@ -101,3 +102,255 @@ def test_flores_filter_drops_belebele_and_cross_split_sentences(tmp_path, monkey
     unfiltered = datasets.load_flores("zh", belebele_filter=False)
     assert unfiltered["dev"]["en"] == ["A cat sat.", "Kept dev one."]  # cross-split duplicates still go
     assert datasets.load_flores("zh") == out  # cached
+
+
+class _FakeModel:
+    """Stands in for a SentenceTransformer: a text's tokens are its words, its embedding depends only on the text."""
+
+    max_seq_length = 512
+
+    def __init__(self, dim=8, fail_after=None, oom_above=None):
+        self.dim, self.fail_after, self.oom_above = dim, fail_after, oom_above
+        self.encoded, self.batch_tokens = [], []
+
+    def tokenizer(self, texts, truncation=True, max_length=512):
+        return {"input_ids": [t.split()[:max_length] for t in texts]}
+
+    def preprocess(self, texts, prompt):
+        assert prompt == ""
+        return {"texts": texts}
+
+    def __call__(self, features):
+        import torch
+
+        texts = features["texts"]
+        tokens = max(len(t.split()) for t in texts) * len(texts)
+        if self.oom_above is not None and tokens > self.oom_above:
+            raise torch.cuda.OutOfMemoryError("fake")
+        if self.fail_after is not None and len(self.encoded) >= self.fail_after:
+            raise KeyboardInterrupt
+        self.encoded.extend(texts)
+        self.batch_tokens.append(tokens)
+        return {"sentence_embedding": torch.stack([_fake_vector(t, self.dim) for t in texts])}
+
+
+def _fake_vector(text, dim=8):
+    import zlib
+
+    import torch
+
+    gen = torch.Generator().manual_seed(zlib.crc32(text.encode()))
+    return torch.randn(dim, generator=gen)
+
+
+def _fake_encoder(tmp_path, model):
+    from spacebridge_bench.encode import Encoder
+    from spacebridge_bench.models import MODELS
+
+    enc = Encoder(MODELS["bge-base-en"], "cpu", cache_dir=tmp_path)
+    enc._model = model
+    return enc
+
+
+def _fake_texts(n=200, seed=0):
+    rng = np.random.default_rng(seed)
+    return [" ".join(f"w{i}" for _ in range(rng.integers(1, 40))) + f" doc{i}" for i in range(n)]
+
+
+def _expected(texts):
+    import torch
+
+    v = torch.stack([_fake_vector(t) for t in texts])
+    return torch.nn.functional.normalize(v, dim=-1).half().float().numpy()
+
+
+def _unit(a):
+    return a / np.linalg.norm(a, axis=-1, keepdims=True)
+
+
+def test_token_sorted_encoding_keeps_input_order_and_budget(tmp_path):
+    from spacebridge_bench import encode
+
+    texts, model = _fake_texts(), _FakeModel()
+    out = _fake_encoder(tmp_path, model).encode(texts)
+    np.testing.assert_allclose(out, _unit(_expected(texts)), atol=1e-6)
+    assert max(model.batch_tokens) <= encode.CPU_BATCH_TOKENS
+    assert sorted(model.encoded) == sorted(texts)  # each text once
+
+
+def test_encoding_continues_from_saved_parts_after_a_crash(tmp_path, monkeypatch):
+    from spacebridge_bench import encode
+
+    monkeypatch.setattr(encode, "PART_ROWS", 16)
+    monkeypatch.setattr(encode, "CPU_BATCH_TOKENS", 200)
+    texts = _fake_texts()
+    crashed = _FakeModel(fail_after=100)
+    with pytest.raises(KeyboardInterrupt):
+        _fake_encoder(tmp_path, crashed).encode(texts)
+    enc = _fake_encoder(tmp_path, _FakeModel())
+    path = enc.cache_dir / f"{enc._key(texts)}.npy"
+    parts = path.with_suffix(".parts")
+    assert not path.exists() and encode._finished_parts(parts)  # no complete-looking file, but saved work
+    saved = encode._finished_parts(parts)[-1][2]
+    out = enc.encode(texts)
+    assert len(enc._model.encoded) == len(texts) - saved  # only the rest was encoded
+    assert path.exists() and not parts.exists()
+    np.testing.assert_allclose(out, _unit(_expected(texts)), atol=1e-6)
+
+
+def test_out_of_memory_halves_the_token_budget(tmp_path, monkeypatch):
+    from spacebridge_bench import encode
+
+    monkeypatch.setattr(encode, "CPU_BATCH_TOKENS", 1_000)
+    texts, model = _fake_texts(), _FakeModel(oom_above=300)
+    out = _fake_encoder(tmp_path, model).encode(texts)
+    assert max(model.batch_tokens) <= 300
+    np.testing.assert_allclose(out, _unit(_expected(texts)), atol=1e-6)
+
+
+def test_store_reads_what_encode_returns(tmp_path):
+    from spacebridge_bench.store import EmbeddingStore
+
+    titles, texts = [""] * 200, _fake_texts()
+    enc = _fake_encoder(tmp_path, _FakeModel())
+    E = enc.docs(titles, texts)
+    store = enc.docs_store(titles, texts)
+    assert store.shape == E.shape and len(store) == len(E)
+    rows = np.array([5, 1, 150])
+    np.testing.assert_allclose(store[rows], E[rows], atol=1e-6)
+    np.testing.assert_allclose(store.mean("cpu"), E.mean(0), atol=1e-5)
+    short = EmbeddingStore(store.path, truncate_dim=4)
+    assert short.shape == (200, 4)
+    np.testing.assert_allclose(short[rows], _unit(E[rows][:, :4]), atol=1e-5)
+
+
+def _store_of(tmp_path, E):
+    from spacebridge_bench.store import EmbeddingStore
+
+    np.save(tmp_path / "index.npy", E.astype(np.float16))
+    return EmbeddingStore(tmp_path / "index.npy")
+
+
+def test_streamed_search_matches_search_in_one_piece(tmp_path, monkeypatch):
+    from spacebridge_bench import store
+
+    rng = np.random.default_rng(0)
+    E, Q = _unit(rng.standard_normal((1_000, 16))), _unit(rng.standard_normal((20, 16))).astype(np.float32)
+    s = _store_of(tmp_path, E)
+    whole = search(Q, s[np.arange(1_000)], 50, "cpu", exclude=np.arange(20))
+    monkeypatch.setattr(store, "CPU_SHARD_ROWS", 170)
+    assert len(list(s.shards("cpu"))) == 6
+    assert search(Q, s, 50, "cpu", exclude=np.arange(20)).tolist() == whole.tolist()
+
+
+def test_nested_search_gives_each_prefix_its_own_top_k(tmp_path, monkeypatch):
+    from spacebridge_bench import store
+    from spacebridge_bench.search import search_nested
+
+    rng = np.random.default_rng(1)
+    E, Q = _unit(rng.standard_normal((1_000, 16))), _unit(rng.standard_normal((20, 16))).astype(np.float32)
+    s = _store_of(tmp_path, E)
+    monkeypatch.setattr(store, "CPU_SHARD_ROWS", 170)
+    out = search_nested(Q, s, [100, 350, 1_000], k=30, device="cpu")
+    assert set(out) == {100, 350, 1_000}
+    for size, ranked in out.items():
+        assert ranked.tolist() == search(Q, s[np.arange(size)], 30, "cpu").tolist()
+
+
+def test_cached_search_reuses_the_ranking_at_any_depth(tmp_path, monkeypatch):
+    from spacebridge_bench import search as search_module
+    from spacebridge_bench.search import cached_search
+
+    rng = np.random.default_rng(2)
+    E, Q = _unit(rng.standard_normal((300, 16))), _unit(rng.standard_normal((5, 16))).astype(np.float32)
+    s = _store_of(tmp_path, E)
+    first = cached_search(Q, s, 30, "cpu", cache_dir=tmp_path / "r")
+    assert first.tolist() == search(Q, s, 30, "cpu").tolist()
+    monkeypatch.setattr(search_module, "search", lambda *a, **k: pytest.fail("should come from the cache"))
+    assert cached_search(Q, s, 10, "cpu", cache_dir=tmp_path / "r").tolist() == first[:, :10].tolist()
+
+
+class _FakeCrossEncoder:
+    """Scores a pair by the doc's trailing integer."""
+
+    def __init__(self):
+        self.seen = []
+
+    def tokenizer(self, queries, docs, truncation=True, max_length=512):
+        return {"input_ids": [(q + " " + d).split() for q, d in zip(queries, docs)]}
+
+    def predict(self, pairs, batch_size, convert_to_numpy, show_progress_bar):
+        self.seen.extend(pairs)
+        return np.array([float(d.split()[-1]) for _, d in pairs])
+
+
+def _fake_reranker(tmp_path, model):
+    from spacebridge_bench.rerank import RERANKERS, Reranker
+
+    rr = Reranker(RERANKERS["bge-reranker-v2-m3"], "cpu", cache_dir=tmp_path)
+    rr._model = model
+    return rr
+
+
+def test_rerank_scores_survive_a_crash_and_ignore_a_torn_record(tmp_path):
+    from spacebridge_bench import rerank as rerank_module
+    from spacebridge_bench.rerank import _pair_key
+
+    docs = [f"doc {i}" for i in range(50)]
+    first = _fake_reranker(tmp_path, _FakeCrossEncoder())
+    # An older .npz cache stays readable.
+    np.savez(first.cache_path, keys=np.array([_pair_key("", "q", "doc 0")], dtype=np.uint64), scores=np.array([123.0], dtype=np.float32))
+    scores = first.score(["q"] * 50, docs, "")
+    assert scores[0] == 123.0 and scores[7] == 7.0 and len(first.model.seen) == 49
+    log = next(tmp_path.glob("*.scores"))
+    with log.open("ab") as f:
+        f.write(b"torn")  # a power loss in the middle of a record
+    rerank_module._CACHES.clear()  # a new process
+    after = _fake_reranker(tmp_path, _FakeCrossEncoder())
+    assert after.score(["q"] * 50, docs, "").tolist() == scores.tolist()
+    assert after.model.seen == []  # nothing rescored
+
+
+def test_finished_cells_drops_a_torn_line_and_an_incomplete_cell(tmp_path):
+    from spacebridge_bench.run import finished_cells
+
+    path = tmp_path / "results.jsonl"
+    lines = [
+        {"cell": "a", "cell_records": 2, "row": "0a"}, {"cell": "a", "cell_records": 2, "row": "8b"},
+        {"cell": "b", "cell_records": 2, "row": "0a"},
+        {"row": "old format, kept"},
+    ]
+    path.write_text("".join(json.dumps(r) + "\n" for r in lines) + '{"cell": "c", "cell_rec')
+    assert finished_cells(path) == {"a"}
+    kept = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [r.get("cell") for r in kept] == ["a", "a", None]
+    assert finished_cells(tmp_path / "missing.jsonl") == set()
+
+
+def test_atomic_file_keeps_the_old_file_when_a_write_fails(tmp_path):
+    from spacebridge_bench import durable
+
+    path = tmp_path / "a.npy"
+    durable.save_npy(path, np.arange(3))
+    with pytest.raises(RuntimeError):
+        with durable.atomic_file(path) as f:
+            f.write(b"partial")
+            raise RuntimeError
+    assert np.load(path).tolist() == [0, 1, 2] and [p.name for p in tmp_path.iterdir()] == ["a.npy"]
+
+
+def test_recall_at_rerank_depth_only_when_the_ranking_reaches_it():
+    from spacebridge_bench.metrics import per_query
+
+    deep = per_query(np.arange(1_000)[None, :], [{500: 1}])
+    assert deep["recall@300"][0] == 0.0 and deep["recall@1000"][0] == 1.0
+    shallow = per_query(np.arange(100)[None, :], [{50: 1}])
+    assert "recall@300" not in shallow and shallow["recall@100"][0] == 1.0
+
+
+def test_progress_lines_reach_the_file(tmp_path, monkeypatch):
+    from spacebridge_bench import durable
+
+    monkeypatch.setenv(durable.PROGRESS_ENV, str(tmp_path / "progress.log"))
+    durable.progress("cell 1/3: start")
+    assert (tmp_path / "progress.log").read_text().endswith("cell 1/3: start\n")

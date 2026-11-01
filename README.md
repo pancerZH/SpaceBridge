@@ -19,6 +19,11 @@ uv run pytest      # synthetic-data tests, no downloads or GPU required
 - `src/spacebridge/`: alignment engine (anchor selection, solvers, refinement, `SpaceBridge`).
 - `src/spacebridge_bench/`: benchmark harness (model registry, cached encoding, datasets, metrics, runner).
 - `tests/`: unit tests on synthetic data.
+- `scripts/`: studies, summary tables, and `steps.sh` for restartable experiment drivers.
 
 Datasets and embeddings are downloaded at runtime and cached under `data/` (git-ignored);
 no dataset text is committed to this repository.
+
+## Long runs
+
+Encoding, reranker scores and benchmark results are saved as they are produced, so a crash or power loss costs at most a few minutes of work: rerun the same command and it continues from what is on disk. `scripts/steps.sh` gives drivers restartable steps and a synced progress log.

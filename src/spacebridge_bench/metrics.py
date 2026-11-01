@@ -3,6 +3,7 @@
 import numpy as np
 
 RECALL_KS = (5, 10, 30, 100)
+DEEP_RECALL_KS = (300, 1000)  # recall at rerank depth, for rankings that reach it
 
 
 def evaluate(ranked: np.ndarray, qrels: list[dict[int, int]]) -> dict[str, float]:
@@ -12,11 +13,12 @@ def evaluate(ranked: np.ndarray, qrels: list[dict[int, int]]) -> dict[str, float
 
 def per_query(ranked: np.ndarray, qrels: list[dict[int, int]]) -> dict[str, np.ndarray]:
     """The metrics of ``evaluate`` for each query separately (for paired bootstrap intervals)."""
-    out: dict[str, list[float]] = {f"recall@{k}": [] for k in RECALL_KS}
+    recall_ks = RECALL_KS + tuple(k for k in DEEP_RECALL_KS if ranked.shape[1] >= k)
+    out: dict[str, list[float]] = {f"recall@{k}": [] for k in recall_ks}
     out.update({"mrr@10": [], "ndcg@5": [], "ndcg@10": []})
     for row, rel in zip(ranked, qrels):
         positives = {d for d, g in rel.items() if g > 0}
-        for k in RECALL_KS:
+        for k in recall_ks:
             out[f"recall@{k}"].append(len(positives.intersection(row[:k].tolist())) / len(positives))
         first = next((i for i, d in enumerate(row[:10]) if d in positives), None)
         out["mrr@10"].append(0.0 if first is None else 1.0 / (first + 1))
