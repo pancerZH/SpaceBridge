@@ -7,6 +7,8 @@ from typing import Optional
 
 import numpy as np
 
+from .anchors import LARGE_INDEX_DOCS
+
 CALIBRATION_PATH = Path(__file__).with_name("quality_calibration.json")
 GRADES = ((95.0, "A"), (85.0, "B"), (70.0, "C"))
 # Advisory routing (M2): the score's ±4.3-point transfer error is about half a grade and it over-predicts
@@ -19,6 +21,9 @@ RERANK_POOL_BY_GRADE = {"A": 60, "B": 60, "C": 100, "D": 100}
 # flagged when Stage 2 kept step 0 while the floor rejected at least this share of its checkpoints, or when the
 # compressed-score temperature rule fired (teacher score s.d. < 0.04: an index regime the calibration never saw).
 STAGE2_BLOCKED_SHARE = 0.5
+# The score's calibration stops at 171K docs (trec-covid). A map loses retention as the index grows while rho_val does
+# not fall (MS MARCO, same queries: Tier 3 0.92 at 50K, 0.73 at 1M), so at 1M the score over-predicted by 8-27 points.
+LARGE_INDEX_RERANK_POOL = 300
 # Per-language score (close-out, FLORES): the English score times the counterpart Recall@10 ratio (query language /
 # source language) of held-out FLORES devtest pairs. Chosen on xquad-zh; on 7 held-out sets (MLQA-zh, XQuAD
 # de/es/ru/ar/hi/vi; 168 fits) it predicts real retention with RMSE 5.1 points (English score: 8.7, biased +8.0),
@@ -75,6 +80,18 @@ def language_score(report: QualityReport, lang: str, recall_lang: float, recall_
     report.by_language[lang] = {"score": score, "band": (score - sd, score + sd), "grade": g, "rerank_pool": pool,
                                 "experimental": True}
     return report.by_language[lang]
+
+
+def index_size_check(report: QualityReport, index_size: int) -> QualityReport:
+    """Warns when the index is larger than any the score was calibrated on, and widens the rerank pool."""
+    report.details["coverage"]["index_size"] = float(index_size)
+    if index_size > LARGE_INDEX_DOCS:
+        report.notes.append(
+            f"index of {index_size:,} documents is above the score's calibrated range (up to ~171K documents); "
+            "the score likely over-predicts retention"
+        )
+        report.rerank_pool = max(report.rerank_pool, LARGE_INDEX_RERANK_POOL)
+    return report
 
 
 def grade(score: float) -> str:

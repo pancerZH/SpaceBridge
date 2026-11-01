@@ -14,6 +14,27 @@ def test_select_anchors_returns_distinct_ids(N, K):
     assert ids.min() >= 0 and ids.max() < N
 
 
+def test_select_anchors_random_is_a_seeded_uniform_sample():
+    E = np.random.default_rng(0).standard_normal((6000, 8))
+    ids = select_anchors(E, 64, seed=1, method="random")
+    assert len(set(ids.tolist())) == 64
+    np.testing.assert_array_equal(ids, select_anchors(E, 64, seed=1, method="random"))
+    assert set(ids.tolist()) != set(select_anchors(E, 64, seed=2, method="random").tolist())
+    with pytest.raises(ValueError):
+        select_anchors(E, 64, method="nope")
+
+
+def test_large_indexes_get_more_anchors_chosen_at_random():
+    from spacebridge import LARGE_INDEX_DOCS, default_anchor_count, resolve_anchor_method
+
+    assert default_anchor_count(1_000) == 1_000
+    assert default_anchor_count(LARGE_INDEX_DOCS) == 2_048
+    assert default_anchor_count(LARGE_INDEX_DOCS + 1) == 8_192
+    assert resolve_anchor_method(LARGE_INDEX_DOCS) == "kmeans"
+    assert resolve_anchor_method(LARGE_INDEX_DOCS + 1) == "random"
+    assert resolve_anchor_method(LARGE_INDEX_DOCS + 1, "kmeans") == "kmeans"
+
+
 def test_select_anchors_rejects_oversized_k():
     with pytest.raises(ValueError):
         select_anchors(np.ones((10, 4)), 11)

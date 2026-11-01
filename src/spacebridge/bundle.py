@@ -22,6 +22,7 @@ class CalibrationBundle:
     val_idx: np.ndarray            # (K_val,)
     distractor_ids: np.ndarray     # (<=50K,) index row ids used for rho_val
     mu_x_doc: Optional[np.ndarray] = None  # (d_s,) diagnostics only; the index is never re-centered
+    index_size: Optional[int] = None       # rows in the index: the quality report warns outside its calibrated range
 
     @property
     def K(self) -> int:
@@ -38,6 +39,7 @@ class CalibrationBundle:
             "src_lang": self.src_lang,
             "anchor_doc_texts": self.anchor_doc_texts,
             "anchor_query_texts": self.anchor_query_texts,
+            "index_size": self.index_size,
         }
         (path / "meta.json").write_text(json.dumps(meta, ensure_ascii=False))
 

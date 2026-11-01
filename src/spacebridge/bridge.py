@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from sklearn.isotonic import IsotonicRegression
 
 from .bundle import CalibrationBundle
-from .quality import QualityReport, language_score, load_calibration, score_report, stage2_health
+from .quality import QualityReport, index_size_check, language_score, load_calibration, score_report, stage2_health
 from .refine import RefineConfig, refine
 from .solvers import LAMBDAS_REL, naive_procrustes, ridge_path, stiefel_procrustes
 
@@ -274,6 +274,8 @@ class SpaceBridge:
             )
             if mode == "auto":
                 stage2_health(self.quality, info["stage2_best_step"], info["stage2_floor_rejected"], info["stage2_tau_scaled"])
+            if bundle.index_size is not None:
+                index_size_check(self.quality, bundle.index_size)
             info["quality"] = self.quality.details
             self._fit_confidence(Y, mu_y, mu_x, W, Xq, pool, tr, va)
         self.status = (

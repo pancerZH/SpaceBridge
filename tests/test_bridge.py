@@ -127,6 +127,20 @@ def test_quality_report_measurements_and_scoring(world):
     assert QualityReport(report.details).rerank_pool == 60  # unscored reports keep the default
 
 
+def test_quality_report_warns_above_its_calibrated_index_size(world):
+    from spacebridge import LARGE_INDEX_DOCS
+    from spacebridge.quality import LARGE_INDEX_RERANK_POOL
+
+    for size, warned in ((LARGE_INDEX_DOCS, False), (LARGE_INDEX_DOCS + 1, True)):
+        bundle = dataclasses.replace(world.bundle, index_size=size)
+        bridge = SpaceBridge(device="cpu")
+        bridge.fit(bundle, world.Y_query, mode="stage1", X_distractor=world.E_src[bundle.distractor_ids])
+        report = bridge.quality_report()
+        assert report.details["coverage"]["index_size"] == size
+        assert any("calibrated range" in n for n in report.notes) is warned
+        assert (report.rerank_pool >= LARGE_INDEX_RERANK_POOL) is warned
+
+
 def test_per_query_confidence_is_bounded_and_lower_off_distribution(world):
     bridge, _ = _fit(world, world.Y_query, mode="stage1")
     q_hat, conf = bridge.transform_query(world.Q_tgt, return_confidence=True)

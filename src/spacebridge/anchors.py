@@ -8,6 +8,12 @@ import numpy as np
 import torch
 
 FPS_THRESHOLD = 5_000
+# Above this index size a fixed query error costs clearly more rank (MS MARCO, same map, Tier 3: 0.85 at 200K, 0.79 at
+# 500K, 0.73 at 1M), so large indexes get more anchors, and random ones: k-means over 1M docs did worse than a random
+# sample (-1.5 points Recall@30, 48/54 cells) while k-means wins on smaller sets (trec-covid, 171K: +1.3).
+LARGE_INDEX_DOCS = 200_000
+DEFAULT_ANCHORS = 2_048
+LARGE_INDEX_ANCHORS = 8_192
 MAX_DISTRACTORS = 50_000
 
 # One token per CJK character, word, or punctuation mark: a tokenizer-free length proxy.
@@ -19,13 +25,31 @@ def _l2(a: np.ndarray) -> np.ndarray:
     return a / (np.linalg.norm(a, axis=-1, keepdims=True) + 1e-12)
 
 
-def select_anchors(E: np.ndarray, K: int, seed: int = 0, device: str = "cuda") -> np.ndarray:
-    """Returns K distinct row ids of E: k-means medoids when N >= 5,000, farthest-point sampling below."""
+def default_anchor_count(N: int) -> int:
+    """The anchor budget K for an index of N documents (design §4.1)."""
+    return min(LARGE_INDEX_ANCHORS if N > LARGE_INDEX_DOCS else DEFAULT_ANCHORS, N)
+
+
+def resolve_anchor_method(N: int, method: str = "auto") -> str:
+    """``auto``: ``random`` above ``LARGE_INDEX_DOCS``, else ``kmeans``."""
+    if method == "auto":
+        return "random" if N > LARGE_INDEX_DOCS else "kmeans"
+    return method
+
+
+def select_anchors(E: np.ndarray, K: int, seed: int = 0, device: str = "cuda", method: str = "auto") -> np.ndarray:
+    """Returns K distinct row ids of E. ``kmeans``: k-means medoids when N >= 5,000, farthest-point sampling
+    below. ``random``: a uniform sample. ``auto``: :func:`resolve_anchor_method`."""
     N = E.shape[0]
     if not 0 < K <= N:
         raise ValueError(f"K={K} must be in [1, N={N}]")
     if K == N:
         return np.arange(N)
+    method = resolve_anchor_method(N, method)
+    if method == "random":
+        return np.sort(np.random.default_rng(seed).choice(N, K, replace=False))
+    if method != "kmeans":
+        raise ValueError(f"unknown anchor selection {method!r}")
     E = _l2(np.asarray(E, dtype=np.float32))
     if N < FPS_THRESHOLD:
         return _farthest_point(E, K, seed)
