@@ -1,0 +1,112 @@
+"""Token-budgeted batching and the ``sentence-transformers`` encoder adapter (optional dependency)."""
+
+from typing import Callable, Optional
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+TOKENIZE_CHUNK = 100_000  # bulk tokenizing keeps only lengths; 8.8M token lists would not fit in RAM
+CPU_BATCH_TOKENS = 1_024  # smaller is faster on this CPU: 10.0 s vs. 17.4 s to rerank 60 pairs at 16,384
+GPU_BATCH_TOKENS = 20_000
+SIZE_CLASS_LARGE_PARAMS = 2e9  # ~4B models and above: the doc-pair pass costs far more than it gains (M3)
+
+
+def token_lengths(tokenizer, *texts: list[str], max_length: int) -> np.ndarray:
+    """Tokens per input, truncated as encoding will; ``texts`` is one list, or two parallel lists for pairs."""
+    out = np.empty(len(texts[0]), dtype=np.int32)
+    for s in range(0, len(out), TOKENIZE_CHUNK):
+        ids = tokenizer(*(t[s : s + TOKENIZE_CHUNK] for t in texts), truncation=True, max_length=max_length)["input_ids"]
+        out[s : s + TOKENIZE_CHUNK] = [len(x) for x in ids]
+    return out
+
+
+def run_token_batches(
+    lengths: np.ndarray, order: np.ndarray, budget: int, handle: Callable[[np.ndarray], None], start: int = 0,
+) -> None:
+    """Calls ``handle`` on batches of ``order[start:]`` holding at most ``budget`` tokens once padded.
+
+    ``order`` is longest first, so batches have under 3% padding. Sorting by characters with a fixed batch size wastes
+    31-37% of the GPU on padding, and larger fixed batches are slower. Out of memory halves the budget and retries.
+    """
+    pos = start
+    while pos < len(order):
+        batch = order[pos : pos + max(1, budget // max(int(lengths[order[pos]]), 1))]
+        try:
+            handle(batch)
+        except torch.cuda.OutOfMemoryError:
+            if len(batch) == 1:
+                raise
+            budget //= 2
+            torch.cuda.empty_cache()
+            continue
+        pos += len(batch)
+
+
+def longest_first(lengths: np.ndarray) -> np.ndarray:
+    return np.argsort(-lengths, kind="stable")
+
+
+def default_dtype(device: str) -> torch.dtype:
+    """bf16 is as fast as fp16 on Blackwell but 2-4x slower than fp32 on a CPU without bf16 instructions."""
+    return torch.bfloat16 if device.startswith("cuda") else torch.float32
+
+
+class SentenceTransformerEncoder:
+    """A ``spacebridge.mount.QueryEncoder`` over a ``sentence-transformers`` model.
+
+    Templates hold the model's native prompts, for example ``query_template="query: {text}"``; ``doc_template`` may use
+    ``{body}`` (``title\\ntext``), ``{title_or_none}`` and ``{text}``.
+    """
+
+    def __init__(
+        self, model: str, query_template: str = "{text}", doc_template: str = "{body}", device: str = "cuda",
+        batch_tokens: Optional[int] = None, max_seq_length: Optional[int] = None, **model_kwargs,
+    ):
+        from sentence_transformers import SentenceTransformer
+
+        self.device = device if torch.cuda.is_available() else "cpu"
+        self.query_template, self.doc_template = query_template, doc_template
+        self.batch_tokens = batch_tokens or (GPU_BATCH_TOKENS if self.device.startswith("cuda") else CPU_BATCH_TOKENS)
+        self.model = SentenceTransformer(
+            model, device=self.device, model_kwargs={"torch_dtype": default_dtype(self.device)}, **model_kwargs,
+        )
+        if max_seq_length is not None:
+            self.model.max_seq_length = max_seq_length
+        self.model.eval()
+        params = sum(p.numel() for p in self.model.parameters())
+        self.size_class = "large" if params >= SIZE_CLASS_LARGE_PARAMS else "small"
+
+    def encode_queries(self, texts: list[str]) -> np.ndarray:
+        return self._encode([self.query_template.format(text=t) for t in texts], self.model.max_seq_length)
+
+    def encode_docs(self, titles: list[str], texts: list[str], max_tokens: Optional[int] = None) -> np.ndarray:
+        inputs = [
+            self.doc_template.format(body=f"{title}\n{text}" if title else text, title_or_none=title or "none", text=text)
+            for title, text in zip(titles, texts)
+        ]
+        limit = self.model.max_seq_length
+        return self._encode(inputs, limit if max_tokens is None else min(max_tokens, limit))
+
+    def _encode(self, inputs: list[str], max_length: int) -> np.ndarray:
+        saved, self.model.max_seq_length = self.model.max_seq_length, max_length
+        try:
+            lengths = token_lengths(self.model.tokenizer, inputs, max_length=max_length)
+            out: Optional[np.ndarray] = None
+
+            def handle(batch: np.ndarray) -> None:
+                nonlocal out
+                features = self.model.preprocess([inputs[i] for i in batch], prompt="")
+                features = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in features.items()}
+                with torch.inference_mode():
+                    emb = self.model(features)["sentence_embedding"]
+                # In fp32: bf16 normalization is up to 0.4% off unit length.
+                emb = F.normalize(emb.float(), dim=-1).cpu().numpy()
+                if out is None:
+                    out = np.empty((len(inputs), emb.shape[1]), dtype=np.float32)
+                out[batch] = emb
+
+            run_token_batches(lengths, longest_first(lengths), self.batch_tokens, handle)
+            return out
+        finally:
+            self.model.max_seq_length = saved

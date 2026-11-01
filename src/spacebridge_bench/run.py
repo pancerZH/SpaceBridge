@@ -16,13 +16,13 @@ from typing import Optional
 import numpy as np
 
 from spacebridge import (
-    DOC_PAIR_TOKENS, CalibrationBundle, RefineConfig, SpaceBridge, extract_query_proxy, make_query_proxies, make_split, random_anchors,
-    sample_distractors, default_anchor_count, resolve_anchor_method, select_anchors,
+    DOC_PAIR_TOKENS, Index, RefineConfig, SpaceBridge, extract_query_proxy, freeze, make_query_proxies, mount, random_anchors,
+    default_anchor_count, resolve_anchor_method, select_anchors,
 )
 
 from . import durable
 from .datasets import DATASETS, FLORES_SPLITS, SHIFT_BANKS, RetrievalDataset, flores_available, load_beir, load_flores, load_shift_bank
-from .encode import Encoder
+from .encode import Encoder, MountEncoder
 from .metrics import bootstrap_ratio_ci, per_query, retention
 from .models import MODELS
 from .rerank import RERANKERS, Reranker, rerank, topk_jaccard
@@ -136,15 +136,13 @@ def run_pair(
     src, tgt = MODELS[src_key], MODELS[tgt_key]
     K = min(K or default_anchor_count(ds.N), ds.N - int((ds.self_rows >= 0).sum()))
     static = anchor_bank != "corpus"
+    parallel_bank = None
     if static:  # Regime L2 (design §4.4): FLORES dev + devtest pairs replace corpus anchors; none is an index row
         fl = load_flores(ds.lang if ds.lang != "en" else ds.query_lang, belebele_filter=anchor_bank == "flores")
-        bank = {l: [t for sp in FLORES_SPLITS for t in fl[sp][l]] for l in (ds.lang, ds.query_lang)}
-        K = min(K, len(bank[ds.lang]))
-        pick = np.sort(np.random.default_rng(seed).permutation(len(bank[ds.lang]))[:K])
-        bank = {l: [v[i] for i in pick] for l, v in bank.items()}
+        parallel_bank = tuple([t for sp in FLORES_SPLITS for t in fl[sp][l]] for l in (ds.lang, ds.query_lang))
 
     enc = Encoder(src, device)
-    E_src = enc.docs_store(ds.titles, ds.texts)
+    E_src = enc.docs_store(ds.titles, ds.texts).prefix(ds.N)
     Q_src = enc.queries(ds.index_lang_queries, ds.task)
     Q_src_direct = enc.queries(ds.queries, ds.task) if "0c" in rows else None
     # Per-language validation (design §5): held-out FLORES devtest pairs, Belebele-filtered (the canonical set) and
@@ -156,77 +154,57 @@ def run_pair(
             dt = load_flores(ds.query_lang, belebele_filter=filt)["devtest"]
             lang_val[tag] = {"en": dt["en"], "lang": dt[ds.query_lang],
                              "X_query": enc.queries(dt["en"], ds.task), "X_doc": enc.docs([""] * len(dt["en"]), dt["en"])}
+    enc.unload()
     # Split hygiene (design §7.1 rule 3): corpus rows that are test queries (ArguAna) never become anchors.
     allowed = np.setdiff1d(np.arange(ds.N), ds.self_rows)
-    if static:  # sentences serve as both the source proxies and the anchor docs; the target encodes the parallel side
-        anchor_ids = np.full(K, -1, dtype=np.int64)
-        proxies, tgt_proxies = bank[ds.lang], bank[ds.query_lang]
-        X_doc_anchor = enc.docs([""] * K, proxies)
-    else:
-        anchor_ids = cached_anchors(ds, src_key, E_src, allowed, K, seed, anchor_select)
-        proxies = make_proxies([ds.titles[i] for i in anchor_ids], [ds.texts[i] for i in anchor_ids], proxy)
-        tgt_proxies, X_doc_anchor = proxies, E_src[anchor_ids]
-    train_idx, val_idx = make_split(K, seed=seed)
-    bundle = CalibrationBundle(
-        src_lang=ds.lang,
-        anchor_ids=anchor_ids,
-        anchor_doc_texts=proxies if static else [ds.texts[i] for i in anchor_ids],
-        anchor_query_texts=proxies,
-        X_doc_raw=X_doc_anchor,
-        X_query_raw=enc.queries(proxies, ds.task),
-        train_idx=train_idx,
-        val_idx=val_idx,
-        distractor_ids=sample_distractors(ds.N, anchor_ids[anchor_ids >= 0], seed=seed),
-        mu_x_doc=E_src.mean(device),
-        index_size=ds.N,
+    index = Index(E_src, ds.texts, ds.titles)
+    bundle = freeze(
+        index, MountEncoder(src, ds.task, device), ds.lang, seed, K,
+        anchor_ids=None if static else cached_anchors(ds, src_key, E_src, allowed, K, seed, anchor_select),
+        make_proxies=lambda titles, texts: make_proxies(titles, texts, proxy), parallel_bank=parallel_bank, device=device,
     )
-    enc.unload()
+    K = bundle.K
+    anchor_ids, proxies = bundle.anchor_ids, bundle.anchor_query_texts
+    tgt_proxies = bundle.tgt_anchor_texts if static else proxies
 
     enc = Encoder(tgt, device)
-    E_tgt = enc.docs_store(ds.titles, ds.texts)
+    E_tgt = enc.docs_store(ds.titles, ds.texts).prefix(ds.N)
     Q_tgt = enc.queries(ds.queries, ds.task)
     # Mount timing re-encodes the anchors uncached (~70 s per run for a 4B model), so it is opt-in.
-    mount = None
+    mount_timing = None
+    rerank_base = "7b" if ds.query_lang else "8b"  # Row 9 reranks the default engine's first stage
+    needs = set(rows) | ({rerank_base} if set(rows) & set(RERANK_DEPTH) else set())
     if time_mount:
-        Y_query, mount = enc.timed_encode([tgt.format_query(p, ds.task) for p in tgt_proxies])
+        _, mount_timing = enc.timed_encode([tgt.format_query(p, ds.task) for p in tgt_proxies])
         # Corpus token estimate: the mount budget is relative to the encoding work of re-indexing (design §2.1).
         sample = np.random.default_rng(0).choice(ds.N, min(3_000, ds.N), replace=False)
         doc_tokens = enc.model.tokenizer([tgt.format_doc(ds.titles[i], ds.texts[i]) for i in sample],
                                          truncation=True, max_length=tgt.max_seq_length)["input_ids"]
-        mount["corpus_tokens_est"] = sum(map(len, doc_tokens)) / len(sample) * ds.N
-        mount["projected_encode_ms_K2048"] = mount["encode_ms"] * 2048 / K
-    else:
-        Y_query = enc.queries(tgt_proxies, ds.task)
-    rerank_base = "7b" if ds.query_lang else "8b"  # Row 9 reranks the default engine's first stage
-    needs = set(rows) | ({rerank_base} if set(rows) & set(RERANK_DEPTH) else set())
+        mount_timing["corpus_tokens_est"] = sum(map(len, doc_tokens)) / len(sample) * ds.N
+        mount_timing["projected_encode_ms_K2048"] = mount_timing["encode_ms"] * 2048 / K
+        if {"8b", "7b"} & needs:
+            enc.unload()
+            enc = Encoder(replace(tgt, max_seq_length=min(doc_pair_tokens or tgt.max_seq_length, tgt.max_seq_length)), device)
+            doc_inputs = ([tgt.format_doc("", t) for t in tgt_proxies] if static
+                          else [tgt.format_doc(ds.titles[i], ds.texts[i]) for i in anchor_ids])
+            _, doc_mount = enc.timed_encode(doc_inputs)
+            mount_timing.update({f"doc_{k}": v for k, v in doc_mount.items()})
+    enc.unload()
+    tgt_mount = MountEncoder(tgt, ds.task, device)
+    Y_query = tgt_mount.encode_queries(tgt_proxies)
     if {"7", "7b"} & needs and ds.query_lang:
         bank_src, bank_q, bank_name = load_shift_bank(ds.query_lang, bank=shift_bank)
-        Y_bank_src, Y_bank_q = enc.queries(bank_src, ds.task), enc.queries(bank_q, ds.task)
+        Y_bank_src, Y_bank_q = tgt_mount.encode_queries(bank_src), tgt_mount.encode_queries(bank_q)
         for v in lang_val.values():
-            v["Y_lang"], v["Y_src"] = enc.queries(v["lang"], ds.task), enc.queries(v["en"], ds.task)
-    Y_doc_pairs = None
-    if {"8b", "7b"} & needs and (time_mount or doc_pair_tokens):
-        if doc_pair_tokens:  # cheaper mount: anchor docs for doc pairs encoded truncated
-            enc.unload()
-            enc = Encoder(replace(tgt, max_seq_length=min(doc_pair_tokens, tgt.max_seq_length)), device)
-        doc_inputs = ([tgt.format_doc("", t) for t in tgt_proxies] if static
-                      else [tgt.format_doc(ds.titles[i], ds.texts[i]) for i in anchor_ids])
-        if time_mount:
-            Y_doc_pairs, doc_mount = enc.timed_encode(doc_inputs)
-            mount.update({f"doc_{k}": v for k, v in doc_mount.items()})
-        else:
-            Y_doc_pairs = enc.encode(doc_inputs)
-    enc.unload()
+            v["Y_lang"], v["Y_src"] = tgt_mount.encode_queries(v["lang"]), tgt_mount.encode_queries(v["en"])
+    tgt_mount.unload()
 
     search_k = max([SEARCH_K] + [RERANK_DEPTH[r] for r in rows if r in RERANK_DEPTH])
     native_ranked = cached_search(Q_src, E_src, search_k, device, exclude=ds.self_rows)
     oracle_ranked = cached_search(Q_tgt, E_tgt, search_k, device, exclude=ds.self_rows)
     native_pq, oracle_pq = per_query(native_ranked, ds.qrels), per_query(oracle_ranked, ds.qrels)
     anchor_Y = {"src_query": bundle.X_query_raw, "tgt_query": Y_query, "tgt_doc": None if static else E_tgt[anchor_ids]}
-    # Rows that run the default engine (doc<->doc pairs on); the identity row pairs source docs with themselves.
-    Y_doc = Y_doc_pairs if doc_pair_tokens else anchor_Y["tgt_doc"]
-    doc_rows = {"1": bundle.X_doc_raw, "8b": Y_doc, "7b": Y_doc}
-    X_distractor = E_src[bundle.distractor_ids]
+    X_distractor = index.vectors(bundle.distractor_ids)
     # Diagnostic (opt-in, 2 of a cell's searches): rho_val over the whole index. The engine's pool holds the anchors
     # + <= 50K distractors, so on a larger index it cannot see the extra crowding (msmarco-1m, trec-covid); this scores
     # the same validation proxies against the teacher's top 10 over all N rows.
@@ -241,23 +219,32 @@ def run_pair(
     def fit_row(row: str) -> tuple[np.ndarray, dict, float, SpaceBridge]:
         if row not in bridged:
             y_kind, mode, pairs, restore = BRIDGE_ROWS[row]
-            bridge = SpaceBridge(
-                device=device, restore_source_mean=restore, match_residual_norm=row not in ("6n", "8n"),
-                doc_pairs=row in doc_rows,
-                refine_config=RefineConfig(
-                    **({"batch_candidates": stage2_batch or None} if stage2_batch is not None else {}),
-                    **({"tau_scale": stage2_tau_scale, "tau_scale_below_sd": float("inf")} if stage2_tau_scale else {}),
-                    **({"stop_rule": stage2_rule} if stage2_rule else {}),
-                    keep_checkpoints=stage2_curves,
-                ),
+            config = RefineConfig(
+                **({"batch_candidates": stage2_batch or None} if stage2_batch is not None else {}),
+                **({"tau_scale": stage2_tau_scale, "tau_scale_below_sd": float("inf")} if stage2_tau_scale else {}),
+                **({"stop_rule": stage2_rule} if stage2_rule else {}),
+                keep_checkpoints=stage2_curves,
             )
-            extra = {"Y_doc_raw": doc_rows[row]} if row in doc_rows else {}
-            fit = bridge.fit(bundle, anchor_Y[y_kind], mode=mode, pairs=pairs, X_distractor=X_distractor, **extra)
+            if row in ("8b", "7b"):  # the default engine, through the call that ships
+                bridge = mount(
+                    bundle, index, tgt_mount, [ds.query_lang] if row == "7b" else (), device, doc_pair_tokens or None,
+                    doc_pairs=True, refine_config=config, shift_banks={ds.query_lang: (bank_src, bank_q)} if row == "7b" else None,
+                )
+                fit = bridge.metrics
+            else:
+                bridge = SpaceBridge(
+                    device=device, restore_source_mean=restore, match_residual_norm=row not in ("6n", "8n"),
+                    doc_pairs=row == "1", refine_config=config,
+                )
+                # The identity row pairs source docs with themselves.
+                extra = {"Y_doc_raw": bundle.X_doc_raw} if row == "1" else {}
+                fit = bridge.fit(bundle, anchor_Y[y_kind], mode=mode, pairs=pairs, X_distractor=X_distractor, **extra)
             Q = Q_src if row == "1" else Q_tgt
             lang = None
             if row in ("7", "7b"):
                 lang = ds.query_lang
-                bridge.register_query_language(lang, Y_bank_src, Y_bank_q)
+                if row == "7":
+                    bridge.register_query_language(lang, Y_bank_src, Y_bank_q)
                 fit["lang_val"] = {
                     tag: bridge.validate_query_language(lang, v["Y_lang"], v["Y_src"], v["X_query"], v["X_doc"])
                     for tag, v in lang_val.items()
@@ -304,8 +291,8 @@ def run_pair(
             if latency is not None:
                 rec["projection_us"] = latency
             pq = per_query(ranked, ds.qrels)
-            if row != "1" and mount is not None:
-                rec["mount"] = mount
+            if row != "1" and mount_timing is not None:
+                rec["mount"] = mount_timing
             if bridge.stage2_checkpoints:
                 rec["stage2_real"] = _checkpoint_study(
                     bridge, Q_src if row == "1" else Q_tgt, ds.query_lang if row in ("7", "7b") else None,
@@ -353,6 +340,13 @@ class _DocTexts:
 
     def __getitem__(self, i: int) -> str:
         return f"{self.titles[i]}\n{self.texts[i]}" if self.titles[i] else self.texts[i]
+
+
+def _first_docs(ds: RetrievalDataset, n: int) -> RetrievalDataset:
+    """The dataset on its first ``n`` rows (``DatasetSpec.nested_docs`` corpora), sharing the whole corpus's embeddings."""
+    if max(max(rel) for rel in ds.qrels) >= n:
+        raise ValueError(f"{ds.name}: positives beyond row {n}; only nested corpora have fair prefixes")
+    return replace(ds, name=f"{ds.name}@{n}", doc_ids=ds.doc_ids[:n])
 
 
 def _first_queries(ds: RetrievalDataset, n: int) -> RetrievalDataset:
@@ -490,14 +484,14 @@ def print_table(records: list[dict]) -> None:
                 f"{r['rho_ceil']['ndcg@5']:12.3f} [{lo:.3f},{hi:.3f}]  {r['rho_ceil']['recall@5']:9.3f}  "
                 f"{r['jaccard@5']['bridge_vs_oracle']:7.3f}  {r['rerank_ms_per_query']:6.0f}"
             )
-    mount = next((r["mount"] for r in records if "mount" in r), None)
-    if mount:
+    timing = next((r["mount"] for r in records if "mount" in r), None)
+    if timing:
         print(
-            f"mount: encode {mount['encode_ms']:.0f} ms for {mount['n_inputs']} proxies "
-            f"({mount['tokens_per_s']:.0f} tok/s; ~{mount['projected_encode_ms_K2048']:.0f} ms at K=2048)"
+            f"mount: encode {timing['encode_ms']:.0f} ms for {timing['n_inputs']} proxies "
+            f"({timing['tokens_per_s']:.0f} tok/s; ~{timing['projected_encode_ms_K2048']:.0f} ms at K=2048)"
         )
-        if "doc_encode_ms" in mount:
-            print(f"       + anchor docs for row 8b: {mount['doc_encode_ms']:.0f} ms ({mount['doc_tokens_per_s']:.0f} tok/s)")
+        if "doc_encode_ms" in timing:
+            print(f"       + anchor docs for row 8b: {timing['doc_encode_ms']:.0f} ms ({timing['doc_tokens_per_s']:.0f} tok/s)")
 
 
 def main() -> None:
@@ -531,6 +525,8 @@ def main() -> None:
                    help="also score the validation proxies over the whole index (rho_val_full, owndoc_full; two extra searches per fit)")
     p.add_argument("--max-queries", type=int, default=None,
                    help="evaluate on the first N queries only: for screening grids, confirm winners on all queries")
+    p.add_argument("--max-docs", type=int, default=None,
+                   help="index only the first N rows of a nested corpus (msmarco-full, nq-full), sharing its embeddings")
     p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
                    help="skip cells already complete in --out, so rerunning a crashed command continues it (default: on)")
     p.add_argument("--device", default="cuda")
@@ -546,6 +542,8 @@ def main() -> None:
                 p.error(f"unknown model {key!r}; choose from {sorted(MODELS)}")
 
     ds = load_beir(args.dataset)
+    if args.max_docs is not None:
+        ds = _first_docs(ds, args.max_docs)
     if args.max_queries is not None:
         ds = _first_queries(ds, args.max_queries)
     done = finished_cells(args.out) if args.resume else set()

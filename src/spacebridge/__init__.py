@@ -6,18 +6,26 @@ from .anchors import (
 )
 from .bridge import DOC_PAIR_TOKENS, SpaceBridge, retrieval_stats
 from .bundle import CalibrationBundle
+from .encoders import SentenceTransformerEncoder
+from .mount import Index, IndexReader, QueryEncoder, freeze, mount
 from .refine import RefineConfig
 
 __all__ = [
     "CalibrationBundle",
     "DOC_PAIR_TOKENS",
+    "Index",
+    "IndexReader",
     "LARGE_INDEX_DOCS",
+    "QueryEncoder",
     "RefineConfig",
+    "SentenceTransformerEncoder",
     "SpaceBridge",
     "default_anchor_count",
     "extract_query_proxy",
+    "freeze",
     "make_query_proxies",
     "make_split",
+    "mount",
     "random_anchors",
     "resolve_anchor_method",
     "retrieval_stats",

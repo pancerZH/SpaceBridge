@@ -86,7 +86,7 @@ def test_query_subsample_keeps_whole_queries():
 def test_flores_filter_drops_belebele_and_cross_split_sentences(tmp_path, monkeypatch):
     import huggingface_hub
 
-    from spacebridge_bench import datasets
+    from spacebridge import language as datasets
 
     files = {
         "dev/eng_Latn.jsonl": ["A cat sat.", "Shared  sentence.", "Kept dev one."],
@@ -363,3 +363,30 @@ def test_progress_lines_reach_the_file(tmp_path, monkeypatch):
     monkeypatch.setenv(durable.PROGRESS_ENV, str(tmp_path / "progress.log"))
     durable.progress("cell 1/3: start")
     assert (tmp_path / "progress.log").read_text().endswith("cell 1/3: start\n")
+
+
+def test_store_prefix_is_a_view_with_its_own_rankings(tmp_path):
+    from spacebridge_bench.search import cached_search
+    from spacebridge_bench.store import EmbeddingStore
+
+    E = np.random.default_rng(0).standard_normal((50, 8))
+    np.save(tmp_path / "index.npy", E.astype(np.float16))
+    store = EmbeddingStore(tmp_path / "index.npy")
+    head = store.prefix(20)
+    assert store.prefix(50) is store and len(head) == 20 and head.shape == (20, 8)
+    np.testing.assert_array_equal(head[np.arange(5)], store[np.arange(5)])
+    Q = E[:3].astype(np.float32)
+    ranked_head = cached_search(Q, head, 5, "cpu", cache_dir=tmp_path / "r")
+    ranked_full = cached_search(Q, store, 5, "cpu", cache_dir=tmp_path / "r")
+    assert ranked_head.max() < 20 and ranked_full.max() >= 20 or (ranked_head == ranked_full).all()
+    assert len(list((tmp_path / "r").iterdir())) == 2
+
+
+def test_first_docs_refuses_a_prefix_that_loses_positives():
+    from spacebridge_bench.datasets import RetrievalDataset
+    from spacebridge_bench.run import _first_docs
+
+    ds = RetrievalDataset("x", "en", "t", [str(i) for i in range(10)], [""] * 10, ["d"] * 10, ["q"], [{7: 1}], np.array([-1]))
+    assert _first_docs(ds, 8).N == 8 and _first_docs(ds, 8).name == "x@8" and len(_first_docs(ds, 8).texts) == 10
+    with pytest.raises(ValueError, match="positives"):
+        _first_docs(ds, 7)

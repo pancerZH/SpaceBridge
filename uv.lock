@@ -1838,6 +1838,16 @@ dependencies = [
     { name = "torch" },
 ]
 
+[package.optional-dependencies]
+banks = [
+    { name = "datasets" },
+    { name = "huggingface-hub" },
+]
+models = [
+    { name = "sentence-transformers" },
+    { name = "transformers" },
+]
+
 [package.dev-dependencies]
 bench = [
     { name = "datasets" },
@@ -1853,10 +1863,15 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "datasets", marker = "extra == 'banks'", specifier = ">=3.0" },
+    { name = "huggingface-hub", marker = "extra == 'banks'", specifier = ">=0.30" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "scikit-learn", specifier = ">=1.4" },
+    { name = "sentence-transformers", marker = "extra == 'models'", specifier = ">=6.0" },
     { name = "torch", specifier = ">=2.7", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "transformers", marker = "extra == 'models'", specifier = ">=4.51" },
 ]
+provides-extras = ["models", "banks"]
 
 [package.metadata.requires-dev]
 bench = [

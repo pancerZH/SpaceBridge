@@ -2,6 +2,8 @@
 
 import time
 import warnings
+from dataclasses import asdict
+from pathlib import Path
 from typing import Dict, Literal, Optional
 
 import numpy as np
@@ -9,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from sklearn.isotonic import IsotonicRegression
 
+from . import storage
 from .bundle import CalibrationBundle
 from .quality import QualityReport, index_size_check, language_score, load_calibration, score_report, stage2_health
 from .refine import RefineConfig, refine
@@ -115,6 +118,41 @@ class SpaceBridge:
         self._support_anchors: Optional[np.ndarray] = None  # (K_train, d_t) unit-norm centered target proxies
         self._conf_map: Optional[tuple[np.ndarray, np.ndarray]] = None  # isotonic support -> agreement knots
         self._val_pool: Optional[tuple] = None  # (anchor docs, distractors) as passed to fit(), for language validation
+
+    def save(self, path: str | Path) -> None:
+        """Writes what serving needs: the map, the means, the quality report and the confidence map (crash-safe)."""
+        if self.W is None:
+            raise RuntimeError("fit() must be called before save()")
+        arrays = {"W": self.W, "mu_x_query": self.mu_x_query}
+        arrays.update({f"mu_y/{lang}": mu for lang, mu in self.mu_y_by_lang.items()})
+        if self._support_anchors is not None:
+            arrays["support_anchors"] = self._support_anchors
+        if self._conf_map is not None:
+            arrays["conf_x"], arrays["conf_y"] = self._conf_map
+        meta = {
+            "src_lang": self.src_lang, "restore_source_mean": self.restore_source_mean, "status": self.status,
+            "metrics": self.metrics, "quality": None if self.quality is None else asdict(self.quality),
+        }
+        storage.save_dir(path, "fitted-bridge", arrays, meta)
+
+    @classmethod
+    def load(cls, path: str | Path, device: str = "cuda") -> "SpaceBridge":
+        """A bridge ready for ``transform_query``. Fitting state stays behind, so ``validate_query_language`` needs a new fit."""
+        arrays, meta = storage.load_dir(path, "fitted-bridge")
+        bridge = cls(device=device, restore_source_mean=meta["restore_source_mean"])
+        bridge.src_lang, bridge.status, bridge.metrics = meta["src_lang"], meta["status"], meta["metrics"]
+        bridge.W, bridge.mu_x_query = arrays["W"], arrays["mu_x_query"]
+        bridge.mu_y_by_lang = {name.split("/", 1)[1]: a for name, a in arrays.items() if name.startswith("mu_y/")}
+        bridge._support_anchors = arrays.get("support_anchors")
+        if "conf_x" in arrays:
+            bridge._conf_map = (arrays["conf_x"], arrays["conf_y"])
+        if meta["quality"] is not None:
+            bridge.quality = QualityReport(**meta["quality"])
+            if bridge.quality.band is not None:
+                bridge.quality.band = tuple(bridge.quality.band)
+            for scored in bridge.quality.by_language.values():
+                scored["band"] = tuple(scored["band"])
+        return bridge
 
     def _t(self, a: np.ndarray) -> torch.Tensor:
         return torch.as_tensor(np.asarray(a, dtype=np.float32), device=self.device)

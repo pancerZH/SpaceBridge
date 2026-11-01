@@ -10,8 +10,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from spacebridge.encoders import CPU_BATCH_TOKENS, default_dtype, longest_first as _longest_first, run_token_batches, token_lengths
+
 from . import durable
-from .encode import CPU_BATCH_TOKENS, _longest_first, run_token_batches, token_lengths
 from .store import release_gpu
 
 DEFAULT_CACHE = Path("data/cache/rerank")
@@ -60,7 +61,7 @@ class Reranker:
             self._model = CrossEncoder(
                 self.spec.hf_id,
                 device=self.device,
-                model_kwargs={"torch_dtype": torch.bfloat16 if self.device.startswith("cuda") else torch.float32},
+                model_kwargs={"torch_dtype": default_dtype(self.device)},
                 max_length=self.spec.max_length,
             )
         return self._model

@@ -45,6 +45,14 @@ class EmbeddingStore:
         x = np.asarray(self._mm[rows], dtype=np.float32)[..., : self.dim]
         return x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-12)
 
+    def prefix(self, n: int) -> "EmbeddingStore":
+        """A view of the first ``n`` rows, for indexes whose prefixes are fair samples (``DatasetSpec.nested_docs``)."""
+        if n == len(self):
+            return self
+        view = EmbeddingStore.__new__(EmbeddingStore)
+        view.path, view.dim, view._mean, view._mm = self.path, self.dim, None, self._mm[:n]
+        return view
+
     def mean(self, device: str = "cuda") -> np.ndarray:
         if self._mean is None:
             device = device if torch.cuda.is_available() else "cpu"
@@ -81,7 +89,7 @@ class EmbeddingStore:
     def shards(self, device: str, boundaries: Sequence[int] = ()) -> Iterator[tuple[int, torch.Tensor]]:
         """Yields (first row, rows on ``device``). Shards end at ``boundaries``; without any, a whole index that fits
         on the GPU stays there for the next search, and a larger one is streamed."""
-        key = (self.path, self.dim, device)
+        key = (self.path, self.dim, len(self), device)
         if not boundaries and device.startswith("cuda"):
             if key in _RESIDENT:
                 _RESIDENT.move_to_end(key)

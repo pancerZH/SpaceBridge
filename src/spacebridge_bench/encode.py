@@ -6,12 +6,15 @@ import json
 import shutil
 import time
 from collections import OrderedDict
+from dataclasses import replace
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+from spacebridge.encoders import CPU_BATCH_TOKENS, default_dtype, longest_first as _longest_first, run_token_batches, token_lengths
 
 from . import durable
 from .models import ModelSpec
@@ -24,44 +27,7 @@ _MEMO: "OrderedDict[Path, np.ndarray]" = OrderedDict()
 # Large encodes are saved in parts, at most this far apart, so a crash or power loss costs little.
 PART_ROWS = 65_536
 PART_SECONDS = 120
-TOKENIZE_CHUNK = 100_000  # bulk tokenizing keeps only lengths; 8.8M token lists would not fit in RAM
-CPU_BATCH_TOKENS = 1_024  # smaller is faster on this CPU: 10.0 s vs. 17.4 s to rerank 60 pairs at 16,384
 _STORES: dict[tuple, tuple] = {}  # (titles, texts, model) -> (titles, texts, store): one hash and one file per run
-
-
-def token_lengths(tokenizer, *texts: list[str], max_length: int) -> np.ndarray:
-    """Tokens per input, truncated as encoding will; ``texts`` is one list, or two parallel lists for pairs."""
-    out = np.empty(len(texts[0]), dtype=np.int32)
-    for s in range(0, len(out), TOKENIZE_CHUNK):
-        ids = tokenizer(*(t[s : s + TOKENIZE_CHUNK] for t in texts), truncation=True, max_length=max_length)["input_ids"]
-        out[s : s + TOKENIZE_CHUNK] = [len(x) for x in ids]
-    return out
-
-
-def run_token_batches(
-    lengths: np.ndarray, order: np.ndarray, budget: int, handle: Callable[[np.ndarray], None], start: int = 0,
-) -> None:
-    """Calls ``handle`` on batches of ``order[start:]`` holding at most ``budget`` tokens once padded.
-
-    ``order`` is longest first, so batches have under 3% padding. Sorting by characters with a fixed batch size wastes
-    31-37% of the GPU on padding, and larger fixed batches are slower. Out of memory halves the budget and retries.
-    """
-    pos = start
-    while pos < len(order):
-        batch = order[pos : pos + max(1, budget // max(int(lengths[order[pos]]), 1))]
-        try:
-            handle(batch)
-        except torch.cuda.OutOfMemoryError:
-            if len(batch) == 1:
-                raise
-            budget //= 2
-            torch.cuda.empty_cache()
-            continue
-        pos += len(batch)
-
-
-def _longest_first(lengths: np.ndarray) -> np.ndarray:
-    return np.argsort(-lengths, kind="stable")
 
 
 class Encoder:
@@ -80,8 +46,7 @@ class Encoder:
             self._model = SentenceTransformer(
                 self.spec.hf_id,
                 device=self.device,
-                # bf16 is as fast as fp16 on Blackwell but 2-4x slower than fp32 on a CPU without bf16 instructions.
-                model_kwargs={"torch_dtype": torch.bfloat16 if self.device.startswith("cuda") else torch.float32},
+                model_kwargs={"torch_dtype": default_dtype(self.device)},
                 processor_kwargs=self.spec.tokenizer_kwargs,
                 config_kwargs=self.spec.config_kwargs or None,
             )
@@ -238,6 +203,32 @@ class Encoder:
             h.update(text.encode())
             h.update(b"\x00")
         return h.hexdigest()[:24]
+
+
+class MountEncoder:
+    """``Encoder`` as the engine's ``QueryEncoder``: cached, with the model's prompts and the dataset's task."""
+
+    def __init__(self, spec: ModelSpec, task: str, device: str = "cuda"):
+        self.spec, self.task, self.device = spec, task, device
+        self.size_class = "large" if spec.params_b >= 2 else "small"
+        self._encoders: dict[int, Encoder] = {}
+
+    def _encoder(self, max_length: int) -> Encoder:
+        if max_length not in self._encoders:
+            self.unload()  # one model at a time on the GPU
+            self._encoders = {max_length: Encoder(replace(self.spec, max_seq_length=max_length), self.device)}
+        return self._encoders[max_length]
+
+    def encode_queries(self, texts: list[str]) -> np.ndarray:
+        return self._encoder(self.spec.max_seq_length).queries(texts, self.task)
+
+    def encode_docs(self, titles: list[str], texts: list[str], max_tokens: Optional[int] = None) -> np.ndarray:
+        limit = self.spec.max_seq_length if max_tokens is None else min(max_tokens, self.spec.max_seq_length)
+        return self._encoder(limit).docs(titles, texts)
+
+    def unload(self) -> None:
+        for enc in self._encoders.values():
+            enc.unload()
 
 
 def _finished_parts(parts: Path) -> list[tuple[Path, int, int]]:

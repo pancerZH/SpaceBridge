@@ -11,6 +11,18 @@ dependencies = [
     "torch>=2.7",
 ]
 
+[project.optional-dependencies]
+# SentenceTransformerEncoder, the adapter for real models. The engine itself only needs numpy, scikit-learn and torch.
+models = [
+    "sentence-transformers>=6.0",
+    "transformers>=4.51",
+]
+# Parallel-sentence banks for query languages other than the index's (FLORES is gated: it needs an HF token).
+banks = [
+    "datasets>=3.0",
+    "huggingface-hub>=0.30",
+]
+
 [dependency-groups]
 bench = [
     "datasets>=3.0",

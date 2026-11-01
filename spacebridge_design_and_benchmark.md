@@ -406,80 +406,54 @@ q_hat, conf = bridge.transform_query(q_raw, return_confidence=True)   # conf in 
 
 ---
 
-## 6. Minimal Python Interface (`spacebridge.py`)
+## 6. Python Interface
+
+Two calls hold the whole protocol, so a caller repeats none of its defaults (`spacebridge.mount`). The benchmark runner goes through them, so benchmarks test what ships.
 
 ```python
-import warnings
-from dataclasses import dataclass
-from typing import Dict, Literal, Optional
-import numpy as np
+import spacebridge
 
+index = spacebridge.Index(vectors, texts, titles)   # or anything with __len__, vectors(ids), texts(ids), titles(ids)
 
+# Once, with the model the index was built with.
+bundle = spacebridge.freeze(index, src_encoder, src_lang="en", seed=0)
+bundle.save("bundle/")
+
+# With each new query model: fit, quality report and language shifts.
+bridge = spacebridge.mount(bundle, index, tgt_encoder, query_langs=["zh"])
+bridge.save("bridge/")
+bridge = spacebridge.SpaceBridge.load("bridge/", device="cpu")
+
+q_hat, confidence = bridge.transform_query(q_raw, query_lang="zh", return_confidence=True)
+report = bridge.quality_report()
+```
+
+**`freeze`** chooses $K$ (`default_anchor_count`) and the anchors (`resolve_anchor_method`: k-means medoids up to 200K documents, a uniform sample above it, which reads no vectors), makes the query proxies, the fixed split and the distractors, and encodes the proxies with the source model. `parallel_bank` replaces corpus anchors with parallel sentences (Regime L2), and `validate_langs` prepares per-language validation. `src_encoder=None` leaves `X_query_raw` empty for a source-model-free fit. **`mount`** encodes the proxies and the anchor docs at 128 tokens, decides doc pairs from the encoder's size class (off for `size_class == "large"`), fits, registers a language shift for each query language, and records its timing in `bridge.metrics["mount"]`.
+
+**Two small protocols keep the engine free of model code.** A `QueryEncoder` has `encode_queries(texts)`, `encode_docs(titles, texts, max_tokens=None)` and `size_class`, and returns L2-normalized float32 rows. An `IndexReader` has `__len__`, `vectors(ids)`, `texts(ids)` and `titles(ids)`. `SentenceTransformerEncoder` is the adapter for real models (optional dependency `spacebridge[models]`), and `Index` wraps arrays or any lazy store with `__getitem__`. Language banks need `spacebridge[banks]`.
+
+```python
 @dataclass
 class CalibrationBundle:
     src_lang: str                  # e.g., "en" or "zh"
+    anchor_ids: np.ndarray         # (K,) index row ids of the anchor docs; -1 for a static sentence bank
     anchor_doc_texts: list[str]
     anchor_query_texts: list[str]
     X_doc_raw: np.ndarray          # (K, d_s) anchor doc vectors exactly as stored in the index
-    X_query_raw: np.ndarray        # (K, d_s) source query embeddings of the proxies (native query prompt)
-    train_idx: np.ndarray          # (K_train,) fixed at freeze time
+    X_query_raw: Optional[np.ndarray]  # (K, d_s) source query embeddings of the proxies; None without the source model
+    train_idx: np.ndarray          # (K_train,) positions into the anchor arrays, fixed at freeze time
     val_idx: np.ndarray            # (K_val,)
     distractor_ids: np.ndarray     # (<=50K,) index row ids used for rho_val
-    mu_x_doc: Optional[np.ndarray] = None  # (d_s,) diagnostics only; the index is never re-centered
-    index_size: Optional[int] = None       # rows in the index: the quality report warns above its calibrated range
-
-
-class SpaceBridge:
-    def __init__(self, device: str = "cuda", restore_source_mean: bool = True, doc_pairs: bool = True):
-        self.device = device
-        self.restore_source_mean = restore_source_mean  # False reproduces v2.3 behavior (Ablation Row 3b)
-        self.doc_pairs = doc_pairs  # default: mode="auto" requires Y_doc_raw (Row 8b); False opts out
-        self.src_lang: str = "en"
-        self.mu_x_query: Optional[np.ndarray] = None
-        self.mu_y_by_lang: Dict[str, np.ndarray] = {}
-        self.W: Optional[np.ndarray] = None
-        self.status: str = "uninitialized"
-        self.metrics: Dict[str, float] = {}
-
-    def fit(
-        self,
-        bundle: CalibrationBundle,
-        Y_raw: np.ndarray,         # (K, d_t) target query embeddings of the proxies (or of anchor docs if pairs="doc")
-        mode: Literal["naive", "stiefel", "ridge", "stage1", "auto"] = "auto",  # auto = best Stage-1 + Stage-2
-        pairs: Literal["query", "doc"] = "query",
-        X_distractor: Optional[np.ndarray] = None,  # index vectors at bundle.distractor_ids
-        Y_doc_raw: Optional[np.ndarray] = None,     # (K, d_t) anchor docs encoded with the target doc prompt
-    ) -> Dict[str, float]:
-        """Sets src_lang, mu_x_query, mu_y_by_lang[src_lang] and W (scaled truncated Stiefel or
-        primal/dual ridge on query-proxy + doc<->doc pairs, then <= 50-step GPU InfoNCE/KL), and
-        computes rho_val, status and the quality report (score, grade, advisory rerank_pool)."""
-        ...
-
-    def register_query_language(
-        self, lang: str, Y_flores_src_lang: np.ndarray, Y_flores_query_lang: np.ndarray
-    ) -> None:
-        """Registers the language-cone shift from M_tgt query-prompt embeddings of the same
-        256 FLORES dev sentences in src_lang and in lang (<80ms)."""
-        if self.src_lang not in self.mu_y_by_lang:
-            raise RuntimeError("fit() must be called before register_query_language()")
-        shift = Y_flores_query_lang.mean(axis=0) - Y_flores_src_lang.mean(axis=0)
-        self.mu_y_by_lang[lang] = self.mu_y_by_lang[self.src_lang] + shift
-
-    def transform_query(self, q_tgt_raw: np.ndarray, query_lang: Optional[str] = None) -> np.ndarray:
-        """Applies language-aware centering, linear projection W, source-mean restore, and L2 norm."""
-        lang = query_lang or self.src_lang
-        mu_y = self.mu_y_by_lang.get(lang)
-        if mu_y is None:
-            warnings.warn(
-                f"query language {lang!r} not registered; using {self.src_lang!r} centering "
-                "without language-cone correction"
-            )
-            mu_y = self.mu_y_by_lang[self.src_lang]
-        q_proj = (q_tgt_raw - mu_y) @ self.W
-        if self.restore_source_mean:
-            q_proj = q_proj + self.mu_x_query
-        return q_proj / (np.linalg.norm(q_proj, axis=-1, keepdims=True) + 1e-8)
+    mu_x_doc: Optional[np.ndarray] = None  # (d_s,) diagnostics only, from the distractors; the index is never re-centered
+    index_size: Optional[int] = None       # rows in the index: the quality report warns outside its calibrated range
+    anchor_doc_titles: Optional[list[str]] = None
+    tgt_anchor_texts: Optional[list[str]] = None   # static bank: the parallel sentences the target model encodes
+    language_validation: dict[str, dict] = field(default_factory=dict)   # per-language validation sentences and embeddings
 ```
+
+**On disk,** a bundle and a fitted bridge are each a directory: `arrays.npz`, `meta.json` and `manifest.json`, which holds the kind, the format version and checksums. The manifest is written last and every file is written atomically (`spacebridge.durable`), so a save cut short by a crash fails to load, and saving again repairs it. A saved bridge holds what serving needs: $W$, the means, the quality report and the confidence map. Stage-2 checkpoints and the validation pool stay behind, so `validate_query_language` needs a fresh fit.
+
+`SpaceBridge.fit` remains available for ablation rows and studies. `fit(mode="auto")` requires `Y_doc_raw` unless the bridge was built with `doc_pairs=False`.
 
 ---
 
