@@ -245,6 +245,12 @@ def run_pair(
             ranked = search(bridge.transform_query(Q, query_lang=lang), E_src, SEARCH_K, device, exclude=ds.self_rows)
             student = search(bridge.transform_query(anchor_Y[y_kind][bundle.val_idx]), E_src, VAL_K, device)
             fit["rho_val_full"] = float(np.mean([len(set(a) & set(b)) / VAL_K for a, b in zip(student, val_teacher_full)]))
+            own = bundle.anchor_ids[bundle.val_idx]  # each validation proxy's own anchor doc (-1 for a static bank)
+            if (own >= 0).all():  # exploratory: does the student find the proxy's own doc as often as the teacher does?
+                fit["owndoc_full"] = {
+                    f"{who}_r{k}": float(np.mean((top[:, :k] == own[:, None]).any(1)))
+                    for who, top in (("student", student), ("teacher", val_teacher_full)) for k in (1, 10)
+                }
             latency = _projection_latency_us(bridge, Q[0]) if time_mount else None
             bridged[row] = (ranked, fit, latency, bridge)
         return bridged[row]
