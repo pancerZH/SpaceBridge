@@ -114,6 +114,7 @@ class SpaceBridge:
         self.stage2_signals = None  # with keep_checkpoints: W (numpy) -> the label-free Stage-2 signals
         self._support_anchors: Optional[np.ndarray] = None  # (K_train, d_t) unit-norm centered target proxies
         self._conf_map: Optional[tuple[np.ndarray, np.ndarray]] = None  # isotonic support -> agreement knots
+        self._val_pool: Optional[tuple] = None  # (anchor docs, distractors) as passed to fit(), for language validation
 
     def _t(self, a: np.ndarray) -> torch.Tensor:
         return torch.as_tensor(np.asarray(a, dtype=np.float32), device=self.device)
@@ -255,6 +256,7 @@ class SpaceBridge:
                 self.stage2_signals = lambda W_np: stage2_signals(self._t(W_np))
 
         self.src_lang = bundle.src_lang
+        self._val_pool = (bundle.X_doc_raw, X_distractor)
         self.W = W.cpu().numpy()
         self.mu_x_query = mu_x.cpu().numpy()
         self.mu_y_by_lang = {self.src_lang: mu_y.cpu().numpy()}
@@ -367,6 +369,41 @@ class SpaceBridge:
             self.quality.notes.append(
                 f"quality score covers {self.src_lang!r} queries only; it does not apply to {lang!r} queries"
             )
+
+    def validate_query_language(
+        self, lang: str, Y_val_query_lang: np.ndarray, Y_val_src_lang: np.ndarray,
+        X_val_query: np.ndarray, X_val_doc: np.ndarray,
+    ) -> dict:
+        """Per-language validation rho_val,Lq (design §5) on held-out parallel sentences (FLORES devtest).
+
+        Args:
+            Y_val_query_lang / Y_val_src_lang: (n, d_t) M_tgt query-prompt embeddings of the sentences in
+                ``lang`` and in the source language (``lang`` must be registered first).
+            X_val_query / X_val_doc: (n, d_s) M_src embeddings of the source-language sentences with its query
+                prompt (the teacher) and its doc prompt (the counterparts, mixed into the validation pool).
+
+        Each projected sentence must retrieve its counterpart from the pool (all anchor docs + distractors +
+        counterparts) and agree with the teacher's top 10, once in ``lang`` and once in the source language.
+        The source-language pass shares the sentences' domain and length, so the difference between the two
+        isolates the cost of the language shift. Stored in ``quality.details["language"][lang]``.
+        """
+        if lang not in self.mu_y_by_lang or self._val_pool is None:
+            raise RuntimeError("fit() and register_query_language(lang) must be called before validate_query_language()")
+        Xc = self._t(X_val_doc)
+        pool = torch.cat([*(self._t(p) for p in self._val_pool if p is not None), Xc])
+        own = torch.arange(pool.shape[0] - Xc.shape[0], pool.shape[0], device=self.device)
+        teacher_top = (self._t(X_val_query) @ pool.T).topk(VAL_K, dim=1).indices
+        out: dict = {"n": int(Xc.shape[0])}
+        for key, Y, l in (("lang", Y_val_query_lang, lang), ("src", Y_val_src_lang, self.src_lang)):
+            Q = self._t(self.transform_query(np.asarray(Y, dtype=np.float32), query_lang=l))
+            stats = retrieval_stats(Q, pool, own)
+            out[f"agree@10_{key}"] = topk_agreement(Q, pool, teacher_top)
+            out[f"recall@10_{key}"], out[f"mrr_{key}"] = stats["recall"], stats["mrr"]
+        # Teacher ceiling: the source model's own query embedding retrieving the counterpart.
+        out["recall@10_teacher"] = retrieval_stats(self._t(X_val_query), pool, own)["recall"]
+        if self.quality is not None:
+            self.quality.details.setdefault("language", {})[lang] = out
+        return out
 
     def _mu_y(self, query_lang: Optional[str]) -> np.ndarray:
         lang = query_lang or self.src_lang

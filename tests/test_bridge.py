@@ -235,3 +235,23 @@ def test_stage2_batch_shrinks_for_wide_indexes():
         cfg = RefineConfig(steps=2, batch_candidates=cap, batch_ref_dim=ref_dim)
         _, info = refine(W0, torch.zeros(d_s), Y, Xq, Xd, signals, cfg)
         assert info["batch"] == expected
+
+
+def test_language_validation_sees_an_uncorrected_shift(world):
+    bridge = SpaceBridge(device="cpu", doc_pairs=False)
+    X_dis = world.E_src[world.bundle.distractor_ids]
+    bridge.fit(world.bundle, world.Y_query, mode="stage1", X_distractor=X_dis)
+    with pytest.raises(RuntimeError):
+        bridge.validate_query_language("zh", world.Q_tgt, world.Q_tgt, world.Q_src, world.Q_src)
+    shift = 0.5 * np.random.default_rng(1).standard_normal(world.Q_tgt.shape[1])
+    Y_zh = world.Q_tgt + shift
+    args = (Y_zh, world.Q_tgt, world.Q_src, world.Q_src)
+    bridge.register_query_language("zh", world.Q_tgt, Y_zh)  # correct shift: zh lands exactly on en
+    ok = bridge.validate_query_language("zh", *args)
+    assert ok["n"] == len(world.Q_src)
+    assert ok["agree@10_lang"] == pytest.approx(ok["agree@10_src"]) and ok["mrr_lang"] == pytest.approx(ok["mrr_src"])
+    assert ok["recall@10_src"] > 0.5 and ok["recall@10_teacher"] == 1.0
+    bridge.register_query_language("zh", world.Q_tgt, world.Q_tgt)  # shift left uncorrected
+    bad = bridge.validate_query_language("zh", *args)
+    assert bad["agree@10_lang"] < ok["agree@10_lang"] - 0.05 and bad["recall@10_lang"] < ok["recall@10_lang"]
+    assert bridge.quality.details["language"]["zh"] is bad
