@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from sklearn.isotonic import IsotonicRegression
 
 from .bundle import CalibrationBundle
-from .quality import QualityReport, load_calibration, score_report, stage2_health
+from .quality import QualityReport, language_score, load_calibration, score_report, stage2_health
 from .refine import RefineConfig, refine
 from .solvers import LAMBDAS_REL, naive_procrustes, ridge_path, stiefel_procrustes
 
@@ -365,7 +365,8 @@ class SpaceBridge:
         shift = Y_flores_query_lang.mean(axis=0) - Y_flores_src_lang.mean(axis=0)
         self.mu_y_by_lang[lang] = self.mu_y_by_lang[self.src_lang] + shift
         if self.quality is not None and lang != self.src_lang:
-            # The score is fitted on same-language queries; held out on xquad-zh it over-predicted by 10.5 points.
+            # The score is fitted on same-language queries; it over-predicts other languages by 5-12 points (close-out,
+            # 7 query languages) until validate_query_language() gives the language its own score.
             self.quality.notes.append(
                 f"quality score covers {self.src_lang!r} queries only; it does not apply to {lang!r} queries"
             )
@@ -385,7 +386,9 @@ class SpaceBridge:
         Each projected sentence must retrieve its counterpart from the pool (all anchor docs + distractors +
         counterparts) and agree with the teacher's top 10, once in ``lang`` and once in the source language.
         The source-language pass shares the sentences' domain and length, so the difference between the two
-        isolates the cost of the language shift. Stored in ``quality.details["language"][lang]``.
+        isolates the cost of the language shift. Stored in ``quality.details["language"][lang]``; the report also gets
+        a per-language score (``quality.by_language[lang]``: the score scaled by the counterpart Recall@10 ratio,
+        ±5.1 points on 7 held-out cross-lingual sets, experimental) with its own grade and advisory rerank pool.
         """
         if lang not in self.mu_y_by_lang or self._val_pool is None:
             raise RuntimeError("fit() and register_query_language(lang) must be called before validate_query_language()")
@@ -403,6 +406,13 @@ class SpaceBridge:
         out["recall@10_teacher"] = retrieval_stats(self._t(X_val_query), pool, own)["recall"]
         if self.quality is not None:
             self.quality.details.setdefault("language", {})[lang] = out
+            scored = language_score(self.quality, lang, out["recall@10_lang"], out["recall@10_src"])
+            if scored is not None:
+                self.quality.notes = [n for n in self.quality.notes if not n.endswith(f"does not apply to {lang!r} queries")]
+                self.quality.notes.append(
+                    f"{lang!r} queries: score {scored['score']:.0f} (grade {scored['grade']}, rerank pool {scored['rerank_pool']}) "
+                    "from per-language validation, experimental"
+                )
         return out
 
     def _mu_y(self, query_lang: Optional[str]) -> np.ndarray:

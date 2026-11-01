@@ -286,7 +286,8 @@ def run_pair(
                 )
             if bridge.quality is not None and row != "1":
                 q = bridge.quality
-                rec["quality"] = {"score": q.score, "band": q.band, "grade": q.grade, "rerank_pool": q.rerank_pool, "notes": q.notes}
+                rec["quality"] = {"score": q.score, "band": q.band, "grade": q.grade, "rerank_pool": q.rerank_pool, "notes": q.notes,
+                                  "by_language": q.by_language}
                 rec["confidence"] = _confidence_study(bridge, Q_tgt, ranked, native_ranked, pq, native_pq, oracle_pq)
         records.append(_score_record(rec, pq, native_pq, oracle_pq))
 

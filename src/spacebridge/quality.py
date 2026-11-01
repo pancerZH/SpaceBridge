@@ -19,6 +19,11 @@ RERANK_POOL_BY_GRADE = {"A": 60, "B": 60, "C": 100, "D": 100}
 # flagged when Stage 2 kept step 0 while the floor rejected at least this share of its checkpoints, or when the
 # compressed-score temperature rule fired (teacher score s.d. < 0.04: an index regime the calibration never saw).
 STAGE2_BLOCKED_SHARE = 0.5
+# Per-language score (close-out, FLORES): the English score times the counterpart Recall@10 ratio (query language /
+# source language) of held-out FLORES devtest pairs. Chosen on xquad-zh; on 7 held-out sets (MLQA-zh, XQuAD
+# de/es/ru/ar/hi/vi; 168 fits) it predicts real retention with RMSE 5.1 points (English score: 8.7, biased +8.0),
+# so its band is ±5.1 points. Experimental: all evidence is Wikipedia QA (XQuAD / MLQA) into one English index.
+LANGUAGE_SCORE_SD = 0.051
 
 
 @dataclass
@@ -30,6 +35,7 @@ class QualityReport:
     rerank_pool: int = DEFAULT_RERANK_POOL       # advisory routing: candidates to send to the cross-encoder
     experimental: bool = True
     notes: list[str] = field(default_factory=list)
+    by_language: dict[str, dict] = field(default_factory=dict)  # registered query languages with a validation score
 
     def features(self) -> dict[str, float]:
         return {f"{group}.{name}": v for group, vals in self.details.items() for name, v in vals.items()}
@@ -55,6 +61,20 @@ def stage2_health(report: QualityReport, best_step: int, floor_rejected: float, 
     if blocked or compressed:
         report.rerank_pool = max(report.rerank_pool, RERANK_POOL_BY_GRADE["D"])
     return report
+
+
+def language_score(report: QualityReport, lang: str, recall_lang: float, recall_src: float) -> Optional[dict]:
+    """Score, band, grade and advisory rerank pool for queries in ``lang`` (``report.by_language[lang]``): the
+    English score scaled by how much of the source language's counterpart Recall@10 the language keeps."""
+    if report.score is None or recall_src <= 0:
+        return None
+    score = report.score * recall_lang / recall_src
+    sd = 100.0 * LANGUAGE_SCORE_SD
+    g = grade(score)
+    pool = max(RERANK_POOL_BY_GRADE[g], report.rerank_pool)  # never narrower than the source-language routing
+    report.by_language[lang] = {"score": score, "band": (score - sd, score + sd), "grade": g, "rerank_pool": pool,
+                                "experimental": True}
+    return report.by_language[lang]
 
 
 def grade(score: float) -> str:

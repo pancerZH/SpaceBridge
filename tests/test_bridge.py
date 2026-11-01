@@ -247,11 +247,26 @@ def test_language_validation_sees_an_uncorrected_shift(world):
     Y_zh = world.Q_tgt + shift
     args = (Y_zh, world.Q_tgt, world.Q_src, world.Q_src)
     bridge.register_query_language("zh", world.Q_tgt, Y_zh)  # correct shift: zh lands exactly on en
+    assert any("does not apply to 'zh'" in n for n in bridge.quality.notes)
     ok = bridge.validate_query_language("zh", *args)
+    zh = bridge.quality.by_language["zh"]
+    assert zh["score"] == pytest.approx(bridge.quality.score) and zh["rerank_pool"] >= bridge.quality.rerank_pool
+    assert not any("does not apply to 'zh'" in n for n in bridge.quality.notes)
     assert ok["n"] == len(world.Q_src)
     assert ok["agree@10_lang"] == pytest.approx(ok["agree@10_src"]) and ok["mrr_lang"] == pytest.approx(ok["mrr_src"])
     assert ok["recall@10_src"] > 0.5 and ok["recall@10_teacher"] == 1.0
     bridge.register_query_language("zh", world.Q_tgt, world.Q_tgt)  # shift left uncorrected
     bad = bridge.validate_query_language("zh", *args)
     assert bad["agree@10_lang"] < ok["agree@10_lang"] - 0.05 and bad["recall@10_lang"] < ok["recall@10_lang"]
+    assert bridge.quality.by_language["zh"]["score"] < zh["score"]
     assert bridge.quality.details["language"]["zh"] is bad
+
+
+def test_language_score_scales_the_score_and_never_narrows_routing():
+    from spacebridge.quality import LANGUAGE_SCORE_SD, QualityReport, language_score
+
+    report = QualityReport(details={}, score=96.0, grade="A", rerank_pool=100)
+    out = language_score(report, "zh", 0.80, 1.0)
+    assert out["score"] == pytest.approx(76.8) and out["grade"] == "C" and out["rerank_pool"] == 100
+    assert out["band"] == pytest.approx((76.8 - 100 * LANGUAGE_SCORE_SD, 76.8 + 100 * LANGUAGE_SCORE_SD))
+    assert language_score(QualityReport(details={}), "zh", 0.9, 1.0) is None  # unscored report
