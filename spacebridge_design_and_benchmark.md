@@ -1,8 +1,8 @@
 # Technical Design Document (v2.4): `SpaceBridge` Cross-Model Alignment Engine & Benchmark Suite
 
-**Status:** Phase 0 complete (2026-11-01). Scoped MVP (Core Engine + Multi-Dimensional & Cross-Lingual Validation), measured up to 1M documents  
+**Status:** Phase 0 complete (2026-11-01); Phase 1 in progress. Goal: 1M documents; ceiling of the whole project: 8.84M (§2.1)  
 **Target Environment:** Local Linux Host (Intel i5-12600K, NVIDIA RTX 5070 Ti 16GB VRAM, PyTorch built for CUDA $\ge 12.8$ / `sm_120`)  
-**Scope:** Phase 0 — Zero-Reindexing Cross-Model, Cross-Dimension, and Cross-Language Query Alignment  
+**Scope:** Zero-Reindexing Cross-Model, Cross-Dimension, and Cross-Language Query Alignment, up to 8.84M documents on one machine  
 
 > [!NOTE]
 > **Changes since v2.3**
@@ -22,7 +22,11 @@
 
 ## 1. Overview & Motivation
 
-Upgrading an embedding model, querying a massive pre-computed vector dataset ($10\text{M}+$ chunks) with a tiny on-device model, or searching a legacy monolingual English index in another language normally requires re-embedding every document from scratch.
+Querying a frozen vector index with a different embedding model, for example after a model upgrade, with a tiny on-device model, or in another language, normally requires re-embedding every document first.
+
+**Positioning (decided 2026-11-01): instant compatibility and migration.** Serve the frozen index right away with the new query model, then re-index in the background if traffic justifies it. It is not a quality upgrade and not a compute saving: at scale a bridged model can stay below the old model's own queries in the first stage, and the wider rerank pool it needs costs compute on every query.
+
+**Scale.** The reference deployment is low-traffic, self-hosted, one GPU, HNSW: models, vectors and text are all local, and the index lives in RAM. **1M documents is the goal; 8.84M (MS MARCO's full corpus) is the stretch and the ceiling of the whole project.** Nothing above it is planned or measured. If a goal does not fit this machine, the algorithm is optimized; more hardware is not assumed. §2.1 gives the lines.
 
 **Working hypothesis** (motivated by the *Platonic Representation Hypothesis*): high-performing embedding models organize semantic neighborhoods with largely isomorphic relative geometry, differing primarily by anisotropic cone offsets (including query/document and language-ID shifts), orthogonal rotations, and spectral scaling. Phase 0 exists to *test* how far this holds across model families, dimensions, and languages.
 
@@ -40,6 +44,15 @@ Upgrading an embedding model, querying a massive pre-computed vector dataset ($1
 **Retention definitions** (computed per metric, per test pair):
 * **Oracle retention** $\rho_{\text{oracle}} = \text{metric}_{\text{bridge}} / \text{metric}_{\text{oracle}}$, where the oracle re-embeds all $N$ docs with $M_{\text{tgt}}$ (Ablation Row 0a).
 * **Ceiling retention** $\rho_{\text{ceil}} = \text{metric}_{\text{bridge}} / \min(\text{metric}_{\text{src-native}}, \text{metric}_{\text{oracle}})$, where *src-native* is $M_{\text{src}}$ queries on the $M_{\text{src}}$ index (Row 0b; for Tier 5 this uses the parallel query in the index language). By the source-capacity ceiling, $\rho_{\text{ceil}}$ is the achievable quantity; **all targets below are on $\rho_{\text{ceil}}$** and $\rho_{\text{oracle}}$ is always reported alongside.
+
+**Goals by index size (Phase 1, approved 2026-11-01).** End to end means `nDCG@5` $\rho_{\text{ceil}}$ after `bge-reranker-v2-m3`, with native and re-index reranked at the same depth. Pool is the number of first-stage candidates sent to the reranker.
+
+| Line | Applies at | Requirement (mean over pairs, 3 seeds; the worst pair is reported too) |
+| :--- | :--- | :--- |
+| **Approved targets (the 1M goal)** | up to 1M | End to end $\ge 98\%$ Tier 1, $\ge 94\%$ Tier 3, pool $\le 300$, on two corpora |
+| **Stretch line** | above 1M, up to 8.84M | End to end $\ge 95\%$ Tier 1, $\ge 90\%$ Tier 3, pool $= 300$ |
+
+Two ranges are reported from these. The **best range** is the largest measured size meeting the approved targets on every corpus measured at that size. The **supported range** is the largest measured size meeting the stretch line. Anything above is "measured, not recommended", with its numbers. A miss at 8.84M is not a project failure; the best range is then restricted to 1M or below. A reranker is required above 200K documents, so document text must be available at query time (first-stage-only use loses far more at 1M). There is no `Recall@30` target at $K = 8,192$: large indexes are judged end to end, with recall at the rerank depth reported.
 
 | Migration Tier | Example Test Case | Pure Vector `Recall@30` $\rho_{\text{ceil}}$ | End-to-End `NDCG@5` $\rho_{\text{ceil}}$ (RRF + Reranker) |
 | :--- | :--- | :--- | :--- |
@@ -98,7 +111,8 @@ A fixed number of seconds cannot hold for every corpus, $K$ and machine, and the
 
 * **Online Overhead:** Query-time projection must take **$< 0.1\text{ ms}$** on CPU (one $d_t \times d_s$ mat-vec, $\le 10^6$ MACs) with **zero duplicate or rewritten vector indices** on disk. Operator D rescoring (only on `MODERATE_DRIFT`) adds **$\approx 1\text{–}3\text{ ms}$** on CPU.
 
-### 2.2 Non-Goals (Phase 0)
+### 2.2 Non-Goals
+* **Anything above 8.84M documents.** It is the limit of the one machine this project runs on (§1).
 * **Custom Container Packaging & Storage Tiering:** Portable `.slice` archives and SSD/HDD tiering are deferred until Phase 0 benchmark targets are met.
 * **Any Index Rewrite:** Indices are immutable read-only snapshots. This includes re-centering, re-normalizing, or re-quantizing stored vectors; all alignment happens on the query side.
 * **Machine Translation in the Loop:** No MT models or LLM translators are used during calibration or evaluation. Cross-lingual anchors and test queries come from **professionally human-translated** parallel data (FLORES, XQuAD, MKQA), so alignment quality is not confounded with MT artifacts.
@@ -110,7 +124,10 @@ A fixed number of seconds cannot hold for every corpus, $K$ and machine, and the
 
 Modern asymmetric embedding models map **queries** (with task instructions or `"query: "` prefixes) and **documents** (with `"passage: "` or raw text) onto **separate cones** ($\mu^{\text{query}} \neq \mu^{\text{doc}}$), and multilingual models add a **language-identity cone shift** ($\mu_{\text{zh}}^{\text{query}} \neq \mu_{\text{en}}^{\text{query}}$).
 
-`SpaceBridge` handles all three shifts on the query side only:
+`SpaceBridge` handles all three shifts on the query side only.
+
+> [!NOTE]
+> **Superseded (2026-11-01).** This flowchart predates the large-index profile, advisory routing and the mandatory reranker above 200K documents. It is kept until it is redrawn with the Phase 1 serving path.
 
 ```mermaid
 flowchart TD
@@ -300,7 +317,7 @@ $$\mu_{Y, L_q}^{(q)} = \mu_{Y, L_{\text{src}}}^{(q)} + \left(\mu_{\text{FLORES},
 * **Caveat:** FLORES sentences are single sentences from Wikinews/Wikivoyage/Wikibooks, so the anchor docs are shorter and narrower in domain than typical corpus passages; Ablation Row 5 quantifies the cost.
 
 > [!NOTE]
-> **First measurement (close-out, 2026-11-01; `mlqa-l2`, `--anchor-bank flores`).** 5,137 MLQA English questions from `bge-large-en-v1.5` into a `bge-large-zh-v1.5` index of 4,989 MLQA Chinese contexts; the native ceiling uses the parallel Chinese questions (`Recall@30` 0.823). The English model re-indexing Chinese text is no ceiling (0.356), so ρnative is the measure. Row 8b, 3 seeds: **0.822 ± 0.015 ρnative `Recall@30`** (`nDCG@10` 0.597) with all 2,009 FLORES pairs; **0.587 ± 0.003 with the 338 Belebele-filtered pairs** (−23.5 ± 1.6 points, 3 / 3 seeds); 0.448 ± 0.018 with corpus medoids, whose Chinese proxies the English model cannot read (Stage 2 makes that worse, −8.1). The filter only protects Belebele as an evaluation set, so for Regime L2 the whole bank should be used unless Belebele is evaluated (proposed, not yet adopted; see rule 6). One dataset and one model pair: a first measurement.
+> **First measurement (close-out, 2026-11-01; `mlqa-l2`, `--anchor-bank flores`).** 5,137 MLQA English questions from `bge-large-en-v1.5` into a `bge-large-zh-v1.5` index of 4,989 MLQA Chinese contexts; the native ceiling uses the parallel Chinese questions (`Recall@30` 0.823). The English model re-indexing Chinese text is no ceiling (0.356), so ρnative is the measure. Row 8b, 3 seeds: **0.822 ± 0.015 ρnative `Recall@30`** (`nDCG@10` 0.597) with all 2,009 FLORES pairs; **0.587 ± 0.003 with the 338 Belebele-filtered pairs** (−23.5 ± 1.6 points, 3 / 3 seeds); 0.448 ± 0.018 with corpus medoids, whose Chinese proxies the English model cannot read (Stage 2 makes that worse, −8.1). The filter only protects Belebele as an evaluation set, so Regime L2 uses the whole bank unless Belebele is evaluated (decided 2026-11-01; see rule 6). One dataset and one model pair: a first measurement.
 
 ---
 
@@ -320,7 +337,7 @@ where the student uses $\hat{q}_{\text{src}}$ and the teacher uses native $X^{(q
 
 **Per-language validation (Regime L1).** English-anchor $\rho_{\text{val}}$ says nothing about Chinese queries. For each registered $L_q$, a second score $\rho_{\text{val}, L_q}$ uses FLORES `devtest` pairs (disjoint from the 256 `dev` sentences used for $\Delta\mu$): $L_q$ sentences are projected as queries and must retrieve their $L_{\text{src}}$ counterparts, encoded once by $M_{\text{src}}^{\text{doc}}$ and mixed into $\mathcal{P}$. Routing uses $\rho_{\text{val}, L_q}$ for queries in $L_q$.
 
-**Interim routing** (used until the §5.1 quality score is calibrated; the §5.1 grade table is the approved target design):
+**Interim routing, superseded (2026-11-01):** the §5.1 grade table and the advisory pool rule replace this table, which is kept until §5 is rewritten with the Phase 1 serving path.
 
 | Validation Retention $\rho_{\text{val}}$ | Alignment Status | Online Retrieval Pipeline Action |
 | :--- | :--- | :--- |
@@ -506,7 +523,7 @@ class SpaceBridge:
   3. **Strict Split Hygiene:** `AnchorSelector` samples strictly from `corpus` documents (never `test` queries), keeping evaluation queries completely unseen during calibration.
   4. **Anchor Budget:** $K = \min(2,048, N)$, 8,192 above 200K docs (§4.1); `scifact` numbers are smoke tests only.
   5. **Dataset Licensing & Redistribution:** No dataset text or embeddings are committed to the repository. `flores_plus` is CC BY-SA 4.0 and gated, `belebele` is CC BY-SA 4.0, and other `mteb` sets carry their own terms; committing extracts would attach share-alike obligations separate from the code license and sidestep the gating terms. The repo contains only download/filter scripts; all data is fetched at runtime (HF token where gated) into the git-ignored `data/` / `cache/` directories.
-  6. **FLORES / Belebele Disjointness:** Drop every FLORES sentence whose `eng_Latn` text appears as a substring of any Belebele `eng_Latn` passage; drop sentences duplicated across `dev` and `devtest`. Use the filtered `dev` subset for the $\Delta\mu$ bank (designed as 256 sentences; the filter leaves 94, all used) and the filtered `devtest` (244) for $\rho_{\text{val}, L_q}$; Tier 5b uses both (338 instead of 2,009; with $\rho_{\text{val}}$ from its own $K_{\text{val}}$ split). Log the surviving counts. *Close-out finding:* the filter costs Tier 5b 23.5 points (§4.4, Regime L2) and is only needed when Belebele is an evaluation set; relaxing it for that case is proposed, not adopted.
+  6. **FLORES / Belebele Disjointness:** Drop every FLORES sentence whose `eng_Latn` text appears as a substring of any Belebele `eng_Latn` passage; drop sentences duplicated across `dev` and `devtest`. Use the filtered `dev` subset for the $\Delta\mu$ bank (designed as 256 sentences; the filter leaves 94, all used) and the filtered `devtest` (244) for $\rho_{\text{val}, L_q}$; Log the surviving counts. *Decided 2026-11-01:* the filter costs Tier 5b 23.5 points (§4.4, Regime L2) and is only needed when Belebele is an evaluation set, so **Tier 5b uses the whole bank (2,009 pairs) and the filter stays on for the $\Delta\mu$ bank.**
 * **Progressive Execution Order:**
   * **Stage 0 (Harness Sanity):** Identity check (Row 1) on `scifact` for `bge-large-en-v1.5`; measure anchor-encoding throughput (tokens/s, `bf16`) for every model to replace the provisional mount budgets in §2.1.
   * **Stage 1 (Smoke Test):** `mteb/scifact` ($5.2\text{K}$ docs, $K \in \{512, 2,048\}$) on Tiers 1, 3, and 4a (`< 2 min` end-to-end per pair, excluding 4B encoding).
