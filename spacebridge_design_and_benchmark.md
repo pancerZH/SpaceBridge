@@ -62,7 +62,7 @@ Upgrading an embedding model, querying a massive pre-computed vector dataset ($1
 >
 > | Corpus at 1M docs | Tier 1 `R@30` | Tier 1 `R@100` | Tier 3 `R@30` | Tier 3 `R@100` |
 > | :--- | :--- | :--- | :--- | :--- |
-> | MS MARCO (6 pairs) | 0.901 (0.888) | 0.933 | 0.823 (0.809) | 0.879 |
+> | MS MARCO (6 pairs) | 0.901 (0.891) | 0.936 | 0.823 (0.811) | 0.885 |
 > | NQ (3 pairs) | 0.877 | 0.936 | 0.839 (0.830) | 0.897 |
 >
 > End to end (MS MARCO, one seed, 3 pairs, `bge-reranker-v2-m3`), `nDCG@5` $\rho_{\text{ceil}}$ at the bridged top-60 / 100 / **300**: Tier 1 0.953 / 0.963 / **0.981**; Tier 3 0.887–0.919 / 0.911–0.934 / **0.952–0.966**, so **top-300 meets the 98% / 94% end-to-end targets** (549 ms of reranking per query, measured with another job on the GPU). Against the first-stage targets, which were set per $K$ and have no $K = 8,192$ entry: read against the $K = 2,048$ targets (88% / 82%), Tier 1 is met on MS MARCO and 0.3 short on NQ, and Tier 3 is met on the mean on both, with MS MARCO's worst pair below; `Recall@100` ≥ 90% is missed at Tier 3 on both. The score over-predicts by about 3–9 points at this profile, so the report warns above $N = 200\text{K}$ and widens the pool. Nothing has been measured above 1M documents, and retention keeps falling with $N$. At $N$ = 1M the model-upgrade scenario was measured only at $K \le 4,096$ with lead proxies and at most top-100 (0.63–0.79 of the old model's own `Recall@30`).
