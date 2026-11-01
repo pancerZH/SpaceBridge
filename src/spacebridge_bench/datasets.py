@@ -49,6 +49,17 @@ DATASETS: dict[str, DatasetSpec] = {
         "mteb/T2Retrieval", "zh", "Given a Chinese search query, retrieve web passages that answer the question",
         max_docs=50_000, max_queries=2_000, split="dev", corpus_split="dev", queries_split="dev",
     ),
+    # Close-out validation (never used for a decision): real Bing queries, untitled passages (lead proxies, the
+    # case where Stage 2 can hurt unnoticed). 2,000 of the 6,980 dev queries (~1.1 positives each); 50K-passage
+    # subsample comparable to the other sets, and a 1M-passage subsample of the 8.8M corpus for the scale test.
+    "msmarco": DatasetSpec(
+        "mteb/msmarco", "en", "Given a web search query, retrieve relevant passages that answer the query",
+        max_docs=50_000, max_queries=2_000, split="dev",
+    ),
+    "msmarco-1m": DatasetSpec(
+        "mteb/msmarco", "en", "Given a web search query, retrieve relevant passages that answer the query",
+        max_docs=1_000_000, max_queries=2_000, split="dev",
+    ),
     # Tier 5a: XQuAD questions (human-translated) against all ~21K English SQuAD v1.1 paragraphs.
     "xquad-zh": DatasetSpec(
         "google/xquad", "en", "Given a question, retrieve Wikipedia passages that answer the question", query_lang="zh"

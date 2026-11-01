@@ -17,6 +17,7 @@ def search(
     device = device if torch.cuda.is_available() else "cpu"
     E_t = torch.as_tensor(E, dtype=torch.float32, device=device)
     k = min(k, E.shape[0])
+    chunk = max(1, min(chunk, 2**28 // E.shape[0]))  # score block <= 1 GB of fp32 (1M docs: 268 queries)
     out = []
     for s in range(0, Q.shape[0], chunk):
         q = torch.as_tensor(Q[s : s + chunk], dtype=torch.float32, device=device)
