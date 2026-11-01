@@ -1,21 +1,67 @@
-"""bf16 encoding with an on-disk embedding cache under data/ (design §7.1)."""
+"""Encoding with a crash-safe on-disk embedding cache under data/ (design §7.1): bf16 on the GPU, fp32 on the CPU."""
 
 import gc
 import hashlib
 import json
+import shutil
 import time
 from collections import OrderedDict
 from pathlib import Path
+from typing import Callable, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
+from . import durable
 from .models import ModelSpec
+from .store import EmbeddingStore, release_gpu
 
 DEFAULT_CACHE = Path("data/cache/embeddings")
 # In-process memo of recently used cached embeddings, so loops over pairs, K and seeds read each file once.
 MEMO_BYTES = 6 * 2**30
 _MEMO: "OrderedDict[Path, np.ndarray]" = OrderedDict()
+# Large encodes are saved in parts, at most this far apart, so a crash or power loss costs little.
+PART_ROWS = 65_536
+PART_SECONDS = 120
+TOKENIZE_CHUNK = 100_000  # bulk tokenizing keeps only lengths; 8.8M token lists would not fit in RAM
+CPU_BATCH_TOKENS = 1_024  # smaller is faster on this CPU: 10.0 s vs. 17.4 s to rerank 60 pairs at 16,384
+_STORES: dict[tuple, tuple] = {}  # (titles, texts, model) -> (titles, texts, store): one hash and one file per run
+
+
+def token_lengths(tokenizer, *texts: list[str], max_length: int) -> np.ndarray:
+    """Tokens per input, truncated as encoding will; ``texts`` is one list, or two parallel lists for pairs."""
+    out = np.empty(len(texts[0]), dtype=np.int32)
+    for s in range(0, len(out), TOKENIZE_CHUNK):
+        ids = tokenizer(*(t[s : s + TOKENIZE_CHUNK] for t in texts), truncation=True, max_length=max_length)["input_ids"]
+        out[s : s + TOKENIZE_CHUNK] = [len(x) for x in ids]
+    return out
+
+
+def run_token_batches(
+    lengths: np.ndarray, order: np.ndarray, budget: int, handle: Callable[[np.ndarray], None], start: int = 0,
+) -> None:
+    """Calls ``handle`` on batches of ``order[start:]`` holding at most ``budget`` tokens once padded.
+
+    ``order`` is longest first, so batches have under 3% padding. Sorting by characters with a fixed batch size wastes
+    31-37% of the GPU on padding, and larger fixed batches are slower. Out of memory halves the budget and retries.
+    """
+    pos = start
+    while pos < len(order):
+        batch = order[pos : pos + max(1, budget // max(int(lengths[order[pos]]), 1))]
+        try:
+            handle(batch)
+        except torch.cuda.OutOfMemoryError:
+            if len(batch) == 1:
+                raise
+            budget //= 2
+            torch.cuda.empty_cache()
+            continue
+        pos += len(batch)
+
+
+def _longest_first(lengths: np.ndarray) -> np.ndarray:
+    return np.argsort(-lengths, kind="stable")
 
 
 class Encoder:
@@ -30,14 +76,17 @@ class Encoder:
         if self._model is None:
             from sentence_transformers import SentenceTransformer
 
+            release_gpu()
             self._model = SentenceTransformer(
                 self.spec.hf_id,
                 device=self.device,
-                model_kwargs={"torch_dtype": torch.bfloat16},
+                # bf16 is as fast as fp16 on Blackwell but 2-4x slower than fp32 on a CPU without bf16 instructions.
+                model_kwargs={"torch_dtype": torch.bfloat16 if self.device.startswith("cuda") else torch.float32},
                 processor_kwargs=self.spec.tokenizer_kwargs,
                 config_kwargs=self.spec.config_kwargs or None,
             )
             self._model.max_seq_length = self.spec.max_seq_length
+            self._model.eval()
         return self._model
 
     def unload(self) -> None:
@@ -52,24 +101,31 @@ class Encoder:
     def docs(self, titles: list[str], texts: list[str], cache: bool = True) -> np.ndarray:
         return self.encode([self.spec.format_doc(a, b) for a, b in zip(titles, texts)], cache=cache)
 
+    def docs_store(self, titles: list[str], texts: list[str]) -> EmbeddingStore:
+        """The documents' embeddings without loading them, encoding them first if they are not cached."""
+        memo = (id(titles), id(texts), self.spec.hf_id, self.spec.max_seq_length, self.spec.truncate_dim, self.cache_dir)
+        if memo not in _STORES:
+            inputs = [self.spec.format_doc(a, b) for a, b in zip(titles, texts)]
+            path = self.cache_dir / f"{self._key(inputs)}.npy"
+            self._ensure_file(inputs, path)
+            _STORES[memo] = (titles, texts, EmbeddingStore(path, self.spec.truncate_dim))
+        return _STORES[memo][2]
+
     def encode(self, inputs: list[str], cache: bool = True) -> np.ndarray:
         """L2-normalized float32 embeddings of fully formatted inputs, cached as float16."""
+        if not inputs:
+            return np.empty((0, self.spec.dim), dtype=np.float32)
+        if not cache:
+            return self._slice(self._encode_full(inputs))
         path = self.cache_dir / f"{self._key(inputs)}.npy"
-        if cache and path in _MEMO:
+        if path in _MEMO:
             _MEMO.move_to_end(path)
             return self._slice(_MEMO[path])
-        if cache and path.exists():
-            emb = _l2(np.load(path).astype(np.float32))
-        else:
-            emb = self._encode_full(inputs)
-            if cache:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                np.save(path, emb.astype(np.float16))
-                emb = _l2(emb.astype(np.float16).astype(np.float32))  # same values as a later cache hit
-        if cache:
-            _MEMO[path] = emb
-            while sum(a.nbytes for a in _MEMO.values()) > MEMO_BYTES and len(_MEMO) > 1:
-                _MEMO.popitem(last=False)
+        self._ensure_file(inputs, path)
+        emb = _l2(np.load(path).astype(np.float32))
+        _MEMO[path] = emb
+        while sum(a.nbytes for a in _MEMO.values()) > MEMO_BYTES and len(_MEMO) > 1:
+            _MEMO.popitem(last=False)
         return self._slice(emb)
 
     def _slice(self, emb: np.ndarray) -> np.ndarray:
@@ -78,8 +134,8 @@ class Encoder:
 
     def timed_encode(self, inputs: list[str]) -> tuple[np.ndarray, dict]:
         """Uncached encode with wall-clock and token throughput, excluding model load and warmup."""
-        self._encode_full(inputs[: self.spec.batch_size])
-        n_tokens = sum(len(ids) for ids in self.model.tokenizer(inputs, truncation=True, max_length=self.spec.max_seq_length)["input_ids"])
+        self._encode_full(inputs[:32])
+        n_tokens = int(token_lengths(self.model.tokenizer, inputs, max_length=self.spec.max_seq_length).sum())
         if self.device == "cuda":
             torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -94,16 +150,85 @@ class Encoder:
             "tokens_per_s": n_tokens / seconds,
         }
 
+    @property
+    def _budget(self) -> int:
+        return self.spec.batch_tokens if self.device.startswith("cuda") else CPU_BATCH_TOKENS
+
+    def _embed_batch(self, texts: list[str]) -> torch.Tensor:
+        """One batch through the model directly: per-row bookkeeping in ``encode()`` costs fast models up to 30%."""
+        # prompt="": inputs are already formatted; suppress any default prompt in the model config
+        features = self.model.preprocess(texts, prompt="")
+        features = {k: v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v for k, v in features.items()}
+        with torch.inference_mode():
+            emb = self.model(features)["sentence_embedding"]
+        return F.normalize(emb.float(), dim=-1)  # in fp32: bf16 normalization is up to 0.4% off unit length
+
     def _encode_full(self, inputs: list[str]) -> np.ndarray:
-        emb = self.model.encode(
-            inputs,
-            prompt="",  # inputs are already formatted; suppress any default prompt in the model config
-            batch_size=self.spec.batch_size,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=len(inputs) > 5 * self.spec.batch_size,
-        )
-        return emb.astype(np.float32)
+        lengths = token_lengths(self.model.tokenizer, inputs, max_length=self.spec.max_seq_length)
+        out: Optional[np.ndarray] = None
+
+        def handle(batch: np.ndarray) -> None:
+            nonlocal out
+            emb = self._embed_batch([inputs[i] for i in batch]).cpu().numpy()
+            if out is None:
+                out = np.empty((len(inputs), emb.shape[1]), dtype=np.float32)
+            out[batch] = emb
+
+        run_token_batches(lengths, _longest_first(lengths), self._budget, handle)
+        return out
+
+    def _ensure_file(self, inputs: list[str], path: Path) -> None:
+        parts = path.with_suffix(".parts")
+        if path.exists():
+            if parts.exists():  # a crash between finishing the file and removing its parts
+                shutil.rmtree(parts)
+            return
+        self._encode_to_file(inputs, path, parts)
+
+    def _encode_to_file(self, inputs: list[str], path: Path, parts: Path) -> None:
+        """Encodes longest first, saving a part every ``PART_ROWS`` rows or ``PART_SECONDS`` seconds. A rerun after a
+        crash continues from the last part on disk; the cache file appears only when it is complete."""
+        lengths_file = parts / "lengths.npy"
+        if lengths_file.exists():
+            lengths = np.load(lengths_file)
+        else:
+            lengths = token_lengths(self.model.tokenizer, inputs, max_length=self.spec.max_seq_length)
+        order = _longest_first(lengths)
+        tokens_before = np.concatenate([[0], np.cumsum(lengths[order], dtype=np.int64)])
+        done = _finished_parts(parts)
+        start = done[-1][2] if done else 0
+        pending: list[np.ndarray] = []
+        first, n_pending, t_last, t_begin = start, 0, time.perf_counter(), time.perf_counter()
+
+        def flush() -> None:
+            nonlocal first, n_pending, t_last
+            if not lengths_file.exists():
+                durable.save_npy(lengths_file, lengths)
+            end = first + n_pending
+            durable.save_npy(parts / f"{first:010d}_{end:010d}.npy", np.concatenate(pending))
+            pending.clear()
+            first, n_pending, t_last = end, 0, time.perf_counter()
+            rate = (tokens_before[end] - tokens_before[start]) / max(t_last - t_begin, 1e-9)
+            eta = (tokens_before[-1] - tokens_before[end]) / max(rate, 1e-9)
+            durable.progress(f"encode {self.spec.key}: {end:,} / {len(order):,} rows, {rate / 1e3:.1f}K tok/s, {eta / 60:.0f} min left")
+
+        def handle(batch: np.ndarray) -> None:
+            nonlocal n_pending
+            pending.append(self._embed_batch([inputs[i] for i in batch]).half().cpu().numpy())
+            n_pending += len(batch)
+            if n_pending >= PART_ROWS or time.perf_counter() - t_last >= PART_SECONDS:
+                flush()
+
+        run_token_batches(lengths, order, self._budget, handle, start=start)
+        if not _finished_parts(parts):  # short enough to never need a part
+            out = np.empty((len(order), pending[0].shape[1]), dtype=np.float16)
+            out[order] = np.concatenate(pending)
+            durable.save_npy(path, out)
+            return
+        if pending:
+            flush()
+        _assemble(parts, order, path)
+        shutil.rmtree(parts)
 
     def _key(self, inputs: list[str]) -> str:
         h = hashlib.sha256(
@@ -113,6 +238,39 @@ class Encoder:
             h.update(text.encode())
             h.update(b"\x00")
         return h.hexdigest()[:24]
+
+
+def _finished_parts(parts: Path) -> list[tuple[Path, int, int]]:
+    """Saved parts as (file, first, end) positions in encoding order, up to the first gap."""
+    if not parts.exists():
+        return []
+    found = [(p, *map(int, p.stem.split("_"))) for p in parts.glob("*_*.npy")]
+    out, end = [], 0
+    for item in sorted(found, key=lambda x: x[1]):
+        if item[1] != end:
+            break
+        out.append(item)
+        end = item[2]
+    return out
+
+
+def _assemble(parts: Path, order: np.ndarray, path: Path) -> None:
+    """Writes the finished parts to the cache file in input order, through a memory map so nothing has to fit in RAM."""
+    found = _finished_parts(parts)
+    if not found or found[-1][2] != len(order):
+        raise RuntimeError(f"incomplete parts in {parts}")
+    dim = np.load(found[0][0], mmap_mode="r").shape[1]
+    with durable.atomic_file(path) as f:
+        header = {"descr": np.lib.format.dtype_to_descr(np.dtype(np.float16)), "fortran_order": False, "shape": (len(order), dim)}
+        np.lib.format.write_array_header_1_0(f, header)
+        f.flush()
+        offset = f.tell()
+        f.truncate(offset + len(order) * dim * 2)
+        out = np.memmap(f, dtype=np.float16, mode="r+", offset=offset, shape=(len(order), dim))
+        for part, a, b in found:
+            out[order[a:b]] = np.load(part)
+        out.flush()
+        del out
 
 
 def _l2(a: np.ndarray) -> np.ndarray:
