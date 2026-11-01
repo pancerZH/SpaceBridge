@@ -5,6 +5,7 @@ dataset and row over tiers and K.
 
     uv run python scripts/compare_runs.py outputs/m3_trec-covid_seeds.jsonl outputs/m3_trec-covid_title.jsonl
     uv run python scripts/compare_runs.py before.jsonl after.jsonl --rows 1 6 8 8b --detail
+    uv run python scripts/compare_runs.py outputs/closeout/ms50k_main.jsonl outputs/closeout/ms1m_main.jsonl --ignore-dataset
 """
 
 import argparse
@@ -25,6 +26,8 @@ def main() -> None:
     p.add_argument("--rows", nargs="*", default=["6", "8", "8b"])
     p.add_argument("--detail", action="store_true", help="also list every configuration with solver and Stage-2 step")
     p.add_argument("--pool", action="store_true", help="also pool each dataset and row over tiers and K")
+    p.add_argument("--ignore-dataset", action="store_true",
+                   help="pair configurations across datasets (e.g. one corpus subsampled at two sizes)")
     args = p.parse_args()
     tier = {}
     for t, prs in TIERS.items():  # first tier wins: Tier 5a reuses Tier 3 pairs
@@ -36,7 +39,7 @@ def main() -> None:
         for line in path.open():
             r = json.loads(line)
             if "reranker" not in r and r["row"] in args.rows:
-                key = (r["dataset"], tier.get((r["src"], r["tgt"]), "?"), r["K"], r["row"], r["src"], r["tgt"], r.get("seed", 0))
+                key = ("*" if args.ignore_dataset else r["dataset"], tier.get((r["src"], r["tgt"]), "?"), r["K"], r["row"], r["src"], r["tgt"], r.get("seed", 0))
                 out[key] = r  # last run wins
         return out
 
