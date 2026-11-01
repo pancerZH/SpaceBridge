@@ -15,7 +15,7 @@ from typing import Optional
 import numpy as np
 
 from spacebridge import (
-    CalibrationBundle, RefineConfig, SpaceBridge, extract_query_proxy, make_query_proxies, make_split, sample_distractors,
+    DOC_PAIR_TOKENS, CalibrationBundle, RefineConfig, SpaceBridge, extract_query_proxy, make_query_proxies, make_split, sample_distractors,
     select_anchors,
 )
 
@@ -82,9 +82,6 @@ TIERS = {
 }
 
 SEARCH_K = 100
-# Mount protocol (design §2.1): anchor docs for doc pairs are encoded truncated to this many tokens. 2.3-2.5x
-# faster than full length at -0.3 to -0.5 points Recall@30 (fiqa, 3 seeds, M3); 0 encodes them in full.
-DOC_PAIR_TOKENS = 128
 ANCHOR_CACHE = Path("data/cache/anchors")
 _warm = False
 RERANK_DEPTH = {"9n": 30, "9": 60, "9w": 100}
@@ -413,7 +410,7 @@ def main() -> None:
                    help="re-encode anchors uncached to time the mount, and time the projection (use an idle GPU)")
     p.add_argument("--proxy", default="title", choices=PROXY_STYLES, help="query-proxy style")
     p.add_argument("--doc-pair-tokens", type=int, default=DOC_PAIR_TOKENS,
-                   help="truncate anchor docs encoded for doc pairs to this many tokens (0: full length)")
+                   help="truncate anchor docs encoded for doc pairs to this many tokens (default: spacebridge.DOC_PAIR_TOKENS; 0: full length)")
     p.add_argument("--stage2-batch", type=int, default=None, help="Stage-2 candidate mini-batch size (default: the engine's; 0: full batch)")
     p.add_argument("--stage2-tau-scale", type=float, default=None, help="Stage-2 temperature relative to the teacher score s.d., on every index (ablation)")
     p.add_argument("--stage2-curves", action="store_true",

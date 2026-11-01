@@ -23,6 +23,11 @@ HIGH_CONFIDENCE = 0.58
 MODERATE_DRIFT = 0.40
 VAL_K = 10
 SUPPORT_K = 5
+# Mount protocol (design §2.1): encode the anchor docs passed as ``Y_doc_raw`` truncated to this many tokens.
+# 2.3-2.5x faster than full length at -0.4 / -0.5 points Recall@30 pooled (trec-covid / fiqa, 3 seeds, M4); callers may
+# choose another length (256 recovers most of the cost but misses the mount budgets for bge-large, EmbeddingGemma 2
+# and the 0.6B decoders). 4B-class query models skip doc pairs (``doc_pairs=False``).
+DOC_PAIR_TOKENS = 128
 
 
 def topk_agreement(Q: torch.Tensor, pool: torch.Tensor, teacher_top: torch.Tensor) -> float:
@@ -135,9 +140,10 @@ class SpaceBridge:
             mode: ``naive`` (uncentered full Procrustes), ``stiefel`` / ``ridge`` (one Stage-1 operator),
                 ``stage1`` (best Stage-1 operator on val), ``auto`` (``stage1`` + Stage-2 refinement).
             X_distractor: index vectors at ``bundle.distractor_ids``, added to the rho_val pool.
-            Y_doc_raw: optional (K, d_t) target doc embeddings of the anchor docs. Their training rows
-                are added as doc<->doc pairs (each centered on its own doc-cone mean) to Stage 1 and 2;
-                validation stays on query proxies.
+            Y_doc_raw: optional (K, d_t) target doc embeddings of the anchor docs, encoded with the target doc
+                prompt and truncated to ``DOC_PAIR_TOKENS`` tokens by default. Their training rows are added as
+                doc<->doc pairs (each centered on its own doc-cone mean) to Stage 1 and 2; validation stays on
+                query proxies.
         """
         if mode == "auto" and pairs != "query":
             raise ValueError("Stage-2 refinement needs query-proxy pairs")
