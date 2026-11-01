@@ -73,18 +73,34 @@ def search_nested(
     return {s: out[s] for s in sizes}
 
 
+def _ranking_path(Q: np.ndarray, E: EmbeddingStore, exclude: Optional[np.ndarray], cache_dir: Path) -> Path:
+    h = hashlib.sha256(f"{E.path.stem}|{E.dim}|{len(E)}".encode())
+    h.update(np.asarray(Q, dtype=np.float32).tobytes())
+    if exclude is not None:
+        h.update(np.asarray(exclude, dtype=np.int64).tobytes())
+    return cache_dir / f"{h.hexdigest()[:24]}_k{RANKING_K}.npy"
+
+
 def cached_search(
     Q: np.ndarray, E: EmbeddingStore, k: int = 100, device: str = "cuda", exclude: Optional[np.ndarray] = None,
     cache_dir: Path = RANKING_CACHE,
 ) -> np.ndarray:
     """``search`` with the ranking kept on disk: native and re-index rankings repeat across every K and seed of a pair."""
-    h = hashlib.sha256(f"{E.path.stem}|{E.dim}|{len(E)}".encode())
-    h.update(np.asarray(Q, dtype=np.float32).tobytes())
-    if exclude is not None:
-        h.update(np.asarray(exclude, dtype=np.int64).tobytes())
-    path = cache_dir / f"{h.hexdigest()[:24]}_k{RANKING_K}.npy"
+    path = _ranking_path(Q, E, exclude, cache_dir)
     if path.exists():
         return np.load(path)[:, :k].astype(np.int64)
     ranked = search(Q, E, max(k, RANKING_K), device, exclude=exclude)
     durable.save_npy(path, ranked.astype(np.int32))
     return ranked[:, :k]
+
+
+def cached_search_nested(
+    Q: np.ndarray, E: EmbeddingStore, sizes: Sequence[int], device: str = "cuda", exclude: Optional[np.ndarray] = None,
+    cache_dir: Path = RANKING_CACHE,
+) -> dict[int, np.ndarray]:
+    """``search_nested`` to ``RANKING_K``, kept on disk where ``cached_search`` of the same prefix finds it too."""
+    paths = {s: _ranking_path(Q, E.prefix(s), exclude, cache_dir) for s in sizes}
+    if not all(p.exists() for p in paths.values()):
+        for s, ranked in search_nested(Q, E, sizes, RANKING_K, device, exclude=exclude).items():
+            durable.save_npy(paths[s], ranked.astype(np.int32))
+    return {s: np.load(p).astype(np.int64) for s, p in paths.items()}

@@ -100,11 +100,10 @@ def refine(
         cap = int(cfg.batch_candidates * min(1.0, math.sqrt(cfg.batch_ref_dim / Xd_train.shape[1])))
     batch = cap if cap is not None and n_cand > cap else None
     with torch.no_grad():
-        teacher_scores = Xq_train @ Xd_train.T
-        sd = teacher_scores.std(dim=1).mean().item()
+        # In blocks: rows x candidates fp32 is 5.5 GB at K = 32,768 with doc pairs.
+        sd = torch.cat([(Xq_train[s : s + 1024] @ Xd_train.T).std(dim=1) for s in range(0, Xq_train.shape[0], 1024)]).mean().item()
         tau = cfg.tau_scale * sd if cfg.tau_scale is not None and sd < cfg.tau_scale_below_sd else cfg.tau
-        teacher_logits = teacher_scores / tau
-        teacher = F.log_softmax(teacher_logits, dim=-1) if batch is None else None
+        teacher = F.log_softmax(Xq_train @ Xd_train.T / tau, dim=-1) if batch is None else None
     gen = torch.Generator(device=dev).manual_seed(0)
 
     W = W0.clone().requires_grad_(True)
@@ -120,7 +119,7 @@ def refine(
             slot[sel] = torch.arange(batch, device=dev)
             rows = (slot[labels] >= 0).nonzero().squeeze(1)
             mu_b, Y_b, cand, lab = mu_x[rows], Yc_train[rows], Xd_train[sel], slot[labels[rows]]
-            t = F.log_softmax(teacher_logits[rows][:, sel], dim=-1)
+            t = F.log_softmax(Xq_train[rows] @ cand.T / tau, dim=-1)
         q = F.normalize(mu_b + Y_b @ W, dim=-1)
         log_p = F.log_softmax(q @ cand.T / tau, dim=-1)
         ce = F.nll_loss(log_p, lab)

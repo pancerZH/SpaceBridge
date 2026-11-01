@@ -26,6 +26,7 @@ HIGH_CONFIDENCE = 0.58
 MODERATE_DRIFT = 0.40
 VAL_K = 10
 SUPPORT_K = 5
+SCORE_BLOCK = 1024  # query rows scored at a time against a calibration pool
 # Mount protocol (design §2.1): encode the anchor docs passed as ``Y_doc_raw`` truncated to this many tokens.
 # 2.3-2.5x faster than full length at -0.4 / -0.5 points Recall@30 pooled (trec-covid / fiqa, 3 seeds, M4); callers may
 # choose another length (256 recovers most of the cost but misses the mount budgets for bge-large, EmbeddingGemma 2
@@ -33,17 +34,24 @@ SUPPORT_K = 5
 DOC_PAIR_TOKENS = 128
 
 
+def _top_ids(Q: torch.Tensor, pool: torch.Tensor, k: int) -> torch.Tensor:
+    """Row ids of each query's top-k in pool, in blocks: queries x pool fp32 is 2.2 GB at K = 32,768."""
+    return torch.cat([(Q[s : s + SCORE_BLOCK] @ pool.T).topk(k, dim=1).indices for s in range(0, Q.shape[0], SCORE_BLOCK)])
+
+
 def topk_agreement(Q: torch.Tensor, pool: torch.Tensor, teacher_top: torch.Tensor) -> float:
     """Mean overlap@k between each query's top-k in pool and the teacher's top-k ids (k = teacher_top width)."""
-    top = (Q @ pool.T).topk(teacher_top.shape[1], dim=1).indices
+    top = _top_ids(Q, pool, teacher_top.shape[1])
     return (top[:, :, None] == teacher_top[:, None, :]).any(-1).float().mean().item()
 
 
 def retrieval_stats(Q: torch.Tensor, pool: torch.Tensor, targets: torch.Tensor, k: int = VAL_K) -> dict:
     """Recall@k and MRR@k when each query in Q has exactly one relevant row ``targets[i]`` in pool."""
-    scores = Q @ pool.T
-    target_scores = scores.gather(1, targets[:, None])
-    rank = (scores > target_scores).sum(1)
+    rank = []
+    for s in range(0, Q.shape[0], SCORE_BLOCK):
+        scores = Q[s : s + SCORE_BLOCK] @ pool.T
+        rank.append((scores > scores.gather(1, targets[s : s + SCORE_BLOCK, None])).sum(1))
+    rank = torch.cat(rank)
     hit = rank < k
     return {
         "recall": hit.float().mean().item(),
@@ -60,21 +68,28 @@ def validation_metrics(Q_student: torch.Tensor, Q_teacher: torch.Tensor, pool: t
     drop from the 1st to the 30th other doc (``_sd``: in units of the query's pool-score s.d.);
     small gaps mean crowded neighborhoods, where small query errors reorder many documents.
     """
-    S, T = Q_student @ pool.T, Q_teacher @ pool.T
-    rows = torch.arange(len(own), device=own.device)
-    T_other = T.clone()
-    T_other[rows, own] = -torch.inf
-    nbrs = T_other.topk(VAL_K, dim=1).indices
-    out = {"agree@10": topk_agreement(Q_student, pool, T.topk(VAL_K, dim=1).indices)}
-    for k in (10, 30, 100):
-        top = S.topk(min(k, pool.shape[0]), dim=1).indices
-        out[f"nbr_recall@{k}"] = (nbrs[:, :, None] == top[:, None, :]).any(-1).float().mean().item()
-    Sc, Tc = S - S.mean(1, keepdim=True), T - T.mean(1, keepdim=True)
-    out["score_corr"] = ((Sc * Tc).sum(1) / (Sc.norm(dim=1) * Tc.norm(dim=1))).mean().item()
-    top30 = T_other.topk(min(30, pool.shape[0] - 1), dim=1).values
-    gap = top30[:, 0] - top30[:, -1]
-    out["teacher_gap"] = gap.mean().item()
-    out["teacher_gap_sd"] = (gap / T.std(dim=1)).mean().item()
+    out = {"agree@10": 0.0, "nbr_recall@10": 0.0, "nbr_recall@30": 0.0, "nbr_recall@100": 0.0}
+    corr, gap, gap_sd, n = [], [], [], Q_student.shape[0]
+    for s in range(0, n, SCORE_BLOCK):
+        S, T = Q_student[s : s + SCORE_BLOCK] @ pool.T, Q_teacher[s : s + SCORE_BLOCK] @ pool.T
+        rows = torch.arange(S.shape[0], device=own.device)
+        teacher_top = T.topk(VAL_K, dim=1).indices
+        student_top = S.topk(min(100, pool.shape[0]), dim=1).indices  # sorted, so prefixes are the top-10 and top-30
+        out["agree@10"] += (student_top[:, :VAL_K, None] == teacher_top[:, None, :]).any(-1).float().sum().item() / VAL_K
+        T_other = T.clone()
+        T_other[rows, own[s : s + SCORE_BLOCK]] = -torch.inf
+        nbrs = T_other.topk(VAL_K, dim=1).indices
+        for k in (10, 30, 100):
+            out[f"nbr_recall@{k}"] += (nbrs[:, :, None] == student_top[:, None, : k]).any(-1).float().sum().item() / VAL_K
+        Sc, Tc = S - S.mean(1, keepdim=True), T - T.mean(1, keepdim=True)
+        corr.append((Sc * Tc).sum(1) / (Sc.norm(dim=1) * Tc.norm(dim=1)))
+        top30 = T_other.topk(min(30, pool.shape[0] - 1), dim=1).values
+        gap.append(top30[:, 0] - top30[:, -1])
+        gap_sd.append(gap[-1] / T.std(dim=1))
+    out = {k: v / n for k, v in out.items()}
+    out["score_corr"] = torch.cat(corr).mean().item()
+    out["teacher_gap"] = torch.cat(gap).mean().item()
+    out["teacher_gap_sd"] = torch.cat(gap_sd).mean().item()
     out["owndoc_mrr"] = retrieval_stats(Q_student, pool, own)["mrr"]
     return out
 
@@ -201,7 +216,7 @@ class SpaceBridge:
         pool = Xd if X_distractor is None else torch.cat([Xd, self._t(X_distractor)])
         # Proxies trivially retrieve their own anchor doc, so validation scores agreement with the
         # native source ranking (teacher top-k over the pool) rather than own-doc recall.
-        teacher_top = (Xq[va] @ pool.T).topk(min(VAL_K, pool.shape[0]), dim=1).indices
+        teacher_top = _top_ids(Xq[va], pool, min(VAL_K, pool.shape[0]))
         # Model selection (Stage-1 candidates, Stage-2 early stopping) scores on a fixed subsample of
         # the pool: all anchor docs plus random distractors; the reported rho_val uses the full pool.
         sel_pool = pool
@@ -210,7 +225,7 @@ class SpaceBridge:
             extra = Xd.shape[0] + torch.randperm(pool.shape[0] - Xd.shape[0], generator=gen)
             keep = torch.cat([torch.arange(Xd.shape[0]), extra[: max(0, self.selection_pool - Xd.shape[0])]])
             sel_pool = pool[keep.to(self.device)]
-        sel_teacher = (Xq[va] @ sel_pool.T).topk(min(VAL_K, sel_pool.shape[0]), dim=1).indices
+        sel_teacher = _top_ids(Xq[va], sel_pool, min(VAL_K, sel_pool.shape[0]))
 
         def val_score(W: torch.Tensor) -> float:
             return topk_agreement(self._project(Y[va], mu_y, mu_x, W), sel_pool, sel_teacher)
@@ -242,7 +257,7 @@ class SpaceBridge:
                 mu_xd, Yd_mu = Xd[tr].mean(0), Yd.mean(0)
                 Ydc, Xdc = Yd - Yd_mu, Xd[tr] - mu_xd
                 Yd_va = self._t(Y_doc_raw)[va]
-                doc_teacher = (Xd[va] @ sel_pool.T).topk(min(VAL_K, sel_pool.shape[0]), dim=1).indices
+                doc_teacher = _top_ids(Xd[va], sel_pool, min(VAL_K, sel_pool.shape[0]))
                 Y_fit, X_fit = torch.cat([Y_fit, Ydc]), torch.cat([X_fit, Xdc])
                 info["doc_pairs"] = len(tr)
             if self.match_residual_norm:
@@ -330,7 +345,7 @@ class SpaceBridge:
         resid_true = X_pairs[va] - mu_x
         resid_pred = (Y[va] - mu_y) @ W
         tr_s = tr[: len(va)]
-        teacher_tr = (Xq[tr_s] @ pool.T).topk(min(VAL_K, pool.shape[0]), dim=1).indices
+        teacher_tr = _top_ids(Xq[tr_s], pool, min(VAL_K, pool.shape[0]))
         train_agree = topk_agreement(self._project(Y[tr_s], mu_y, mu_x, W), pool, teacher_tr)
         Yc = Y[tr] - mu_y
         # Participation ratio of the calibration inputs: how many target dimensions the anchors span.
@@ -363,16 +378,16 @@ class SpaceBridge:
         anchors = F.normalize(Y[tr] - mu_y, dim=-1)
         self._support_anchors = anchors.cpu().numpy()
         support = self._support(Y[va] - mu_y, anchors)
-        teacher = (Xq[va] @ pool.T).topk(VAL_K, dim=1).indices
-        student = (self._project(Y[va], mu_y, mu_x, W) @ pool.T).topk(VAL_K, dim=1).indices
+        teacher = _top_ids(Xq[va], pool, VAL_K)
+        student = _top_ids(self._project(Y[va], mu_y, mu_x, W), pool, VAL_K)
         agree = (student[:, :, None] == teacher[:, None, :]).any(-1).float().mean(1)
         iso = IsotonicRegression(out_of_bounds="clip").fit(support.cpu().numpy(), agree.cpu().numpy())
         self._conf_map = (iso.X_thresholds_, iso.y_thresholds_)
 
     @staticmethod
     def _support(Yc, anchors):
-        sims = F.normalize(Yc, dim=-1) @ anchors.T
-        return sims.topk(min(SUPPORT_K, anchors.shape[0]), dim=1).values.mean(1)
+        Yn, k = F.normalize(Yc, dim=-1), min(SUPPORT_K, anchors.shape[0])
+        return torch.cat([(Yn[s : s + SCORE_BLOCK] @ anchors.T).topk(k, dim=1).values.mean(1) for s in range(0, Yn.shape[0], SCORE_BLOCK)])
 
     def query_support(self, q_tgt_raw: np.ndarray, query_lang: Optional[str] = None) -> np.ndarray:
         """Mean cosine of each centered target query to its 5 nearest training proxies."""
@@ -435,7 +450,7 @@ class SpaceBridge:
         Xc = self._t(X_val_doc)
         pool = torch.cat([*(self._t(p) for p in self._val_pool if p is not None), Xc])
         own = torch.arange(pool.shape[0] - Xc.shape[0], pool.shape[0], device=self.device)
-        teacher_top = (self._t(X_val_query) @ pool.T).topk(VAL_K, dim=1).indices
+        teacher_top = _top_ids(self._t(X_val_query), pool, VAL_K)
         out: dict = {"n": int(Xc.shape[0])}
         for key, Y, l in (("lang", Y_val_query_lang, lang), ("src", Y_val_src_lang, self.src_lang)):
             Q = self._t(self.transform_query(np.asarray(Y, dtype=np.float32), query_lang=l))
