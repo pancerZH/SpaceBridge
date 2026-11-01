@@ -344,7 +344,7 @@ class SpaceBridge:
 
     def fit_source_free(
         self, bundle: CalibrationBundle, Y_query_raw: np.ndarray, Y_doc_raw: np.ndarray, X_distractor: Optional[np.ndarray] = None,
-        stage2: bool = True,
+        stage2: bool = True, center: str = "doc", operator: str = "select", stage2_rows: str = "both",
     ) -> Dict[str, float]:
         """Fits without the source model, for an index whose model is gone (design §4.5): only stored vectors and M_tgt.
 
@@ -362,8 +362,9 @@ class SpaceBridge:
             extra = Xd.shape[0] + torch.randperm(pool.shape[0] - Xd.shape[0], generator=gen)
             keep = torch.cat([torch.arange(Xd.shape[0]), extra[: max(0, self.selection_pool - Xd.shape[0])]])
             sel_pool = pool[keep.to(self.device)]
-        mu_y, mu_x = Yd[tr].mean(0), Xd[tr].mean(0)
-        Ydc, Xdc = Yd - mu_y, Xd - mu_x
+        mu_yd, mu_x = Yd[tr].mean(0), Xd[tr].mean(0)
+        mu_y = mu_yd if center == "doc" else Yq[tr].mean(0)
+        Ydc, Xdc = Yd - mu_yd, Xd - mu_x
         Yqc = Yq - mu_y
         target_norm = Xdc[tr].norm(dim=1).mean()
         rescale = (lambda W: W * (target_norm / (Ydc[tr] @ W).norm(dim=1).mean())) if self.match_residual_norm else (lambda W: W)
@@ -377,9 +378,10 @@ class SpaceBridge:
         W_s, s_info = stiefel_procrustes(Ydc[tr], Xdc[tr])
         W_s = rescale(W_s)
         candidates.append((mrr(W_s, sel_pool), W_s, {"solver": "stiefel", "rank": s_info["rank"], "scale": s_info["scale"]}))
-        for lam_rel, W_r in ridge_path(Ydc[tr], Xdc[tr], self.lambdas_rel):
-            W_r = rescale(W_r)
-            candidates.append((mrr(W_r, sel_pool), W_r, {"solver": "ridge", "lambda_rel": lam_rel}))
+        if operator == "select":
+            for lam_rel, W_r in ridge_path(Ydc[tr], Xdc[tr], self.lambdas_rel):
+                W_r = rescale(W_r)
+                candidates.append((mrr(W_r, sel_pool), W_r, {"solver": "ridge", "lambda_rel": lam_rel}))
         _, W, chosen = max(candidates, key=lambda c: c[0])
         info.update(chosen)
         self._sync()
@@ -388,8 +390,9 @@ class SpaceBridge:
         if stage2:
             t0 = time.perf_counter()
             n = len(tr)
-            mu_rows = mu_x.expand(2 * n, -1)
-            Y_rows, labels = torch.cat([Yqc[tr], Ydc[tr]]), torch.cat([torch.arange(n, device=self.device)] * 2)
+            rows = {"both": [Yqc[tr], Ydc[tr]], "proxies": [Yqc[tr]], "docs": [Ydc[tr]]}[stage2_rows]
+            mu_rows = mu_x.expand(len(rows) * n, -1)
+            Y_rows, labels = torch.cat(rows), torch.cat([torch.arange(n, device=self.device)] * len(rows))
             cfg = replace(self.refine_config, alpha=0.0, stop_rule="tail")
 
             def signals(W_: torch.Tensor) -> dict:  # no teacher: the agreement floor is always passed

@@ -21,7 +21,7 @@ from spacebridge_bench.encode import Encoder
 from spacebridge_bench.metrics import per_query
 from spacebridge_bench.models import MODELS
 from spacebridge_bench.rerank import RERANKERS, Reranker, rerank
-from spacebridge_bench.run import _DocTexts
+from spacebridge_bench.run import _DocTexts, _first_queries
 from spacebridge_bench.search import cached_search
 
 CACHE = Path("data/cache/translations")
@@ -40,7 +40,8 @@ class Translator:
         self.name, (self.hf_id, self.prefix, self.kwargs) = name, TRANSLATORS[name]
         self.device = device if torch.cuda.is_available() else "cpu"
         self.tokenizer = AutoTokenizer.from_pretrained(self.hf_id)
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(self.hf_id).to(self.device).eval()
+        dtype = torch.bfloat16 if self.device.startswith("cuda") else torch.float32
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(self.hf_id, dtype=dtype).to(self.device).eval()
 
     @torch.inference_mode()
     def translate(self, texts: list[str]) -> list[str]:
@@ -77,11 +78,14 @@ def main() -> None:
     p.add_argument("dataset")
     p.add_argument("--translator", required=True, choices=TRANSLATORS)
     p.add_argument("--index-model", default="bge-large-en")
+    p.add_argument("--max-queries", type=int, default=None)
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
 
     ds = load_beir(args.dataset)
+    if args.max_queries is not None:
+        ds = _first_queries(ds, args.max_queries)
     translated = translate_cached(args.translator, ds.queries, args.device)
     enc = Encoder(MODELS[args.index_model], args.device)
     store = enc.docs_store(ds.titles, ds.texts)
