@@ -82,6 +82,11 @@ def language_score(report: QualityReport, lang: str, recall_lang: float, recall_
     return report.by_language[lang]
 
 
+def size_rerank_pool(index_size: int) -> int:
+    """The rerank pool an index of this size calls for, before any grade or health flag widens it (design §5)."""
+    return LARGE_INDEX_RERANK_POOL if index_size > LARGE_INDEX_DOCS else DEFAULT_RERANK_POOL
+
+
 def index_size_check(report: QualityReport, index_size: int) -> QualityReport:
     """Warns when the index is larger than any the score was calibrated on, and widens the rerank pool."""
     report.details["coverage"]["index_size"] = float(index_size)
@@ -90,7 +95,7 @@ def index_size_check(report: QualityReport, index_size: int) -> QualityReport:
             f"index of {index_size:,} documents is above the score's calibrated range (up to ~171K documents); "
             "the score likely over-predicts retention"
         )
-        report.rerank_pool = max(report.rerank_pool, LARGE_INDEX_RERANK_POOL)
+    report.rerank_pool = max(report.rerank_pool, size_rerank_pool(index_size))
     return report
 
 

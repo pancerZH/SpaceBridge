@@ -12,6 +12,7 @@ import torch
 from . import durable
 from .bridge import SpaceBridge
 from .mount import IndexReader, QueryEncoder
+from .quality import size_rerank_pool
 
 HNSW_SAVE_SECONDS = 600  # a crash loses at most this much building
 HNSW_BATCH_ROWS = 100_000
@@ -130,14 +131,17 @@ class SearchResult:
 
 
 class Searcher:
-    """One call per query. ``pool`` defaults to the report's advisory pool (above 200K documents a reranker is required)."""
+    """One call per query. ``pool`` defaults to the report's advisory pool, or the index size's if the bridge has no report
+    (above 200K documents a reranker is required)."""
 
     def __init__(
         self, bridge: SpaceBridge, encoder: QueryEncoder, backend: SearchBackend, index: IndexReader,
         reranker: Optional[Reranker] = None, pool: Optional[int] = None, device: str = "cpu",
     ):
         self.bridge, self.encoder, self.backend, self.index, self.reranker = bridge, encoder, backend, index, reranker
-        self.pool = pool if pool is not None else (bridge.quality.rerank_pool if bridge.quality is not None else 60)
+        if pool is None:
+            pool = bridge.quality.rerank_pool if bridge.quality is not None else size_rerank_pool(len(index))
+        self.pool = pool
         self.device = device
 
     def _now(self) -> float:

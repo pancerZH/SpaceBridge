@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 
-from spacebridge import ExactBackend, Index, Searcher, build_hnsw, freeze, mount
+from spacebridge import LARGE_INDEX_DOCS, ExactBackend, Index, Searcher, build_hnsw, freeze, mount
+from spacebridge.quality import size_rerank_pool
 
 from conftest import l2
 from test_mount import make_mount_world
@@ -43,6 +44,27 @@ def test_searcher_without_a_reranker_keeps_the_first_stage_order():
     assert out.pool == bridge.quality.rerank_pool
     q_hat = bridge.transform_query(tgt.encode_queries(["question 3"]))
     np.testing.assert_array_equal(out.ids, ExactBackend(vectors).search(q_hat, 7)[0])
+
+
+class SizedIndex(Index):
+    """An index that reports a size other than its rows, to test the rules that depend on size."""
+
+    def __init__(self, inner: Index, size: int):
+        super().__init__(inner._vectors, inner._texts, inner._titles)
+        self.size = size
+
+    def __len__(self):
+        return self.size
+
+
+def test_searcher_without_a_report_follows_the_index_size():
+    vectors, index, src, tgt = make_mount_world(n_docs=800)
+    bridge = mount(freeze(index, src, K=300, device="cpu"), index, tgt, device="cpu")
+    bridge.quality = None
+    backend, rr = ExactBackend(vectors), ReverseAlphabetReranker()
+    for size in (800, LARGE_INDEX_DOCS, LARGE_INDEX_DOCS + 1, 1_000_000, 1_000_001, 8_841_823):
+        assert Searcher(bridge, tgt, backend, SizedIndex(index, size), rr).pool == size_rerank_pool(size)
+    assert Searcher(bridge, tgt, backend, index, rr, pool=17).pool == 17
 
 
 def test_hnsw_build_continues_after_a_crash_and_finds_neighbours(tmp_path):
