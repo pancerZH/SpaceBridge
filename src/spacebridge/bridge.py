@@ -344,13 +344,14 @@ class SpaceBridge:
 
     def fit_source_free(
         self, bundle: CalibrationBundle, Y_query_raw: np.ndarray, Y_doc_raw: np.ndarray, X_distractor: Optional[np.ndarray] = None,
-        stage2: bool = True, center: str = "doc", operator: str = "select", stage2_rows: str = "both",
+        stage2: bool = True, center: str = "doc", operator: str = "stiefel", stage2_rows: str = "both",
     ) -> Dict[str, float]:
         """Fits without the source model, for an index whose model is gone (design §4.5): only stored vectors and M_tgt.
 
         Queries stay in the target model's own geometry: they are centered on its *doc* mean and restored on the source
-        doc mean, so a doc-pair map carries the target's query/doc relation across. With no teacher, Stage-1 selection and
-        Stage 2 use the proxies' own-doc retrieval, Stage 2 has no KL term, and the quality report has no score.
+        doc mean, so a doc-pair map carries the target's query/doc relation across. With no teacher, Stage 2 uses the
+        proxies' own-doc retrieval and has no KL term, and the quality report has no score. ``operator="select"`` also
+        tries ridge maps and picks by own-doc MRR, which picked worse maps on Tier 3 (FiQA, design §4.5).
         """
         Yq, Yd, Xd = self._t(Y_query_raw), self._t(Y_doc_raw), self._t(bundle.X_doc_raw)
         tr = torch.as_tensor(bundle.train_idx, device=self.device)
