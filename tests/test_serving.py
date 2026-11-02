@@ -57,6 +57,20 @@ class SizedIndex(Index):
         return self.size
 
 
+def test_searcher_requires_a_reranker_above_the_large_index_size():
+    vectors, index, src, tgt = make_mount_world(n_docs=800)
+    bridge = mount(freeze(index, src, K=300, device="cpu"), index, tgt, device="cpu")
+    backend = ExactBackend(vectors)
+    assert Searcher(bridge, tgt, backend, SizedIndex(index, LARGE_INDEX_DOCS)).reranker is None
+    large = SizedIndex(index, LARGE_INDEX_DOCS + 1)
+    with pytest.raises(ValueError, match="needs a reranker"):
+        Searcher(bridge, tgt, backend, large)
+    assert Searcher(bridge, tgt, backend, large, ReverseAlphabetReranker()).reranker is not None
+    out = Searcher(bridge, tgt, backend, large, allow_no_reranker=True).search("question 3", k=7)
+    q_hat = bridge.transform_query(tgt.encode_queries(["question 3"]))
+    np.testing.assert_array_equal(out.ids, backend.search(q_hat, 7)[0])
+
+
 def test_searcher_without_a_report_follows_the_index_size():
     vectors, index, src, tgt = make_mount_world(n_docs=800)
     bridge = mount(freeze(index, src, K=300, device="cpu"), index, tgt, device="cpu")

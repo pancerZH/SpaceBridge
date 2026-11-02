@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from . import durable
+from .anchors import LARGE_INDEX_DOCS
 from .bridge import SpaceBridge
 from .mount import IndexReader, QueryEncoder
 from .quality import size_rerank_pool
@@ -131,13 +132,21 @@ class SearchResult:
 
 
 class Searcher:
-    """One call per query. ``pool`` defaults to the report's advisory pool, or the index size's if the bridge has no report
-    (above 200K documents a reranker is required)."""
+    """One call per query. ``pool`` defaults to the report's advisory pool, or the index size's if the bridge has no report.
+
+    Above ``LARGE_INDEX_DOCS`` documents a reranker is required: first-stage results lose far more there (MS MARCO 1M, nDCG@5
+    0.33-0.44 instead of 0.66-0.69). ``allow_no_reranker=True`` opts out, to time search alone.
+    """
 
     def __init__(
         self, bridge: SpaceBridge, encoder: QueryEncoder, backend: SearchBackend, index: IndexReader,
-        reranker: Optional[Reranker] = None, pool: Optional[int] = None, device: str = "cpu",
+        reranker: Optional[Reranker] = None, pool: Optional[int] = None, device: str = "cpu", allow_no_reranker: bool = False,
     ):
+        if reranker is None and len(index) > LARGE_INDEX_DOCS and not allow_no_reranker:
+            raise ValueError(
+                f"an index of {len(index):,} documents needs a reranker (required above {LARGE_INDEX_DOCS:,} documents, "
+                "design §2.1); pass one, or allow_no_reranker=True to serve first-stage results anyway"
+            )
         self.bridge, self.encoder, self.backend, self.index, self.reranker = bridge, encoder, backend, index, reranker
         if pool is None:
             pool = bridge.quality.rerank_pool if bridge.quality is not None else size_rerank_pool(len(index))
