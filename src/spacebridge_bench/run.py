@@ -54,6 +54,8 @@ ROWS = {
     "9n": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-30 + cross-encoder rerank",
     "9": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-60 + cross-encoder rerank",
     "9w": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-100 + cross-encoder rerank",
+    "9p": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-150 + cross-encoder rerank",
+    "9q": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-200 + cross-encoder rerank",
     "9x": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-300 + cross-encoder rerank",
     "9y": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-500 + cross-encoder rerank",
     "9z": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-1,000 + cross-encoder rerank",
@@ -99,7 +101,7 @@ SEARCH_K = 1_000  # as fast as top-100, and reports recall at rerank depth
 VAL_K = 10  # rho_val's top-k (spacebridge.bridge.VAL_K)
 ANCHOR_CACHE = Path("data/cache/anchors")
 _warm = False
-RERANK_DEPTH = {"9t": 10, "9u": 20, "9n": 30, "9": 60, "9w": 100, "9x": 300, "9y": 500, "9z": 1_000}
+RERANK_DEPTH = {"9t": 10, "9u": 20, "9n": 30, "9": 60, "9w": 100, "9p": 150, "9q": 200, "9x": 300, "9y": 500, "9z": 1_000}
 CI_METRICS = ("recall@30", "ndcg@5", "ndcg@10")
 PROXY_STYLES = ("title", "title-any", "lead", "short")
 

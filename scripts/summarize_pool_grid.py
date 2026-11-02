@@ -10,6 +10,7 @@ import numpy as np
 
 TIER1 = {"bge-base-en", "bge-large-en"}
 TARGETS = {"1": 0.98, "3": 0.94}
+POOLS = (10, 20, 30, 60, 100, 150, 200, 300)
 
 
 def tier(src: str, tgt: str) -> str:
@@ -28,14 +29,14 @@ def main() -> None:
             cells[key].append(r["rho_ceil"]["ndcg@5"])
             meta[r["dataset"]] = (r["n_queries"],)
     datasets = sorted({k[:2] for k in cells})
-    print(f"{'dataset':<22} {'K':>6} {'n_q':>5} {'tier':>4}  " + " ".join(f"{'p' + str(d):>7}" for d in (10, 20, 30, 60, 100, 300)) + "   worst@smallest  smallest pool (mean)")
+    print(f"{'dataset':<22} {'K':>6} {'n_q':>5} {'tier':>4}  " + " ".join(f"{'p' + str(d):>7}" for d in POOLS) + "   worst@smallest  smallest pool (mean)")
     for ds, K in datasets:
         for t in ("1", "3"):
             pairs = sorted({k[3] for k in cells if k[:3] == (ds, K, t)})
             if not pairs:
                 continue
             line, smallest, worst = [], None, None
-            for pool in (10, 20, 30, 60, 100, 300):
+            for pool in POOLS:
                 vals = [np.mean(cells[(ds, K, t, p, pool)]) for p in pairs if (ds, K, t, p, pool) in cells]
                 if not vals:
                     line.append(f"{'-':>7}")

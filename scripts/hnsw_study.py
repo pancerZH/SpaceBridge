@@ -17,7 +17,7 @@ import faiss
 import numpy as np
 
 from spacebridge import Index, build_hnsw, freeze, mount
-from spacebridge.serving import save_faiss_index
+from spacebridge.serving import HNSW_SAVE_SECONDS, save_faiss_index
 from spacebridge_bench import durable
 from spacebridge_bench.datasets import load_beir
 from spacebridge_bench.encode import Encoder, MountEncoder
@@ -28,7 +28,7 @@ from spacebridge_bench.run import _DocTexts, _first_docs, _first_queries
 from spacebridge_bench.search import cached_search, search
 
 HNSW_CACHE = Path("data/cache/hnsw")
-POOLS = (60, 100, 300)
+POOLS = (60, 100, 150, 200, 300)
 EFS = (300, 500, 1000)
 
 
@@ -122,10 +122,14 @@ def main() -> None:
     p.add_argument("--ef-construction", type=int, default=200)
     p.add_argument("--ivfpq", default=None, help="also test this FAISS factory string, e.g. IVF16384,PQ128")
     p.add_argument("--nprobe", type=int, nargs="+", default=[64, 256])
+    p.add_argument("--save-seconds", type=float, default=HNSW_SAVE_SECONDS, help="save a growing HNSW index this often")
+    p.add_argument("--index-dir", type=Path, default=HNSW_CACHE, help="where indexes are kept")
+    p.add_argument("--pools", type=int, nargs="+", default=list(POOLS), help="candidates sent to the reranker")
     p.add_argument("--build-only", action="store_true")
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
+    pools = tuple(args.pools)
 
     ds = load_beir(args.dataset)
     if args.max_docs is not None:
@@ -139,11 +143,11 @@ def main() -> None:
     Q_native = enc.queries(ds.index_lang_queries, ds.task)
     enc.unload()
 
-    path = HNSW_CACHE / f"{ds.name}_{store.path.stem}_{store.dim}d_M{args.M}_efc{args.ef_construction}.faiss"
+    path = args.index_dir / f"{ds.name}_{store.path.stem}_{store.dim}d_M{args.M}_efc{args.ef_construction}.faiss"
     t0 = time.perf_counter()
     was_complete = "build" in res.done
     index = build_hnsw(
-        store, path, args.M, args.ef_construction,
+        store, path, args.M, args.ef_construction, save_seconds=args.save_seconds,
         on_batch=lambda n, total: durable.progress(f"hnsw build: {n:,} / {total:,}, {time.perf_counter() - t0:.0f} s this run"),
     )
     if not was_complete:
@@ -153,11 +157,11 @@ def main() -> None:
         return
 
     rr = Reranker(RERANKERS["bge-reranker-v2-m3"], args.device)
-    maxk = max(POOLS)
+    maxk = max(pools)
     exact_native = cached_search(Q_native, store, 1000, args.device, exclude=ds.self_rows)
     for ef in EFS:
         ranked = hnsw_search(index, Q_native, maxk, ef)
-        rankings_report(res, f"hnsw|native|ef{ef}", ranked, exact_native, ds, ds.index_lang_queries, rr, POOLS)
+        rankings_report(res, f"hnsw|native|ef{ef}", ranked, exact_native, ds, ds.index_lang_queries, rr, pools)
     rr.unload()
     pool_index = Index(store, ds.texts, ds.titles)
     pq_index = None
@@ -167,7 +171,7 @@ def main() -> None:
         for nprobe in args.nprobe:
             faiss.extract_index_ivf(pq_index).nprobe = nprobe
             ranked = pq_index.search(np.asarray(Q_native, dtype=np.float32), maxk)[1]
-            rankings_report(res, f"{args.ivfpq}|native|nprobe{nprobe}", ranked, exact_native, ds, ds.index_lang_queries, rr, POOLS)
+            rankings_report(res, f"{args.ivfpq}|native|nprobe{nprobe}", ranked, exact_native, ds, ds.index_lang_queries, rr, pools)
         rr.unload()
 
     for tgt_key in args.query_models:
@@ -177,15 +181,15 @@ def main() -> None:
         enc.unload()
         oracle = cached_search(Q_tgt, E_tgt, 1000, args.device, exclude=ds.self_rows)
         docs = _DocTexts(ds.titles, ds.texts)
-        for pool in POOLS:
+        for pool in pools:
             key = f"oracle|{tgt_key}|pool{pool}"
             if key not in res.done:
                 pq = per_query(rerank(rr, oracle, pool, ds.queries, docs, ds.task), ds.qrels)
                 res.add(key, tag="oracle", tgt=tgt_key, pool=pool, ndcg5_exact=float(pq["ndcg@5"].mean()))
         rr.unload()
         for seed in args.seed:
-            if all(f"hnsw|{tgt_key}|s{seed}|ef{ef}|pool{pool}" in res.done for ef in EFS for pool in POOLS) and (
-                not args.ivfpq or all(f"{args.ivfpq}|{tgt_key}|s{seed}|nprobe{n}|pool{pool}" in res.done for n in args.nprobe for pool in POOLS)
+            if all(f"hnsw|{tgt_key}|s{seed}|ef{ef}|pool{pool}" in res.done for ef in EFS for pool in pools) and (
+                not args.ivfpq or all(f"{args.ivfpq}|{tgt_key}|s{seed}|nprobe{n}|pool{pool}" in res.done for n in args.nprobe for pool in pools)
             ):
                 continue
             bundle = freeze(pool_index, MountEncoder(src, ds.task, args.device), ds.lang, seed, args.K or None, device=args.device)
@@ -194,7 +198,7 @@ def main() -> None:
             exact = search(Q_hat, store, 1000, args.device, exclude=ds.self_rows)
             for ef in EFS:
                 ranked = hnsw_search(index, Q_hat, maxk, ef)
-                rankings_report(res, f"hnsw|{tgt_key}|s{seed}|ef{ef}", ranked, exact, ds, ds.queries, rr, POOLS)
+                rankings_report(res, f"hnsw|{tgt_key}|s{seed}|ef{ef}", ranked, exact, ds, ds.queries, rr, pools)
             if pq_index is not None:
                 reader = QuantizedIndex(pq_index, ds, store.dim)
                 pq_bundle = freeze(reader, MountEncoder(src, ds.task, args.device), ds.lang, seed, args.K or None, device=args.device)
@@ -203,7 +207,7 @@ def main() -> None:
                 for nprobe in args.nprobe:
                     faiss.extract_index_ivf(pq_index).nprobe = nprobe
                     ranked = pq_index.search(np.asarray(Q_hat_pq, dtype=np.float32), maxk)[1]
-                    rankings_report(res, f"{args.ivfpq}|{tgt_key}|s{seed}|nprobe{nprobe}", ranked, exact, ds, ds.queries, rr, POOLS)
+                    rankings_report(res, f"{args.ivfpq}|{tgt_key}|s{seed}|nprobe{nprobe}", ranked, exact, ds, ds.queries, rr, pools)
             rr.unload()
 
 
