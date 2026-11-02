@@ -6,6 +6,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -28,8 +29,10 @@ class RerankerSpec:
     instructed: bool          # takes the dataset's task instruction as its prompt
     batch_tokens: int = 10_000
     max_length: int = 512
+    onnx: Optional[str] = None  # scores on the CPU through this file (scripts/export_reranker_onnx.py), whatever the device
 
 
+ONNX_DIR = "data/cache/onnx"
 RERANKERS: dict[str, RerankerSpec] = {
     spec.key: spec
     for spec in [
@@ -38,8 +41,27 @@ RERANKERS: dict[str, RerankerSpec] = {
         # Lighter ones, for the CPU line (Phase 1 M2, Part E); not run by default. MIT and Apache-2.0; the second is English only.
         RerankerSpec("bge-reranker-base", "BAAI/bge-reranker-base", instructed=False),
         RerankerSpec("ms-marco-minilm", "cross-encoder/ms-marco-MiniLM-L6-v2", instructed=False),
+        RerankerSpec("bge-reranker-v2-m3-int8", "BAAI/bge-reranker-v2-m3", instructed=False, onnx=f"{ONNX_DIR}/bge-reranker-v2-m3/model_int8.onnx"),
     ]
 }
+
+
+class OnnxCrossEncoder:
+    """What scoring uses of a ``CrossEncoder``, over an ONNX file, on the CPU. Needs ``--extra onnx``. Scores are raw logits."""
+
+    def __init__(self, path: str | Path, hf_id: str, max_length: int = 512, threads: Optional[int] = None):
+        import onnxruntime as ort
+        from transformers import AutoTokenizer
+
+        options = ort.SessionOptions()
+        if threads:
+            options.intra_op_num_threads = threads
+        self.tokenizer, self.max_length = AutoTokenizer.from_pretrained(hf_id), max_length
+        self.session = ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"])
+
+    def predict(self, pairs, batch_size=None, convert_to_numpy=True, show_progress_bar=False) -> np.ndarray:
+        enc = self.tokenizer([p[0] for p in pairs], [p[1] for p in pairs], padding=True, truncation=True, max_length=self.max_length, return_tensors="np")
+        return self.session.run(["logits"], {k: enc[k].astype(np.int64) for k in ("input_ids", "attention_mask")})[0].reshape(-1)
 
 
 class Reranker:
@@ -58,6 +80,9 @@ class Reranker:
     @property
     def model(self):
         if self._model is None:
+            if self.spec.onnx:
+                self._model = OnnxCrossEncoder(self.spec.onnx, self.spec.hf_id, self.spec.max_length)
+                return self._model
             from sentence_transformers import CrossEncoder
 
             release_gpu()
@@ -132,7 +157,7 @@ class Reranker:
 
     def _predict(self, queries: list[str], docs: list[str], prompt: str) -> np.ndarray:
         kwargs = {"prompt": prompt} if self.spec.instructed else {}
-        budget = self.spec.batch_tokens if self.device.startswith("cuda") else CPU_BATCH_TOKENS
+        budget = self.spec.batch_tokens if self.device.startswith("cuda") and not self.spec.onnx else CPU_BATCH_TOKENS
         return predict_pairs(self.model, queries, docs, budget, self.spec.max_length, **kwargs)
 
 

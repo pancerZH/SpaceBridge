@@ -28,6 +28,12 @@ hnsw = [
     "faiss-cpu>=1.9",
 ]
 
+# A quantized reranker for CPU serving (Phase 1 M2, Part E): scripts/export_reranker_onnx.py and the harness only.
+onnx = [
+    "onnx>=1.17",
+    "onnxruntime>=1.20",
+]
+
 [dependency-groups]
 bench = [
     "datasets>=3.0",

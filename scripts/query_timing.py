@@ -19,11 +19,12 @@ import numpy as np
 import torch
 
 from spacebridge import CrossEncoderReranker, ExactBackend, HnswBackend, Index, Searcher, SpaceBridge, freeze, mount
-from spacebridge.encoders import token_lengths
+from spacebridge.encoders import CPU_BATCH_TOKENS, predict_pairs, token_lengths
 from spacebridge_bench import durable
 from spacebridge_bench.datasets import load_beir
 from spacebridge_bench.encode import Encoder, MountEncoder
 from spacebridge_bench.models import MODELS
+from spacebridge_bench.rerank import OnnxCrossEncoder
 from spacebridge_bench.run import _first_docs
 
 DEFAULT_RERANKER = "BAAI/bge-reranker-v2-m3"
@@ -50,6 +51,17 @@ class LiveQueryEncoder:
 
     def encode_queries(self, texts: list[str]) -> np.ndarray:
         return self.encoder.encode([self.spec.format_query(t, self.task) for t in texts], cache=False)
+
+
+class OnnxReranker:
+    """``--reranker onnx:PATH``: the reference reranker through an ONNX file, on the CPU."""
+
+    def __init__(self, path: str, threads: int):
+        self.max_length = 512
+        self.model = OnnxCrossEncoder(path, DEFAULT_RERANKER, self.max_length, threads)
+
+    def score(self, query: str, docs: list[str]) -> np.ndarray:
+        return predict_pairs(self.model, [query] * len(docs), docs, CPU_BATCH_TOKENS, self.max_length)
 
 
 class RememberingReranker:
@@ -88,7 +100,7 @@ def main() -> None:
     p.add_argument("--threads", type=int, default=10)
     p.add_argument("--n", type=int, default=20)
     p.add_argument("--no-rerank", action="store_true", help="time encode, project, search and fetch only")
-    p.add_argument("--reranker", default=DEFAULT_RERANKER, help="Hugging Face id of the cross-encoder")
+    p.add_argument("--reranker", default=DEFAULT_RERANKER, help="Hugging Face id of the cross-encoder, or onnx:PATH (needs --extra onnx)")
     p.add_argument("--out", type=Path, default=None)
     args = p.parse_args()
 
@@ -114,7 +126,8 @@ def main() -> None:
         backend = HnswBackend(args.backend, ef_search=args.ef)
     load_s = time.perf_counter() - t0
     encoder = LiveQueryEncoder(args.query_model, ds.task, args.device)
-    reranker = None if args.no_rerank else RememberingReranker(CrossEncoderReranker(args.reranker, device=args.device))
+    inner = OnnxReranker(args.reranker[5:], args.threads) if args.reranker.startswith("onnx:") else CrossEncoderReranker(args.reranker, device=args.device)
+    reranker = None if args.no_rerank else RememberingReranker(inner)
     searcher = Searcher(bridge, encoder, backend, index, reranker, device=args.device, allow_no_reranker=args.no_rerank)
     if args.device.startswith("cuda"):
         torch.cuda.reset_peak_memory_stats()

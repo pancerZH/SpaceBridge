@@ -390,3 +390,15 @@ def test_first_docs_refuses_a_prefix_that_loses_positives():
     assert _first_docs(ds, 8).N == 8 and _first_docs(ds, 8).name == "x@8" and len(_first_docs(ds, 8).texts) == 10
     with pytest.raises(ValueError, match="positives"):
         _first_docs(ds, 7)
+
+
+def test_onnx_reranker_goes_through_the_cache_and_the_cpu_budget(tmp_path):
+    from spacebridge_bench.rerank import Reranker, RerankerSpec
+
+    rr = Reranker(RerankerSpec("fake-onnx", "x", instructed=False, onnx="x.onnx"), "cpu", cache_dir=tmp_path)
+    rr._model = _FakeCrossEncoder()
+    scores = rr.score(["q"] * 3, ["doc 1", "doc 2", "doc 3"], "")
+    assert scores.tolist() == [1.0, 2.0, 3.0]
+    assert len(rr._model.seen) == 3
+    rr.score(["q"] * 3, ["doc 1", "doc 2", "doc 3"], "")
+    assert len(rr._model.seen) == 3
