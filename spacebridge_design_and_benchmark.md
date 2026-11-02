@@ -26,6 +26,8 @@ Querying a frozen vector index with a different embedding model, for example aft
 
 **Positioning (decided 2026-11-01): instant compatibility and migration.** Serve the frozen index right away with the new query model, then re-index in the background if traffic justifies it. It is not a quality upgrade and not a compute saving: at scale a bridged model can stay below the old model's own queries in the first stage, and the wider rerank pool it needs costs compute on every query.
 
+**Translation (decided 2026-11-02).** The positioning stands for same-language migration, where translation does not apply. For cross-language search, use machine translation while the old query model is available, and the bridge once it is retired: translation needs the old model alive at query time. On Chinese to English, MADLAD-400 3B leads the best bridge by 2.5–4 points of `nDCG@5` at pool 60 (`xquad-zh`, `mlqa-zh`). The evidence is Chinese to English only.
+
 **Scale.** The reference deployment is low-traffic, self-hosted, one GPU, HNSW: models, vectors and text are all local, and the index lives in RAM. **1M documents is the goal; 8.84M (MS MARCO's full corpus) is the stretch and the ceiling of the whole project.** Nothing above it is planned or measured. If a goal does not fit this machine, the algorithm is optimized; more hardware is not assumed. §2.1 gives the lines.
 
 **Working hypothesis** (motivated by the *Platonic Representation Hypothesis*): high-performing embedding models organize semantic neighborhoods with largely isomorphic relative geometry, differing primarily by anisotropic cone offsets (including query/document and language-ID shifts), orthogonal rotations, and spectral scaling. Phase 0 exists to *test* how far this holds across model families, dimensions, and languages.
@@ -62,23 +64,40 @@ Two ranges are reported from these. The **best range** is the largest measured s
 | **Tier 4: Extreme Low $\leftrightarrow$ High Dim** | `MiniLM (384d)` / MRL $(128\text{–}768\text{d})$ $\leftrightarrow$ `Qwen3-4B (2560d)` ($6.7\times$–$20\times$) | **$\ge 80\%$** (Up-Proj) / **$\ge 85\%$\*** (Down-Proj, ceiling = $384\text{d}$ native) | **$\ge 92\%$** |
 | **Tier 5: Cross-Language (`zh` $\leftrightarrow$ `en`)** | `zh` Query (`Qwen3`/`mE5`/`harrier`/`EmbeddingGemma 2`) $\to$ Monolingual `en` Index (`bge-en`) *(BM25 = 0)* | **$\ge 78\%$** | **$\ge 90\%$** *(via Cross-Lingual Reranker)* |
 
-† **Revised and approved 2026-10-30** after Milestone 1, stated for a hard domain (`fiqa`). The original Tier 1 target ($\ge 95\%$) proved out of reach for a linear query map on `fiqa` (observed 89.4–92.2% at $K = 2,048$; 90.4–92.3% at $K = 4,096$ with doc pairs), while it is met on the easy `scifact` corpus (96.8–97.3%). Tier 3 meets its target (83.1–91.1% at $K = 2,048$). **All tiers additionally target `Recall@100` $\rho_{\text{ceil}} \ge 90\%$** (reranker recoverability; observed 92.8% mean on `fiqa`). End-to-end targets are unchanged; **Row 9 was measured in Milestone 2** (`fiqa`, $K = 2,048$, dense first stage + cross-encoder, no BM25): mean `nDCG@5` $\rho_{\text{ceil}}$ is 0.96 when reranking the bridged top-30, 0.99 at top-60 and 0.99–1.00 at top-100, with `bge-reranker-v2-m3` and `Qwen3-Reranker-0.6B` agreeing within noise. Tier 1 meets 98% from top-60; Tier 3 meets 94% at top-100 on all pairs; at top-60 it meets it on 4 of 4 pairs with `bge-reranker-v2-m3` (worst 0.941) and 3 of 4 with `Qwen3-Reranker-0.6B` (worst 0.930). The first-stage loss is therefore mostly reordering that a reranker over a wider pool recovers. **Re-measured on the shipped default engine** (doc↔doc pairs, M2 follow-up): first-stage `nDCG@5` 0.80 (was 0.77); after reranking 0.97 / 0.99 / 1.00 at top-30 / 60 / 100 with either reranker, and Tier 3 now meets 94% at top-60 on all 4 pairs with both rerankers (worst 0.964 / 0.949). Tier 5a (`xquad-zh`, Row 7b, `bge-reranker-v2-m3`): 0.916 / 0.945 / 0.959, meeting 94% on 3 of 4 models at top-60 and top-100 (worst `harrier-oss-v1-0.6b` 0.923 / 0.938). Tiers 2, 4 and 5 keep their original targets until first measured. **First measured in M3** (default engine incl. title proxies, 3 seeds, first-stage `Recall@30` $\rho_{\text{ceil}}$, mean over pairs, $K$ = 2,048 / 4,096): **Tier 2** (`T2Retrieval`, `bge-large-zh-v1.5` ↔ `multilingual-e5-large`) 0.891 / 0.883, met on the mean; the `multilingual-e5-large` index direction is 0.879 / 0.849 ± 0.097 (§4.3, compressed-score temperature). **Tier 4a** (`fiqa`, `all-MiniLM-L6-v2` ↔ `Qwen3-Embedding-4B`) met in both directions: Up 1.042 / 1.077 (ceiling = MiniLM re-index; 0.72–0.75 of the 4B native), Down 0.937 / 0.995. **Tier 4b** (MRL slices of `Qwen3-Embedding-0.6B` into `bge-large-en-v1.5`): 0.90 / 0.89 / 0.82 / 0.70 at 768 / 512 / 256 / 128 dims ($K = 2,048$), so ≥ 80% down to 4× compression. With title proxies `trec-covid` Tier 1 is 0.884 at $K = 2,048$ (target met on the mean) and 0.897 at 4,096 (0.3 short); `hotpotqa` (held out) meets every tier target on the mean. **M4 status** (final default incl. the M4 Stage-2 stopping rule, 3 seeds): every tier meets its first-stage target on the mean on every measured dataset, including `trec-covid` Tier 1 at $K = 4,096$ (0.906) and Tier 2 at $K = 4,096$ (0.913, every pair); worst pairs below target are `T2Retrieval` `multilingual-e5-large` ← `bge-large-zh-v1.5` at $K = 2,048$ (0.871) and `trec-covid` Tier 1 `bge-large-en-v1.5` ← `bge-base-en-v1.5` (0.872 / 0.884). **End-to-end, first measured for Tiers 2 and 4** ($K = 2,048$, `bge-reranker-v2-m3`, `nDCG@5` $\rho_{\text{ceil}}$ at top-30 / 60 / 100): `trec-covid` Tier 1 0.982 / 1.011 / 1.015 and Tier 3 0.998 / 1.018 / 1.007; Tier 4a (`fiqa`) 0.975 / 0.992 / 1.011; Tier 5a (`xquad-zh`) 0.913 / 0.944 / 0.959; **Tier 2 (`T2Retrieval`) 0.922 / 0.952 / 0.965**, so Tier 2 needs the top-100 pool to meet 96% (both directions are at 0.95 at top-60; the Stage-2 health flag widens the pool for the mE5-index direction only). As the benchmark broadens (§7.1), targets should be read as the median across datasets, with the worst dataset reported alongside.
+† **Revised and approved 2026-10-30,** stated for a hard domain (`fiqa`). The original Tier 1 target ($\ge 95\%$) is out of reach for a linear query map on `fiqa` (89–92% at $K$ = 2,048–4,096), though it is met on the easy `scifact` (97%). **All tiers also target `Recall@100` $\rho_{\text{ceil}} \ge 90\%$,** so a reranker can recover the rest. As the benchmark broadens (§7.1), read the targets as the median across datasets, with the worst dataset reported alongside. Tiers 2, 4 and 5 keep their original targets.
+
+**Status up to about 171K documents** (final engine, 3 seeds, mean over pairs, Phase 0):
+
+- **First stage, `Recall@30`, $K$ = 2,048 / 4,096:** every tier meets its target on the mean on every measured dataset. Worst pairs below target: `T2Retrieval` `multilingual-e5-large` ← `bge-large-zh-v1.5` at $K = 2,048$ (0.871), `trec-covid` Tier 1 `bge-large-en-v1.5` ← `bge-base-en-v1.5` (0.872 / 0.884). Tier 4a (`fiqa`): Up 1.042 / 1.077 (ceiling = MiniLM re-index; 0.72–0.75 of the 4B native), Down 0.937 / 0.995. Tier 4b (MRL slices into `bge-large-en-v1.5`, $K = 2,048$): 0.90 / 0.89 / 0.82 / 0.70 at 768 / 512 / 256 / 128 dims.
+- **End to end, `nDCG@5` at pool 30 / 60 / 100, $K = 2,048$, `bge-reranker-v2-m3`:** `fiqa` 0.97 / 0.99 / 1.00; `trec-covid` Tier 1 0.982 / 1.011 / 1.015, Tier 3 0.998 / 1.018 / 1.007; Tier 4a (`fiqa`) 0.975 / 0.992 / 1.011; Tier 5a (`xquad-zh`) 0.913 / 0.944 / 0.959, with `harrier-oss-v1-0.6b` the worst at 0.923 / 0.938 at pool 60 / 100; Tier 2 (`T2Retrieval`) 0.922 / 0.952 / 0.965, so Tier 2 needs pool 100 to meet 96%.
 
 \* Provisional: re-baseline after Stage 1 smoke test. In v2.3 this target was stated against the $2560\text{d}$ oracle, which can exceed the source-capacity ceiling itself.
 
 > [!WARNING]
-> **At the default $K = 2,048$ the targets above are met only up to ~171K documents (close-out, MS MARCO, 2026-11-01); see the large-index profile below.** On MS MARCO passage (2,000 real Bing dev queries, untitled passages; never used for a decision), the default engine (Row 8b, 3 seeds) meets every first-stage and end-to-end target on a 50K-passage subsample (Tier 1 0.973 / 0.979, Tier 3 0.935 / 0.952 at $K$ = 2,048 / 4,096; end to end at top-60 0.988 / 0.962, every pair). On a **1M-passage** subsample with the same queries it misses all of them: first stage Tier 1 **0.859 / 0.889**, Tier 3 **0.725 / 0.779** (−16.2 points pooled vs. 50K, 0 of 36 cells better; `nDCG@10` −21.1), `Recall@100` 0.81–0.94, end to end at top-60 **0.931** (Tier 1) and **0.811** (Tier 3), top-100 0.951 / 0.844. Identity stays ≥ 0.998. A 20× denser index turns the same small query-map error into many more rank losses among near-duplicate passages, and the reranker can no longer recover them because the bridged top-100 misses them. Larger $K$ helps with diminishing returns (Tier 1 / 3 at $K$ = 8,192: 0.897 / 0.812; 16,384: 0.910 / 0.831) but encoding is linear in $K$, so 16,384 anchors would take the mount to ~28 s (`bge-large-en`) and ~68 s (0.6B decoders). The model-upgrade scenario (index from `all-MiniLM-L6-v2` / `bge-base-en-v1.5`, queries from `bge-large-en-v1.5` / `Qwen3-Embedding-0.6B`) keeps only 0.63–0.79 of the *old* model's own `Recall@30` at 1M. Mount (1.5–8.6 s) and solver (135–176 ms) are independent of $N$. 
->
-> **Why (diagnosis, 2026-11-01).** The same map, evaluated on growing subsets of one index, loses retention steadily (`Recall@30`, 50K / 200K / 500K / 1M: Tier 1 0.970 / 0.933 / 0.890 / 0.860; Tier 3 0.921 / 0.855 / 0.790 / 0.732 and 0.923 / 0.843 / 0.772 / 0.695), so density is the main cause and not map quality; the 50K result also flatters the bridge, since native `Recall@30` is 0.99 there. Most losses are near misses: the positive's median rank goes from 0 to 2–8, its 90th percentile from about 12 to 97–418. NQ at 1M (real Google queries, 3 seeds) replicates it: Tier 1 / 3 at $K = 2,048$ fall from 0.970 / 0.944 at 50K to 0.844 / 0.745. Proxy shape is minor: calibrating Stage 1 on real MS MARCO train queries instead of lead-sentence proxies adds 2–5 points at $K = 2,048$. Even 32,768 real query pairs reach only 0.91 / 0.83 / 0.89 at 1M (cosine to the native query ~0.76–0.79), which points to a limit of the linear map (no nonlinear map was tested). `scripts/scale_diagnosis.py`, `scripts/scale_anchors_depth.py`.
->
-> **Large-index profile ($N > 200\text{K}$, default since 2026-11-01): $K = 8,192$, random anchors, `rerank_pool = 300`.** Row 8b (3 seeds), `Recall@30` mean (worst pair), `Recall@100` worst pair:
->
-> | Corpus at 1M docs | Tier 1 `R@30` | Tier 1 `R@100` | Tier 3 `R@30` | Tier 3 `R@100` |
-> | :--- | :--- | :--- | :--- | :--- |
-> | MS MARCO (6 pairs) | 0.901 (0.891) | 0.936 | 0.823 (0.811) | 0.885 |
-> | NQ (3 pairs) | 0.877 | 0.936 | 0.839 (0.830) | 0.897 |
->
-> End to end (MS MARCO, one seed, 3 pairs, `bge-reranker-v2-m3`), `nDCG@5` $\rho_{\text{ceil}}$ at the bridged top-60 / 100 / **300**: Tier 1 0.953 / 0.963 / **0.981**; Tier 3 0.887–0.919 / 0.911–0.934 / **0.952–0.966**, so **top-300 meets the 98% / 94% end-to-end targets** (549 ms of reranking per query, measured with another job on the GPU). Against the first-stage targets, which were set per $K$ and have no $K = 8,192$ entry: read against the $K = 2,048$ targets (88% / 82%), Tier 1 is met on MS MARCO and 0.3 short on NQ, and Tier 3 is met on the mean on both, with MS MARCO's worst pair below; `Recall@100` ≥ 90% is missed at Tier 3 on both. The score over-predicts by about 3–9 points at this profile, so the report warns above $N = 200\text{K}$ and widens the pool. Nothing has been measured above 1M documents, and retention keeps falling with $N$. At $N$ = 1M the model-upgrade scenario was measured only at $K \le 4,096$ with lead proxies and at most top-100 (0.63–0.79 of the old model's own `Recall@30`).
+> **Retention falls as the index grows, and the targets above don't hold at every size on their own.** The same map on growing subsets of one index (MS MARCO, $K = 2,048$, `Recall@30`, 50K / 200K / 500K / 1M): Tier 1 0.970 / 0.933 / 0.890 / 0.860, Tier 3 0.921 / 0.855 / 0.790 / 0.732. NQ replicates it: 0.970 / 0.944 at 50K, 0.844 / 0.745 at 1M. A denser index turns the same small query error into more rank losses among near-duplicate passages, and most are near misses: the positive's median rank goes from 0 to 2–8. Small subsets also flatter the bridge (native `Recall@30` is 0.99 at 50K, 0.94 at 1M). Real queries instead of proxies add only 2–5 points at $K = 2,048$, and even 32,768 real query pairs reach only 0.83–0.91 at 1M, which points to a limit of the linear map; no nonlinear map was tested. `scripts/scale_diagnosis.py`, `scripts/scale_anchors_depth.py`.
+
+**Status above 171K documents (Phase 1, 2026-11-02).** End to end, `nDCG@5` $\rho_{\text{ceil}}$ at `rerank_pool = 300`, `bge-reranker-v2-m3`, $K$ = 8,192 random anchors, mean over pairs, 3 seeds. Tiers 1 and 3 only; Tiers 2, 4 and 5 are not measured above 171K. Tier 1 at 200K and 500K is one direction.
+
+| Corpus | Size | Queries | Tier 1 ($\ge 98\%$) | Tier 3 ($\ge 94\%$) |
+| :--- | :--- | :--- | :--- | :--- |
+| MS MARCO | 200K | 500 | 0.993 | 0.980 |
+| NQ | 200K | 500 | 0.999 | 0.995 |
+| MS MARCO | 500K | 500 | 0.990 | 0.965 |
+| NQ | 500K | 500 | 0.993 | 0.980 |
+| MS MARCO | 1M | 2,000 | 0.986 | 0.957 |
+| NQ | 1M | 2,000 | 0.989 | 0.972 |
+| HotpotQA | 1M | 2,000 | **0.956** | **0.898** |
+| MS MARCO | 8.84M | 2,000 | 0.963 [0.948, 0.977] | not measured |
+
+- **Best range (the approved targets, on every corpus measured at that size): 500K,** on MS MARCO and NQ. HotpotQA has not been measured at 500K. It reads 0.967 and 0.932 at 50K, pool 100, $K$ = 2,048, the largest pool measured there.
+- **1M passes on MS MARCO and NQ and misses on HotpotQA,** by 2.4 and 4.2 points. Its first stage is the weaker: `Recall@300` retention 0.946 and 0.896, against 0.970 and 0.942 on MS MARCO. The cause is untested.
+- **Supported range (the stretch line, 95% Tier 1 and 90% Tier 3): up to 1M,** with HotpotQA's Tier 3 0.2 points under the line, inside the $\pm 0.3$ re-encoding noise.
+- **8.84M is a Tier 1 first look only: measured, not recommended.** A rule fixed in advance stopped the work there, because $0.95 \le T < 0.97$ with $T = 0.963$. Tier 3 has been about 3× Tier 1's loss up to 1M on MS MARCO, which would predict 0.889, but that ratio is unmeasured above 1M (2.3× on HotpotQA and 2.5× on NQ at 1M). First-stage `Recall@300` retention there is 0.901; $K$ = 32,768 adds 1.3 points.
+- **The smallest pool that passes is not the default.** Pool 200 passes on MS MARCO and NQ at 1M (Tier 1 0.982 on both, Tier 3 0.947 and 0.962) and misses on HotpotQA, so the default stays 300 (§5). Pools below that are available with `pool=`.
+- **Smaller index models do worse:** `minilm` ← `bge-large-en` reads 0.935 and `minilm` ← `qwen3-0.6b` 0.912 at 1M, pool 300. They are not in the approved target set; Tier 4's line is 92%.
+- **Through HNSW** ($M = 32$, $\text{ef}_{\text{construction}} = 200$, MS MARCO 1M only), Tier 1 reads 0.983 at pool 300 and ef 500, against 0.986 exact. Tier 3's one indexed pair shows no loss.
+
+**Speed, one query on the reference machine** (`scripts/summarize_library.py`): on 10 CPU threads, short passages take 11 s up to 200K and 51 s above it; long documents take 36 s and 171 s, so they cross a minute just above 200K, where the pool steps from 60 to 300. The GPU takes at most 1.3 s at p95 up to 1M. CPU rerank seconds $\approx 1.91\text{ ms} \times \text{pool} \times \text{tokens per pair}$, within 4.0% on average and 9.6% at worst over five corpora from 97 to 412 tokens per pair. At 1M, re-indexing pays for itself on compute after about 2,900-6,900 queries with the larger query models and about 130-1,100 with the smaller two.
 
 * **Solver Budget (any model, reference hardware):** Stage-1 + Stage-2 + validation on precomputed embeddings should take about **$250\text{ ms}$** on the RTX 5070 Ti. This is a reference for spotting regressions, not a promise on other machines. Measured at the default $K$: 143–176 ms for indexes up to 1024-d, 173 ms into a 2560-d index; 239–263 ms at the large-index $K = 8,192$.
 * **Mount Budget (revised and approved 2026-11-01):** the mount encodes the $K$ query proxies plus, for doc↔doc pairs, the $K$ anchor docs **truncated to 128 tokens** (`spacebridge.DOC_PAIR_TOKENS`, configurable), and its cost is bounded **relative to re-indexing the corpus with $M_{\text{tgt}}$**:
@@ -109,7 +128,7 @@ A fixed number of seconds cannot hold for every corpus, $K$ and machine, and the
 >
 > Before truncation (M3, full-length anchor docs, 200–280 tokens) the doc-pair pass was ~3× the proxy pass: 7.1 s for `bge-large-en-v1.5`, 8.8 s for `EmbeddingGemma 2`, 15.7 s for the 0.6B decoders. **Retention cost of 128-token anchor docs** (Row 8b, 128 − full, 3 seeds, Tier 1 + 3, $K$ = 2,048 / 4,096): `fiqa` (decision set) −0.3 to −0.5 points; held-out `hotpotqa` +0.0 [−0.1, +0.1] (36 cells, short passages, so truncation rarely bites); held-out `trec-covid` −0.4 [−0.7, −0.2] pooled with the M4 Stage-2 stopping rule (the M2 rule's stopping flips had masked it as −0.2 [−0.9, +0.5]); the largest cost is Tier 3 at $K = 2,048$, −0.8 [−1.3, −0.3] (10 of 12 cells negative), where anchor docs are ~200+-token abstracts; `fiqa` under the same rule is −0.5 [−0.7, −0.3] pooled, −0.8 at Tier 3. 256-token anchor docs recover most of it (−0.2 / −0.1 pooled on `trec-covid` / `fiqa`) but take the mount to 5.7 s (`bge-large-en-v1.5`), 6.8 s (`EmbeddingGemma 2`) and 11.5–11.8 s (0.6B decoders), which the relative budget would now allow; 128 tokens stays the default, and the length is a parameter (`--doc-pair-tokens`, `spacebridge.DOC_PAIR_TOKENS`). Query-time projection: 24–54 µs on CPU. Up-projection into a 2560-d index exceeded the solver budget (263 ms at $K = 2,048$; Stage 2's logits scale with $d_s$) until the M4 width-aware Stage-2 batch (§4.3): now 173 ms at $K = 2,048$ and 208 ms at 4,096.
 
-* **Online Overhead:** Query-time projection must take **$< 0.1\text{ ms}$** on CPU (one $d_t \times d_s$ mat-vec, $\le 10^6$ MACs) with **zero duplicate or rewritten vector indices** on disk. Operator D rescoring (only on `MODERATE_DRIFT`) adds **$\approx 1\text{–}3\text{ ms}$** on CPU.
+* **Online Overhead:** Query-time projection must take **$< 0.1\text{ ms}$** on CPU (one $d_t \times d_s$ mat-vec, $\le 10^6$ MACs) with **zero duplicate or rewritten vector indices** on disk. Operator D rescoring would add **$\approx 1\text{–}3\text{ ms}$** on CPU; it is designed, not implemented (§3).
 
 ### 2.2 Non-Goals
 * **Anything above 8.84M documents.** It is the limit of the one machine this project runs on (§1).
@@ -126,43 +145,38 @@ Modern asymmetric embedding models map **queries** (with task instructions or `"
 
 `SpaceBridge` handles all three shifts on the query side only.
 
-> [!NOTE]
-> **Superseded (2026-11-01).** This flowchart predates the large-index profile, advisory routing and the mandatory reranker above 200K documents. It is kept until it is redrawn with the Phase 1 serving path.
+The chart shows what the library does (`freeze`, `mount`, `Searcher`). Operator D (§4.3), BM25 fusion and language detection are designed but not implemented; a caller passes the query language, and the first stage is the bridged dense search alone.
 
 ```mermaid
 flowchart TD
-    subgraph Freeze["1. Index Freeze Phase (Source Model M_src, Lang L_src) - offline, once"]
-        Docs["Corpus Documents (N)"] --> EncDoc["Encode Docs M_src^doc -> Index E_src (never modified)"]
-        EncDoc --> Medoids["Select K Medoid Docs (D_anchor, X^d), K = min(2048, N)"]
-        Medoids --> ExtractQ["Extract Title or Lead-Sentence Proxies (Q_anchor)"]
-        ExtractQ --> EncSrcQ["Encode Query Proxies M_src^query -> X^q, mu_X^q"]
-        EncDoc --> Distract["Sample 50K Distractor Row IDs for rho_val"]
+    subgraph Freeze["1. freeze: once, with M_src, or with no model if M_src is retired"]
+        Docs["Frozen index: vectors E_src (never modified) and document text"] --> Anchors["K anchors: K = 2,048 k-means medoids up to 150K docs, K = 8,192 random above"]
+        Anchors --> Proxies["Title or lead-sentence query proxies"]
+        Proxies --> EncSrc["M_src encodes the proxies -> X^q (skipped if retired)"]
+        Docs --> Distract["Sample up to 50K distractor rows for rho_val"]
     end
 
-    subgraph Mount["2. Mount & Calibrate Phase (solver < 250ms; encoding cost per model class)"]
-        EncSrcQ --> CalibBundle["Calibration Bundle: Q_anchor, X^q, X^d, mu_X^q, distractor IDs"]
-        Distract --> CalibBundle
-        CalibBundle --> LangBridge{"Disjoint Monolingual? (Regime L2)"}
-        LangBridge -- "No (Same-Lang or Multilingual M_tgt)" --> EncTgtQ["Y^q = M_tgt^query(Q_anchor)"]
-        LangBridge -- "Yes (zh-Only Index + en-Only M_tgt)" --> StaticBank["Static FLORES Bank (Belebele-overlap removed)"]
-        StaticBank --> Stage1["Stage 1 (~15ms): Scaled Truncated Stiefel / Primal-Dual Ridge -> W_0"]
-        EncTgtQ --> Stage1
-        Stage1 --> Stage2["Stage 2 (~60ms GPU): ≤ 50-Step InfoNCE + Teacher KL -> W*"]
-        Stage2 --> Val["rho_val vs. anchors + 50K distractors (per language)"]
+    subgraph Mount["2. mount: with each new query model M_tgt"]
+        EncSrc --> Bundle["Calibration bundle: anchors, proxies, X^q, X^d, split, distractor rows"]
+        Distract --> Bundle
+        Bundle --> Regime{"Can M_tgt read the corpus language?"}
+        Regime -- "Yes" --> EncTgt["M_tgt encodes the proxies -> Y^q, and anchor docs at 128 tokens -> Y^d (no doc pairs for 4B-class models)"]
+        Regime -- "No: Regime L2" --> StaticBank["FLORES parallel sentences replace the corpus anchors, chosen at freeze"]
+        StaticBank --> Stage1
+        EncTgt --> Stage1["Stage 1: Stiefel or ridge -> W_0, Stiefel only without a teacher"]
+        Stage1 --> Stage2["Stage 2: 50 steps of InfoNCE + teacher KL -> W*, InfoNCE only without a teacher"]
+        Stage2 --> Report["Quality report: score, grade, advisory rerank pool; no score without a teacher"]
     end
 
-    subgraph Online["3. Online Retrieval Phase (Query in Lang L_q)"]
-        UserQ["User Query"] --> LangID["L_q = caller-provided or LangID model"]
-        LangID --> TgtOnline["q_raw = M_tgt^query(User Query)"]
-        TgtOnline --> LangCenter["Subtract Language-Adjusted Query Mean mu_Y,Lq^q"]
-        LangCenter --> Proj["Project via W*, add mu_X^q, L2 Normalize -> q_hat_src"]
-        Proj --> Hybrid["ANN on unmodified E_src (+ BM25 if L_q == L_src)"]
-        Hybrid --> DriftCheck{"Confidence Tier?"}
-        DriftCheck -- "HIGH" --> Rerank["Multilingual Cross-Encoder -> Top-5"]
-        DriftCheck -- "MODERATE" --> RelRescore["Operator D Relative Rescore (Top-200) -> Top-60"]
-        DriftCheck -- "LOW" --> Wide["Warn + Widen Pool to Top-100"]
-        RelRescore --> Rerank
-        Wide --> Rerank
+    subgraph Online["3. Searcher: one query, language given by the caller"]
+        UserQ["Query"] --> TgtOnline["q_raw = M_tgt^query(query)"]
+        TgtOnline --> LangCenter["Subtract the query mean; a registered language has its own mean"]
+        LangCenter --> Proj["Project via W*, add mu_X^q, L2 normalize"]
+        Proj --> Search["HNSW or exact search of E_src, top-pool"]
+        Report --> Pool["pool: set by hand, or the report's: §5"]
+        Pool --> Search
+        Search --> Fetch["Fetch document text"]
+        Fetch --> Rerank["Cross-encoder -> top-k. Required above 200K documents"]
     end
 ```
 
@@ -266,6 +280,8 @@ with $\tau = 0.05$ (or $0.6\,\sigma_T$ on compressed-score indexes, below), $\al
 > **Size-dependent (M3, Tier 4).** For 4B-class query models the doc-pair pass costs 51 s at $K = 2,048$ (70 s mount) and gives no measurable gain: `Qwen3-Embedding-4B` queries into a MiniLM index, Row 8b − Row 8 = +0.1 ± 3.0 points `Recall@30` (3 seeds; +2.6 ± 0.4 at $K = 4,096$). The mount protocol is therefore doc pairs for query models up to ~0.6B (gains of +1.6 to +7.4 points across `fiqa`, `trec-covid` and the MRL sweep, for seconds of encoding), with anchor docs encoded truncated to 128 tokens (§2.1), and `doc_pairs=False` for 4B-class models.
 
 #### Operator D: Candidate-Scoped Relative Representation Rescorer (Zero Extra Index)
+**Designed, not implemented:** the library has no code for it and the serving path does not use it (§3, §5).
+
 Applied strictly in-memory over `Top-200` first-stage candidates $\mathcal{C}_{200}$ against $K_{\text{ref}} = 512$ reference anchor **documents** when moderate drift is detected. Both sides are profiled against the *same* 512 documents, so profile coordinates are comparable across spaces:
 
 1. **Lazy setup (first `MODERATE_DRIFT` mount only):** encode the 512 reference anchor docs with $M_{\text{tgt}}^{\text{doc}}$ to get $Y_{\text{ref}}^{(d)}$; $X_{\text{ref}}^{(d)}$ is already in the bundle.
@@ -343,15 +359,21 @@ where the student uses $\hat{q}_{\text{src}}$ and the teacher uses native $X^{(q
 
 **Per-language validation (Regime L1).** English-anchor $\rho_{\text{val}}$ says nothing about Chinese queries. For each registered $L_q$, a second score $\rho_{\text{val}, L_q}$ uses FLORES `devtest` pairs (disjoint from the 256 `dev` sentences used for $\Delta\mu$): $L_q$ sentences are projected as queries and must retrieve their $L_{\text{src}}$ counterparts, encoded once by $M_{\text{src}}^{\text{doc}}$ and mixed into $\mathcal{P}$. Routing uses $\rho_{\text{val}, L_q}$ for queries in $L_q$.
 
-**Interim routing, superseded (2026-11-01):** the §5.1 grade table and the advisory pool rule replace this table, which is kept until §5 is rewritten with the Phase 1 serving path.
+**What the library does (Phase 1, 2026-11-02).** The index size and the §5.1 grade set the rerank pool. The $\rho_{\text{val}}$ label in `bridge.status` is reported but routes nothing, and Operator D and BM25 fusion are not in the serving path (§3).
 
-| Validation Retention $\rho_{\text{val}}$ | Alignment Status | Online Retrieval Pipeline Action |
+| Index | Rerank pool (`QualityReport.rerank_pool`; `pool=` overrides it) | Reranker in `Searcher` |
 | :--- | :--- | :--- |
-| **$\rho_{\text{val}} \ge 0.58$** | `HIGH_CONFIDENCE` | Linear ANN ($W^*$) + BM25 (if $L_q == L_{\text{src}}$) (`rerank_pool = 30`) $\to$ Cross-Encoder Top-5. |
-| **$0.40 \le \rho_{\text{val}} < 0.58$** | `MODERATE_DRIFT` | Fetch `Top-200` $\to$ in-memory **Operator D Relative Rescorer** $\to$ Cross-Encoder on `rerank_pool = 60`. |
-| **$\rho_{\text{val}} < 0.40$** | `LOW_ALIGNMENT_WARN` | Emit warning, widen `rerank_pool = 100`, and recommend background native re-indexing if sustained. |
+| Up to 200K documents | Grade A or B: 60. Grade C or D, a Stage-2 health flag, or a source-model-free fit: 100 | Optional |
+| Above 200K documents | 300 with a warning, whatever the grade | Required: raises `ValueError` unless `allow_no_reranker=True` |
+| A bridge with no quality report | 60 up to 200K documents, 300 above | As above |
 
-The thresholds come from the calibration study (§7.4): over 180 `scifact` fits (6 pairs × 6 anchor counts × 5 solver settings), real `Recall@30` ceiling retention $\approx 0.85\,\rho_{\text{val}} + 0.41$ ($R^2 = 0.87$, residual s.d. 4 points; Spearman 0.89 pooled, 0.93 within pairs), so $\rho_{\text{val}} = 0.58$ / $0.40$ correspond to $\approx 90\%$ / $75\%$ retention. Agreement is on a different scale from retention: a $\rho_{\text{val}}$ of 0.6 already means $\approx 92\%$ retention. **On `fiqa` these thresholds did not transfer** (the same fit implies 0.505 / 0.347, and no `fiqa` fit reached `HIGH_CONFIDENCE`), so the fixed-threshold table above is superseded by the calibrated quality score in §5.1.
+A bridge saved before a rule changes keeps the pool stored in its report.
+
+**Why 300 above 200K, not 200.** End to end, $K$ = 8,192, 2,000 queries, 3 seeds, Tier 1 then Tier 3 mean at pool 200: MS MARCO 1M 0.982 and 0.947, NQ 1M 0.982 and 0.962, which pass, and through HNSW at ef 500 on MS MARCO, by 0.03 points. The held-out HotpotQA 1M misses at pool 200 (0.940, 0.879) and also at pool 300 (0.956, 0.898), so the default stays 300 and 1M is outside the best range (§2.1).
+
+**Known gap at or below 200K.** The library serves pool 60 at 100K and 150K on MS MARCO and NQ, because every pair grades A or B, and that misses: at 150K, Tier 1 and Tier 3 read 0.976 and 0.918 on MS MARCO, 0.979 and 0.938 on NQ; at 100K, Tier 3 reads 0.933 on MS MARCO (K = 2,048, 500 queries, 3 seeds). The routing is unchanged, pending a decision.
+
+**The earlier thresholds.** $\rho_{\text{val}} = 0.58$ and $0.40$ came from 180 `scifact` fits (real `Recall@30` ceiling retention $\approx 0.85\,\rho_{\text{val}} + 0.41$, $R^2 = 0.87$) and did not transfer to `fiqa` (the same fit implies 0.505 and 0.347). They now only name the `bridge.status` label.
 
 ### 5.1 Conversion Quality Report (Simple Score, Detailed Measurements, Per-Query Confidence)
 
@@ -366,10 +388,10 @@ Approved routing (2026-10-30), **made advisory 2026-10-31** (after the M2 calibr
 | Grade | Score | Default routing (`QualityReport.rerank_pool`) |
 | :--- | :--- | :--- |
 | **A** | $\ge 95$ | `rerank_pool = 60` (was 30) |
-| **B** | $85\text{–}95$ | `rerank_pool = 60` (+ Operator D) |
+| **B** | $85\text{–}95$ | `rerank_pool = 60` |
 | **C** | $70\text{–}85$ | `rerank_pool = 100`, warn |
 | **D** | $< 70$ | `rerank_pool = 100`, warn and recommend native re-indexing |
-| *any, index above 200K docs* | | `rerank_pool = 300`, warn (2026-11-01, §2.1) |
+| *any, index above 200K docs* | | `rerank_pool = 300`, warn (§5) |
 
 Unscored reports (no calibration available) also get 60. Why advisory: the score transfers to an unseen corpus with a ±4.3-point error, about half a grade, and it over-predicts hard corpora (`trec-covid` by 8 points), so an A could put a hard corpus at `rerank_pool = 30`, where Tier 3 misses its end-to-end target even on `fiqa` (mean 0.94, worst 0.89–0.91). At 60, `fiqa` meets the Tier 1 end-to-end target on every pair, and Tier 3 on 4 of 4 pairs with `bge-reranker-v2-m3` (worst 0.941) and 3 of 4 with `Qwen3-Reranker-0.6B` (worst 0.930). Shrinking the pool for grade A should come back only with a signal that detects hard datasets.
 
@@ -460,6 +482,15 @@ class CalibrationBundle:
 ```
 
 **On disk,** a bundle and a fitted bridge are each a directory: `arrays.npz`, `meta.json` and `manifest.json`, which holds the kind, the format version and checksums. The manifest is written last and every file is written atomically (`spacebridge.durable`), so a save cut short by a crash fails to load, and saving again repairs it. A saved bridge holds what serving needs: $W$, the means, the quality report and the confidence map. Stage-2 checkpoints and the validation pool stay behind, so `validate_query_language` needs a fresh fit.
+
+**Serving.** `Searcher` runs encode, project, search, fetch and rerank, and returns a timing breakdown with each result.
+
+```python
+searcher = spacebridge.Searcher(bridge, tgt_encoder, backend, index, reranker=reranker)   # ExactBackend or HnswBackend
+result = searcher.search("query text", k=5)   # result.ids, .scores, .texts, .confidence, .pool, .timing_ms
+```
+
+The pool follows §5. Above 200K documents, `reranker=None` raises `ValueError` unless the caller passes `allow_no_reranker=True`. `result.confidence` is NaN for a source-model-free bridge, which has no teacher to calibrate it on; it serves normally otherwise. `HnswBackend` searches at `ef_search = 500` by default, and `build_hnsw` saves as it grows, so a rerun continues.
 
 `SpaceBridge.fit` remains available for ablation rows and studies. `fit(mode="auto")` requires `Y_doc_raw` unless the bridge was built with `doc_pairs=False`.
 
@@ -559,6 +590,18 @@ Every test pair runs through the following configurations:
 > **Held-out confirmation (M3).** The defaults were chosen on `fiqa` / `xquad-zh` test queries, so they were re-tested on `hotpotqa` (2,000 test queries, positive-preserving 50K-passage subsample; never used for a decision), Tier 1 + 3, 3 seeds. Stage 2 replicates at FiQA's size: Row 8 − Row 6 = +1.2 to +2.5 points `Recall@30` and +2.5 to +4.1 `nDCG@10` across tiers and $K$ (34 of 36 pair-seed cells positive). Doc pairs replicate in direction but are smaller: Row 8b − Row 8 = +0.3 to +0.6 (28 of 36; Tier 1 alone within noise). Row 8b beats Row 6 in 36 of 36 cells and meets every tier's mean `Recall@30` target (Tier 1 0.913 / 0.932, Tier 3 0.842 / 0.889 at $K$ = 2,048 / 4,096); identity ≥ 0.997.
 >
 > **Held-out confirmation (close-out, MS MARCO).** Untitled passages with short real queries were the open Stage-2 risk (lead proxies, §4.3). On MS MARCO Stage 2 helps at both sizes: Row 8 − Row 6 at 50K Tier 3 +0.7 / +0.6 points `Recall@30` (12 / 12, 10 / 12 cells) and +1.3 / +1.5 `nDCG@10`; at 1M Tier 3 +1.5 / +2.0 and +2.1 / +2.9; the saved curves give Stage 1 alone −0.37 [−0.52, −0.22] / −0.34 [−0.52, −0.17] points `Recall@30` against the tail rule (50K, $K$ = 2,048 / 4,096). The one negative cell group is 50K Tier 1 at $K = 4,096$ (−0.2, 0 / 6 cells), pairs already at 0.98 of the ceiling. The risk stays open (trec-covid with lead proxies remains the only harmful case measured) but MS MARCO does not show it.
+
+### 7.3.1 Speed and crash safety of the harness (Phase 1)
+
+**Where the waiting goes.** Encoding is about 70–75% of a long run, so that is where the speed work went. Sorting by exact token count under a per-model token budget, instead of by characters with a fixed batch size, gains ×1.24–1.63 (31–37% of what the GPU processed had been padding, and raising the fixed batch size made it slower). Full-corpus encoding of three models on 8.84M documents fell from about 10.1 h to 6.8 h. Rerank scores are cached per (query, document) pair, and a cached 1M benchmark cell takes 2 s when repeated in a process. Solver, projection, metrics and input hashing are not worth optimizing.
+
+**On the CPU the reranker dominates query time:** at 1M, pool 300, short passages, it is 50.7 s of 50.8 s, against 109 ms to encode the query and 3 ms for HNSW search. §2.1 has the summary, and `scripts/summarize_library.py` the times by pool.
+
+**Results do not move.** The speed work changed no number beyond the noise floor: 53 values against saved Phase 0 results, largest change 0.062 points. A fresh encode can move `Recall@30` retention by up to about 0.3 points, which is the noise floor. Use one encoding method within a comparison.
+
+**Crash safety.** Every long job writes through `spacebridge_bench.durable` and continues from what is on disk when rerun: encoding parts at most every 2 minutes, rerank scores every 30 s, benchmark results per cell, HNSW builds at least every 10 minutes. Each was tested with a real `kill -9`, the HNSW build on a real 400K build (killed after a save, continued from 200,000 rows, recall 0.978 at ef 500). A real power loss was not tested; that case rests on `fsync`.
+
+**Run long jobs through `scripts/steps.sh`.** It also sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. Without that, exact search at 8.84M runs out of VRAM on 16 GB: its 7.6 GB shards fragment the allocator, and one run failed this way on its second shard.
 
 ### 7.4 Metrics Logged per Run
 * **Mount Wall-Clock Breakdown:** Anchor `bf16` encoding (`ms`, tokens/s), FLORES language shift (`ms`), Stage-1 Stiefel/Dual-Ridge (`ms`), Stage-2 GPU InfoNCE (`ms`), $\rho_{\text{val}}$ computation (`ms`), peak VRAM.
