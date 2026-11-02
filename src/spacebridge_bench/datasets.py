@@ -81,6 +81,16 @@ DATASETS: dict[str, DatasetSpec] = {
     "nq-full": DatasetSpec(
         "mteb/nq", "en", "Given a question, retrieve Wikipedia passages that answer the question", nested_docs=1_000_000,
     ),
+    # The same row order cut at 1M: prefixes up to 1M for models with no whole-corpus embeddings. Same documents as
+    # msmarco-1m and nq-1m, so scripts/reorder_embeddings.py makes their embeddings with no encoding.
+    "msmarco-1m-nested": DatasetSpec(
+        "mteb/msmarco", "en", "Given a web search query, retrieve relevant passages that answer the query",
+        max_docs=1_000_000, max_queries=2_000, split="dev", nested_docs=1_000_000,
+    ),
+    "nq-1m-nested": DatasetSpec(
+        "mteb/nq", "en", "Given a question, retrieve Wikipedia passages that answer the question", max_docs=1_000_000,
+        nested_docs=1_000_000,
+    ),
     # Tier 5a: XQuAD questions (human-translated) against all ~21K English SQuAD v1.1 paragraphs.
     "xquad-zh": DatasetSpec(
         "google/xquad", "en", "Given a question, retrieve Wikipedia passages that answer the question", query_lang="zh"
@@ -161,7 +171,7 @@ def _load_beir(name: str, split: Optional[str], seed: int) -> RetrievalDataset:
 
     all_ids = [str(i) for i in corpus["_id"]]
     if spec.nested_docs is not None:
-        corpus = corpus.select(_nested_order(all_ids, qrels, spec.nested_docs, seed))
+        corpus = corpus.select(_nested_order(all_ids, qrels, spec.nested_docs, seed)[: spec.max_docs])
     elif spec.max_docs is not None and len(all_ids) > spec.max_docs:
         corpus = corpus.select(_positive_preserving_subsample(all_ids, qrels, spec.max_docs, seed))
     doc_ids = [str(i) for i in corpus["_id"]]
