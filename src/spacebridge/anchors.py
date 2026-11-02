@@ -11,6 +11,11 @@ FPS_THRESHOLD = 5_000
 # Above this index size a fixed query error costs clearly more rank (MS MARCO, same map, Tier 3: 0.85 at 200K, 0.79 at
 # 500K, 0.73 at 1M), so large indexes get more anchors, and random ones: k-means over 1M docs did worse than a random
 # sample (-1.5 points Recall@30, 48/54 cells) while k-means wins on smaller sets (trec-covid, 171K: +1.3).
+# From LARGE_PROFILE_DOCS up that profile beats K = 2,048 k-means end to end (pool 60, Tier 3: +2.6 to +4.7 points on MS MARCO
+# and NQ at 100K-200K, +2.7 to +5.0 on held-out HotpotQA; no clear change on trec-covid at 50 queries). Below it, K = 8,192
+# is over the 10% mount budget on short passages: 1.1M tokens is 10% of about 145K MS MARCO documents.
+LARGE_PROFILE_DOCS = 150_000
+# Above this a reranker is required, and the quality score is outside its calibrated range.
 LARGE_INDEX_DOCS = 200_000
 DEFAULT_ANCHORS = 2_048
 LARGE_INDEX_ANCHORS = 8_192
@@ -27,13 +32,13 @@ def _l2(a: np.ndarray) -> np.ndarray:
 
 def default_anchor_count(N: int) -> int:
     """The anchor budget K for an index of N documents (design §4.1)."""
-    return min(LARGE_INDEX_ANCHORS if N > LARGE_INDEX_DOCS else DEFAULT_ANCHORS, N)
+    return min(LARGE_INDEX_ANCHORS if N > LARGE_PROFILE_DOCS else DEFAULT_ANCHORS, N)
 
 
 def resolve_anchor_method(N: int, method: str = "auto") -> str:
-    """``auto``: ``random`` above ``LARGE_INDEX_DOCS``, else ``kmeans``."""
+    """``auto``: ``random`` above ``LARGE_PROFILE_DOCS``, else ``kmeans``."""
     if method == "auto":
-        return "random" if N > LARGE_INDEX_DOCS else "kmeans"
+        return "random" if N > LARGE_PROFILE_DOCS else "kmeans"
     return method
 
 
