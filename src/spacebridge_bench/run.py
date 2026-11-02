@@ -517,7 +517,7 @@ def main() -> None:
     p.add_argument("--pair", nargs="*", default=[], help="src:tgt model keys, e.g. bge-large-en:qwen3-0.6b")
     p.add_argument("--rows", nargs="*", default=[r for r in ROWS if r not in RERANK_DEPTH], choices=list(ROWS),
                    help="ablation rows; rerank rows 9n/9/9w are opt-in")
-    p.add_argument("--rerankers", nargs="*", default=list(RERANKERS), choices=list(RERANKERS))
+    p.add_argument("--rerankers", nargs="*", default=["bge-reranker-v2-m3", "qwen3-reranker-0.6b"], choices=list(RERANKERS))
     p.add_argument("--K", type=int, nargs="*", default=[0],
                    help="anchor budget(s); one run per value (0: spacebridge.default_anchor_count of the index)")
     p.add_argument("--seed", type=int, nargs="*", default=[0], help="one run per seed, in one process")

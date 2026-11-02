@@ -35,6 +35,9 @@ RERANKERS: dict[str, RerankerSpec] = {
     for spec in [
         RerankerSpec("bge-reranker-v2-m3", "BAAI/bge-reranker-v2-m3", instructed=False),
         RerankerSpec("qwen3-reranker-0.6b", "Qwen/Qwen3-Reranker-0.6B", instructed=True, batch_tokens=5_000),
+        # Lighter ones, for the CPU line (Phase 1 M2, Part E); not run by default. MIT and Apache-2.0; the second is English only.
+        RerankerSpec("bge-reranker-base", "BAAI/bge-reranker-base", instructed=False),
+        RerankerSpec("ms-marco-minilm", "cross-encoder/ms-marco-MiniLM-L6-v2", instructed=False),
     ]
 }
 

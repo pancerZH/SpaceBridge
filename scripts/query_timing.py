@@ -26,6 +26,8 @@ from spacebridge_bench.encode import Encoder, MountEncoder
 from spacebridge_bench.models import MODELS
 from spacebridge_bench.run import _first_docs
 
+DEFAULT_RERANKER = "BAAI/bge-reranker-v2-m3"
+
 
 def load(args):
     ds = load_beir(args.dataset)
@@ -86,6 +88,7 @@ def main() -> None:
     p.add_argument("--threads", type=int, default=10)
     p.add_argument("--n", type=int, default=20)
     p.add_argument("--no-rerank", action="store_true", help="time encode, project, search and fetch only")
+    p.add_argument("--reranker", default=DEFAULT_RERANKER, help="Hugging Face id of the cross-encoder")
     p.add_argument("--out", type=Path, default=None)
     args = p.parse_args()
 
@@ -111,13 +114,13 @@ def main() -> None:
         backend = HnswBackend(args.backend, ef_search=args.ef)
     load_s = time.perf_counter() - t0
     encoder = LiveQueryEncoder(args.query_model, ds.task, args.device)
-    reranker = None if args.no_rerank else RememberingReranker(CrossEncoderReranker(device=args.device))
+    reranker = None if args.no_rerank else RememberingReranker(CrossEncoderReranker(args.reranker, device=args.device))
     searcher = Searcher(bridge, encoder, backend, index, reranker, device=args.device, allow_no_reranker=args.no_rerank)
     if args.device.startswith("cuda"):
         torch.cuda.reset_peak_memory_stats()
     queries = ds.queries[: args.n + 1]
     for pool in args.pool:
-        key = f"{ds.name}|{args.backend}|{args.device}|t{args.threads}|pool{pool}|ef{args.ef}" + ("|norerank" if args.no_rerank else "")
+        key = f"{ds.name}|{args.backend}|{args.device}|t{args.threads}|pool{pool}|ef{args.ef}" + ("|norerank" if args.no_rerank else "") + (f"|{args.reranker}" if args.reranker != DEFAULT_RERANKER else "")
         if key in done:
             continue
         searcher.search(queries[0], pool=pool)  # warmup
@@ -127,7 +130,7 @@ def main() -> None:
             rows.append(out.timing_ms)
             if reranker is not None:
                 tokens.append(reranker.count_tokens())
-        rec = {"key": key, "dataset": ds.name, "N": ds.N, "backend": args.backend, "ef": args.ef, "device": args.device, "threads": args.threads, "pool": pool, "n": len(rows), "rerank": not args.no_rerank,
+        rec = {"key": key, "dataset": ds.name, "N": ds.N, "backend": args.backend, "ef": args.ef, "device": args.device, "threads": args.threads, "pool": pool, "n": len(rows), "rerank": not args.no_rerank, "reranker": args.reranker,
                "stages_ms": percentile_table(rows), "load_s": load_s, "index_model": args.index_model, "query_model": args.query_model}
         if tokens:
             rec["tokens_per_pair"], rec["tokens_per_doc"] = (float(v) for v in np.mean(tokens, axis=0))
