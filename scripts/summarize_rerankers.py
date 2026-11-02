@@ -112,6 +112,17 @@ def precision_table(records: list[dict]) -> None:
     print()
 
 
+def length_table(records: list[dict]) -> None:
+    print("## Precision and document length, by reranker. Index model's own first stage, no bridge\n")
+    print("| Reranker | Corpus | Queries | Pool | fp32 | bf16 | bf16 - fp32, points [95% CI] | Tokens per pair, top 5 (fp32) | Tokens per pair, pool |")
+    print("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    cells = {(r["reranker"], r["dataset"], r["n_queries"], r["pool"], r["variant"]): r for r in records}
+    for rr, ds, n, pool in sorted({k[:4] for k in cells}):
+        a, b = cells[rr, ds, n, pool, "fp32"], cells[rr, ds, n, pool, "bf16"]
+        print(f"| `{rr}` | {ds} | {n} | {pool} | {a['ndcg@5']:.3f} | {b['ndcg@5']:.3f} | {100 * b['difference_from_fp32']:+.2f} [{100 * b['ci_difference'][0]:+.2f}, {100 * b['ci_difference'][1]:+.2f}] | {a['top5_tokens']:.0f} | {a['pool_tokens']:.0f} |")
+    print()
+
+
 def timing_name(r: dict) -> str:
     rr = r.get("reranker") or "BAAI/bge-reranker-v2-m3"
     return next(name for name, mark in reversed(TIMINGS.items()) if mark is None or mark in rr)
@@ -169,6 +180,7 @@ def main() -> None:
     light_tables(by_cell(read(sorted((ROOT / "m2_e").glob("rr_*.jsonl")))))
     int8_table(read(sorted((ROOT / "m2_e_int8").glob("*.jsonl"))))
     precision_table(read([ROOT / "m2_e_more/precision.jsonl"]))
+    length_table(read([ROOT / "m2_e_more/length.jsonl"]))
     timing_table(read([ROOT / "m1_timing/timing.jsonl", ROOT / "m2_timing/timing.jsonl", ROOT / "m2_e_timing/timing.jsonl"]))
     free_tables(read([ROOT / "m2_e_more/free_nq2k.jsonl"]), read([*sorted((ROOT / "w3_1m").glob("nq1m_e2e*.jsonl")), ROOT / "m2_pools/nq1m.jsonl"]))
 
