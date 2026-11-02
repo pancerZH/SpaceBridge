@@ -29,3 +29,6 @@ runs/
 
 # Local performance reports (kept off GitHub)
 docs/reports/
+
+# Written by examples/quickstart.py
+/quickstart/
