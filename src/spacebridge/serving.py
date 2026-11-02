@@ -126,7 +126,8 @@ class SearchResult:
     ids: np.ndarray                 # row ids, best first
     scores: np.ndarray              # reranker scores, or first-stage scores without a reranker
     texts: list[str]
-    confidence: float               # predicted top-10 agreement with native retrieval (design §5.1)
+    confidence: float               # predicted top-10 agreement with native retrieval (design §5.1); NaN for a
+                                    # source-model-free bridge, which has no teacher to calibrate it on
     pool: int                       # candidates sent to the reranker
     timing_ms: dict[str, float] = field(default_factory=dict)  # encode, project, search, fetch, rerank, total
 

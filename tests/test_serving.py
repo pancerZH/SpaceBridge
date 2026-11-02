@@ -81,6 +81,13 @@ def test_searcher_without_a_report_follows_the_index_size():
     assert Searcher(bridge, tgt, backend, index, rr, pool=17).pool == 17
 
 
+def test_a_source_free_bridge_serves_with_nan_confidence():
+    vectors, index, src, tgt = make_mount_world(n_docs=800)
+    bridge = mount(freeze(index, None, K=300, device="cpu"), index, tgt, device="cpu")
+    out = Searcher(bridge, tgt, ExactBackend(vectors), index, ReverseAlphabetReranker(), pool=30).search("question 5", k=3)
+    assert len(out.ids) == 3 and np.isnan(out.confidence)
+
+
 def test_hnsw_build_continues_after_a_crash_and_finds_neighbours(tmp_path):
     pytest.importorskip("faiss")
     import faiss
