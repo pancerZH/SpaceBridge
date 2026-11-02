@@ -126,8 +126,10 @@ def main() -> None:
         backend = HnswBackend(args.backend, ef_search=args.ef)
     load_s = time.perf_counter() - t0
     encoder = LiveQueryEncoder(args.query_model, ds.task, args.device)
-    inner = OnnxReranker(args.reranker[5:], args.threads) if args.reranker.startswith("onnx:") else CrossEncoderReranker(args.reranker, device=args.device)
-    reranker = None if args.no_rerank else RememberingReranker(inner)
+    reranker = None
+    if not args.no_rerank:
+        onnx = args.reranker.startswith("onnx:")
+        reranker = RememberingReranker(OnnxReranker(args.reranker[5:], args.threads) if onnx else CrossEncoderReranker(args.reranker, device=args.device))
     searcher = Searcher(bridge, encoder, backend, index, reranker, device=args.device, allow_no_reranker=args.no_rerank)
     if args.device.startswith("cuda"):
         torch.cuda.reset_peak_memory_stats()
