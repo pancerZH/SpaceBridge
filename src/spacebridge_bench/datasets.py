@@ -48,6 +48,11 @@ DATASETS: dict[str, DatasetSpec] = {
         "mteb/hotpotqa", "en", "Given a multi-hop question, retrieve documents that can help answer the question",
         max_docs=50_000, max_queries=2_000,
     ),
+    # Held-out check of the default pool above 200K (Phase 1 M2): the corpus at the size where that default applies.
+    "hotpotqa-1m": DatasetSpec(
+        "mteb/hotpotqa", "en", "Given a multi-hop question, retrieve documents that can help answer the question",
+        max_docs=1_000_000, max_queries=2_000,
+    ),
     "quora": DatasetSpec(
         "mteb/quora", "en", "Given a question, retrieve questions that are semantically equivalent to the given question",
         max_docs=50_000, max_queries=2_000,

@@ -3,6 +3,8 @@
 ``fit`` saves a bridge. ``run`` then times real queries with their real candidates, on the device given: use
 ``CUDA_VISIBLE_DEVICES=`` for CPU numbers. One JSON line per timed configuration goes to --out; a rerun skips it. The first
 query of a configuration only warms up and is not counted. The time of a stage is its median and 95th percentile over queries.
+Each record also has the candidates' mean tokens per (query, document) pair and per document, truncated at the reranker's
+limit, counted between queries so they cost no timed work.
 
     uv run python -u scripts/query_timing.py fit msmarco-full --index-model bge-large-en --query-model qwen3-0.6b --max-docs 1000000 --device cuda --bridge b/
     CUDA_VISIBLE_DEVICES= uv run --extra hnsw python -u scripts/query_timing.py run msmarco-full --index-model bge-large-en \
@@ -17,6 +19,7 @@ import numpy as np
 import torch
 
 from spacebridge import CrossEncoderReranker, ExactBackend, HnswBackend, Index, Searcher, SpaceBridge, freeze, mount
+from spacebridge.encoders import token_lengths
 from spacebridge_bench import durable
 from spacebridge_bench.datasets import load_beir
 from spacebridge_bench.encode import Encoder, MountEncoder
@@ -45,6 +48,22 @@ class LiveQueryEncoder:
 
     def encode_queries(self, texts: list[str]) -> np.ndarray:
         return self.encoder.encode([self.spec.format_query(t, self.task) for t in texts], cache=False)
+
+
+class RememberingReranker:
+    """Passes scoring through, keeping the last candidates so their tokens can be counted outside the timed path."""
+
+    def __init__(self, inner: CrossEncoderReranker):
+        self.inner, self.last = inner, None
+
+    def score(self, query: str, docs: list[str]) -> np.ndarray:
+        self.last = (query, docs)
+        return self.inner.score(query, docs)
+
+    def count_tokens(self) -> tuple[float, float]:
+        query, docs = self.last
+        tok, limit = self.inner.model.tokenizer, self.inner.max_length
+        return float(token_lengths(tok, [query] * len(docs), docs, max_length=limit).mean()), float(token_lengths(tok, docs, max_length=limit).mean())
 
 
 def percentile_table(rows: list[dict]) -> dict:
@@ -92,8 +111,8 @@ def main() -> None:
         backend = HnswBackend(args.backend, ef_search=args.ef)
     load_s = time.perf_counter() - t0
     encoder = LiveQueryEncoder(args.query_model, ds.task, args.device)
-    reranker = None if args.no_rerank else CrossEncoderReranker(device=args.device)
-    searcher = Searcher(bridge, encoder, backend, index, reranker, device=args.device)
+    reranker = None if args.no_rerank else RememberingReranker(CrossEncoderReranker(device=args.device))
+    searcher = Searcher(bridge, encoder, backend, index, reranker, device=args.device, allow_no_reranker=args.no_rerank)
     if args.device.startswith("cuda"):
         torch.cuda.reset_peak_memory_stats()
     queries = ds.queries[: args.n + 1]
@@ -102,12 +121,16 @@ def main() -> None:
         if key in done:
             continue
         searcher.search(queries[0], pool=pool)  # warmup
-        rows, tokens = [], 0
+        rows, tokens = [], []
         for q in queries[1:]:
             out = searcher.search(q, pool=pool)
             rows.append(out.timing_ms)
+            if reranker is not None:
+                tokens.append(reranker.count_tokens())
         rec = {"key": key, "dataset": ds.name, "N": ds.N, "backend": args.backend, "ef": args.ef, "device": args.device, "threads": args.threads, "pool": pool, "n": len(rows), "rerank": not args.no_rerank,
                "stages_ms": percentile_table(rows), "load_s": load_s, "index_model": args.index_model, "query_model": args.query_model}
+        if tokens:
+            rec["tokens_per_pair"], rec["tokens_per_doc"] = (float(v) for v in np.mean(tokens, axis=0))
         if args.device.startswith("cuda"):
             rec["peak_vram_gb"] = torch.cuda.max_memory_allocated() / 2**30
         if args.out:
