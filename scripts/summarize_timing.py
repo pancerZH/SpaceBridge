@@ -12,8 +12,9 @@ from pathlib import Path
 
 import numpy as np
 
-# Smallest pool meeting the targets on the hardest corpus measured at each size (phase1-m1.md, smallest-pool table).
-POOLS = {5_183: 30, 10_000: 10, 20_000: 20, 50_000: 60, 100_000: 100, 171_332: 60, 200_000: 60, 500_000: 300, 1_000_000: 300}
+# Smallest pool meeting the targets at each size, among corpora with a pool that passes (scripts/summarize_library.py, Table 2).
+# HotpotQA has none tested at 50K or 1M, so these aren't the library's pools; Table 1 of that script shows those.
+POOLS = {5_183: 30, 10_000: 10, 20_000: 20, 50_000: 60, 100_000: 100, 150_000: 150, 171_332: 60, 200_000: 60, 500_000: 150, 1_000_000: 200}
 QUERY_TOKENS_ADDED = {"minilm": 0, "bge-base-en": 12, "bge-large-en": 12, "qwen3-0.6b": 20}  # per proxy, for the model's prompt
 QUERY_MODELS = ("minilm", "bge-base-en", "bge-large-en", "qwen3-0.6b")
 
