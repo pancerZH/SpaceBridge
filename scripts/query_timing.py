@@ -1,10 +1,10 @@
 """W5: wall-clock of one query through the shipped ``Searcher``, by stage. Run it on an idle machine.
 
-``fit`` saves a bridge (needs the GPU once). ``run`` then times real queries with their real candidates, on the device given:
-use ``CUDA_VISIBLE_DEVICES=`` for CPU numbers. One JSON line per timed configuration goes to --out; a rerun skips it. The first
+``fit`` saves a bridge. ``run`` then times real queries with their real candidates, on the device given: use
+``CUDA_VISIBLE_DEVICES=`` for CPU numbers. One JSON line per timed configuration goes to --out; a rerun skips it. The first
 query of a configuration only warms up and is not counted. The time of a stage is its median and 95th percentile over queries.
 
-    uv run python -u scripts/query_timing.py fit msmarco-full --index-model bge-large-en --query-model qwen3-0.6b --max-docs 1000000 --bridge b/
+    uv run python -u scripts/query_timing.py fit msmarco-full --index-model bge-large-en --query-model qwen3-0.6b --max-docs 1000000 --device cuda --bridge b/
     CUDA_VISIBLE_DEVICES= uv run --extra hnsw python -u scripts/query_timing.py run msmarco-full --index-model bge-large-en \
         --query-model qwen3-0.6b --max-docs 1000000 --bridge b/ --pool 300 --backend exact --device cpu --threads 10 --n 20 --out t.jsonl
 """
@@ -72,8 +72,8 @@ def main() -> None:
     ds, store = load(args)
     if args.mode == "fit":
         index = Index(store, ds.texts, ds.titles)
-        bundle = freeze(index, MountEncoder(MODELS[args.index_model], ds.task), ds.lang, args.seed)
-        mount(bundle, index, MountEncoder(MODELS[args.query_model], ds.task)).save(args.bridge)
+        bundle = freeze(index, MountEncoder(MODELS[args.index_model], ds.task, args.device), ds.lang, args.seed, device=args.device)
+        mount(bundle, index, MountEncoder(MODELS[args.query_model], ds.task, args.device), device=args.device).save(args.bridge)
         durable.progress(f"bridge saved to {args.bridge}")
         return
 
