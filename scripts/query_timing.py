@@ -66,6 +66,7 @@ def main() -> None:
     p.add_argument("--device", default="cpu")
     p.add_argument("--threads", type=int, default=10)
     p.add_argument("--n", type=int, default=20)
+    p.add_argument("--no-rerank", action="store_true", help="time encode, project, search and fetch only")
     p.add_argument("--out", type=Path, default=None)
     args = p.parse_args()
 
@@ -91,13 +92,13 @@ def main() -> None:
         backend = HnswBackend(args.backend, ef_search=args.ef)
     load_s = time.perf_counter() - t0
     encoder = LiveQueryEncoder(args.query_model, ds.task, args.device)
-    reranker = CrossEncoderReranker(device=args.device)
+    reranker = None if args.no_rerank else CrossEncoderReranker(device=args.device)
     searcher = Searcher(bridge, encoder, backend, index, reranker, device=args.device)
     if args.device.startswith("cuda"):
         torch.cuda.reset_peak_memory_stats()
     queries = ds.queries[: args.n + 1]
     for pool in args.pool:
-        key = f"{ds.name}|{args.backend}|{args.device}|t{args.threads}|pool{pool}|ef{args.ef}"
+        key = f"{ds.name}|{args.backend}|{args.device}|t{args.threads}|pool{pool}|ef{args.ef}" + ("|norerank" if args.no_rerank else "")
         if key in done:
             continue
         searcher.search(queries[0], pool=pool)  # warmup
@@ -105,7 +106,7 @@ def main() -> None:
         for q in queries[1:]:
             out = searcher.search(q, pool=pool)
             rows.append(out.timing_ms)
-        rec = {"key": key, "dataset": ds.name, "N": ds.N, "backend": args.backend, "ef": args.ef, "device": args.device, "threads": args.threads, "pool": pool, "n": len(rows),
+        rec = {"key": key, "dataset": ds.name, "N": ds.N, "backend": args.backend, "ef": args.ef, "device": args.device, "threads": args.threads, "pool": pool, "n": len(rows), "rerank": not args.no_rerank,
                "stages_ms": percentile_table(rows), "load_s": load_s, "index_model": args.index_model, "query_model": args.query_model}
         if args.device.startswith("cuda"):
             rec["peak_vram_gb"] = torch.cuda.max_memory_allocated() / 2**30
