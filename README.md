@@ -74,6 +74,7 @@ Seconds, p50 (p95), on 10 CPU threads or an RTX 5070 Ti. The library's pool sets
 - **A grade C or D bridge, or one with no source model, gets pool 100 up to 200K:** 17.5 s short, 60.6 s long.
 - **Your own documents, on a CPU like this one:** rerank seconds ≈ 1.91 ms × pool × tokens per pair, within 4% on average and 10% at worst over five corpora from 97 to 412 tokens per pair. One query reaches a minute at pool × tokens per pair ≈ 31,400. Long documents go through a 512-token limit.
 - **16 threads** is about 30% faster than 10 (28-30% at the three points measured).
+- **A faster reranker for CPU, measured but not in the library:** an int8 export of `bge-reranker-v2-m3` (`scripts/export_reranker_onnx.py`, needs `--extra onnx`) took 14 s short and 71 s long at pool 300 on this CPU, with no quality loss seen on 50-100 queries per corpus. That's too few to rule out a loss of a point or so, and the targets above aren't claimed for it. To use it, pass `Searcher` an object with a `score(query, docs)` method. `bge-reranker-base` and `ms-marco-MiniLM-L6-v2` score faster but lost up to 44 and 12 points of absolute `nDCG@5`, depending on the corpus, so we don't recommend them as general rerankers.
 
 ### Re-index or bridge
 
