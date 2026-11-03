@@ -257,8 +257,10 @@ class Timing:
         r = self.run(device, corpus, pool, lexical)
         if r is None:
             return float("nan")
-        st_ = {k: v[q] for k, v in r["stages_ms"].items()}
-        rest = st_["total"] - st_["search"] - st_.get("lexical", 0.0)
+        stage = r["stages_ms"]
+        if r["N"] == size:  # measured at this size: nothing to adjust
+            return stage["total"][q] / 1e3
+        rest = stage["total"][q] - stage["search"]["p50"] - stage.get("lexical", {"p50": 0.0})["p50"]  # the p50s, so a p95 can't fall under its p50
         return (rest + self.search_ms(device, size) + (self.lexical_ms(size) if lexical else 0.0)) / 1e3
 
 
@@ -312,7 +314,8 @@ def break_even() -> None:
         cells = []
         for size in (1_000_000, 8_841_823):
             sec = {d: size * rate[m, d]["tokens_per_doc"] / rate[m, d]["tokens_per_s"] for d in ("cuda", "cpu")}
-            cells += [", ".join(f"{sec[d] / 3600:.1f} h" for d in ("cuda", "cpu")), ", ".join(f"{sec[d] / lex[size] / 1e6:.1f}M" for d in ("cuda", "cpu"))]
+            cells += [", ".join(f"{sec[d] / 60:.0f} min" if sec[d] < 3600 else f"{sec[d] / 3600:.1f} h" for d in ("cuda", "cpu")),
+                      ", ".join(f"{sec[d] / lex[size] / 1e6:.1f}M" if sec[d] / lex[size] >= 1e6 else f"{sec[d] / lex[size] / 1e3:.0f}K" for d in ("cuda", "cpu"))]
         print(f"| `{m}` | " + " | ".join(cells) + " |")
 
 
