@@ -180,6 +180,51 @@ def test_a_query_in_another_language_skips_bm25_and_takes_the_plain_pool(world):
         bridge.quality = stored
 
 
+def test_translate_feeds_bm25_only_and_only_for_a_query_in_another_language(world):
+    vectors, index, tgt, bridge = world
+    lex, backend = LexicalIndex.build(index), ExactBackend(vectors)
+    bridge.register_query_language("zh", tgt.encode_queries(["question 1", "question 2"]), tgt.encode_queries(["question 3", "question 4"]))
+
+    class Remember(ReverseAlphabetReranker):
+        def score(self, query, docs):
+            self.query, self.docs = query, docs
+            return super().score(query, docs)
+
+    calls, rr = [], Remember()
+
+    def translate(query, lang):
+        calls.append((query, lang))
+        return "the title of document 123"
+
+    searcher = Searcher(bridge, tgt, backend, index, rr, pool=60, lexical=lex, translate=translate)
+    query = "问题 7"
+    out = searcher.search(query, k=3, query_lang="zh")
+    assert calls == [(query, "zh")] and rr.query == query  # the reranker keeps the original
+    assert out.pool == 60 and "translate" in out.timing_ms and out.timing_ms["translate"] >= 0
+    q_hat = bridge.transform_query(tgt.encode_queries([query]), query_lang="zh")
+    want = merge_pool(backend.search(q_hat, 60)[0], lex.top("the title of document 123", 15), 60)
+    assert rr.docs == [f"{t}\n{x}" for t, x in zip(index.titles(want), index.texts(want))]
+
+    calls.clear()
+    assert "translate" not in searcher.search("question 7 about document 9", k=3).timing_ms  # same language: nothing to translate
+    assert "translate" not in searcher.search("question 7 about document 9", k=3, query_lang="en").timing_ms
+    assert calls == []
+    no_translate = Searcher(bridge, tgt, backend, index, rr, pool=60, lexical=lex).search(query, k=3, query_lang="zh")
+    assert "translate" not in no_translate.timing_ms and set(no_translate.ids) <= set(backend.search(q_hat, 60)[0])  # skipped, as before
+
+
+def test_translate_needs_a_lexical_index_and_a_reranker(world):
+    vectors, index, tgt, bridge = world
+    lex, backend = LexicalIndex.build(index), ExactBackend(vectors)
+    identity = lambda q, lang: q
+    with pytest.raises(ValueError, match="needs a reranker and a lexical index"):
+        Searcher(bridge, tgt, backend, index, ReverseAlphabetReranker(), lexical=None, translate=identity)
+    with pytest.raises(ValueError, match="needs a reranker and a lexical index"):
+        Searcher(bridge, tgt, backend, index, ReverseAlphabetReranker(), translate=identity)  # auto stays off at 800 documents
+    with pytest.raises(ValueError, match="needs a reranker and a lexical index"):
+        Searcher(bridge, tgt, backend, index, lexical=lex, translate=identity)
+
+
 def report(grade=None, stored=60, **stage2):
     r = QualityReport({"stage2": stage2} if stage2 else {}, grade=grade, rerank_pool=stored)
     return r

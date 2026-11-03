@@ -139,7 +139,7 @@ class SearchResult:
     confidence: float               # predicted top-10 agreement with native retrieval (design §5.1); NaN for a
                                     # source-model-free bridge, which has no teacher to calibrate it on
     pool: int                       # candidates actually sent to the reranker
-    timing_ms: dict[str, float] = field(default_factory=dict)  # encode, project, search, lexical, fetch, rerank, total
+    timing_ms: dict[str, float] = field(default_factory=dict)  # encode, project, search, lexical, fetch, rerank, total, and translate if one ran
 
 
 class Searcher:
@@ -153,12 +153,16 @@ class Searcher:
     ``LexicalIndex`` is used whatever the size and language. ``None`` turns it off. With it on, the pool defaults to 60, or 100
     for a weak or source-free fit, and a query in a language other than the index's skips BM25 and takes the pool it would take
     with BM25 off.
+
+    ``translate(query, query_lang)``, off by default, returns such a query in the index's language, so that BM25 can read it. Only
+    BM25 reads the translation: the bridge and the reranker keep the original query. It needs a lexical index, so below
+    ``LEXICAL_MIN_DOCS`` pass one. Measured Chinese to English only (design §4.6).
     """
 
     def __init__(
         self, bridge: SpaceBridge, encoder: QueryEncoder, backend: SearchBackend, index: IndexReader,
         reranker: Optional[Reranker] = None, pool: Optional[int] = None, device: str = "cpu", allow_no_reranker: bool = False,
-        lexical: LexicalIndex | str | None = "auto",
+        lexical: LexicalIndex | str | None = "auto", translate: Optional[Callable[[str, str], str]] = None,
     ):
         if reranker is None and len(index) > LARGE_INDEX_DOCS and not allow_no_reranker:
             raise ValueError(
@@ -166,7 +170,9 @@ class Searcher:
                 "design §2.1); pass one, or allow_no_reranker=True to serve first-stage results anyway"
             )
         self.bridge, self.encoder, self.backend, self.index, self.reranker = bridge, encoder, backend, index, reranker
-        self.lexical = self._resolve_lexical(lexical)
+        self.lexical, self.translate = self._resolve_lexical(lexical), translate
+        if translate is not None and self.lexical is None:
+            raise ValueError("translate feeds BM25, so it needs a reranker and a lexical index: pass lexical=LexicalIndex.build(index)")
         self.plain_pool = pool or (bridge.quality.rerank_pool if bridge.quality is not None else size_rerank_pool(len(index)))
         self.pool = self.plain_pool
         if self.lexical is not None and pool is None:
@@ -192,7 +198,8 @@ class Searcher:
         return time.perf_counter()
 
     def search(self, query: str, k: int = 5, query_lang: Optional[str] = None, pool: Optional[int] = None) -> SearchResult:
-        lexical = self.lexical if query_lang in (None, self.bridge.src_lang) else None
+        foreign = query_lang not in (None, self.bridge.src_lang)
+        lexical = self.lexical if not foreign or self.translate is not None else None
         pool = pool or (self.pool if lexical is not None else self.plain_pool)
         timing = {}
         t0 = t = self._now()
@@ -209,8 +216,12 @@ class Searcher:
         lap("project")
         ids, scores = self.backend.search(q_hat, pool)
         lap("search")
+        text = query
+        if foreign and lexical is not None:
+            text = self.translate(query, query_lang)
+            lap("translate")
         if lexical is not None:
-            ids = merge_pool(ids, lexical.top(query, pool // LEXICAL_SHARE), pool)
+            ids = merge_pool(ids, lexical.top(text, pool // LEXICAL_SHARE), pool)
         lap("lexical")
         titles, texts = self.index.titles(ids), self.index.texts(ids)
         docs = [f"{title}\n{text}" if title else text for title, text in zip(titles, texts)]

@@ -180,6 +180,12 @@ def a6() -> None:
                 print(f"| {index} ← {tgt} | {pool} | {m(plain, 'ndcg5_exact'):.4f} | {m(plain, 'ndcg5_approx'):.4f} | {m(lex, 'ndcg5_exact'):.4f} | {m(lex, 'ndcg5_approx'):.4f} | {100 * (m(lex, 'ndcg5_approx') - m(lex, 'ndcg5_exact')):+.2f} | {m(lex, 'ndcg5_approx') / ceil:.3f} |")
 
 
+def one_m() -> None:
+    print("# What ships at 1M, through the rows\n")
+    print("Bold reaches the approved line: 0.98 Tier 1, 0.94 Tier 3. Mean over pairs, 3 seeds, 2,000 queries, K = 8,192, Tier 1 both directions.")
+    table(read("m3_1m/hp.jsonl", "m3_1m/ms.jsonl", "m3_1m/nq2k.jsonl"), ("9", "9w", "9x", "9h", "9hw", "9hx"), LINES, "## By budget")
+
+
 def full() -> None:
     print("# M3 C4: end to end above 1M\n")
     print("Bold reaches the stretch line: 0.95 Tier 1, 0.90 Tier 3. Mean over pairs, 3 seeds, 2,000 queries, K = 8,192.")
@@ -214,7 +220,7 @@ TABLE1 = [
     (171_332, "171K", True, 8192, [("TREC-COVID", ["m3_a6/trec_covid.jsonl"])]),
     (200_000, "200K", True, 8192, [("MS MARCO", ["m3_a6/ms200000.jsonl"]), ("NQ", ["m3_a6/nq200000.jsonl"]), ("HotpotQA", ["m3_a6/hp200000.jsonl"])]),
     (500_000, "500K", True, 8192, [("MS MARCO", ["m3_a6/ms500000.jsonl"]), ("NQ", ["m3_a6/nq500000.jsonl"]), ("HotpotQA", ["m3_a6/hp500000.jsonl"])]),
-    (1_000_000, "1M", True, 8192, [("MS MARCO", ["m3_1m/ms.jsonl"]), ("NQ", ["m3_1m/nq.jsonl"]), ("HotpotQA", ["m3_1m/hp.jsonl"])]),
+    (1_000_000, "1M", True, 8192, [("MS MARCO", ["m3_1m/ms.jsonl"]), ("NQ", ["m3_1m/nq2k.jsonl"]), ("HotpotQA", ["m3_1m/hp.jsonl"])]),
     (5_233_329, "5.23M", True, 8192, [("HotpotQA", ["m3_full/hp.jsonl"])]),
     (8_841_823, "8.84M", True, 8192, [("MS MARCO", ["m3_full/ms_t1.jsonl", "m3_full/ms_t3.jsonl"])]),
 ]
@@ -317,5 +323,36 @@ def b() -> None:
             print(f"| {name} | {budget} | " + " | ".join(cols) + f" | {', '.join(pools)} |")
 
 
+def b_confirm() -> None:
+    """The rule's confirmation: X2 and X3 against Row 7b, 3 seeds, 2 query models, then the comparators with the old model alive."""
+    recs = read("m3_b/confirm.jsonl")
+    print("\n## Confirmation: 3 seeds, K = 2,048, `bge-large-en` index, absolute `nDCG@5`\n")
+    print("Mean ± s.d. over seeds. Gain is points over Row 7b, paired by seed, with the seeds that gain.\n")
+    print("| Set | Query model | Budget | Row 7b | X2: BM25, opus-mt | Gain | X3: BM25, MADLAD | Gain |\n| --- | --- | --- | --- | --- | --- | --- | --- |")
+    idx = defaultdict(dict)
+    for r in recs:
+        idx[(r["dataset"], r["tgt"], r["budget"], r["candidate"])][r["seed"]] = r["metrics"]["ndcg@5"]
+    for ds, tgt, budget in sorted({k[:3] for k in idx}):
+        base = idx[(ds, tgt, budget, "7b")]
+        cols = [f"{st.mean(base.values()):.3f} ± {st.stdev(base.values()):.3f}"]
+        for c in ("X2", "X3"):
+            v = idx[(ds, tgt, budget, c)]
+            d = [100 * (v[s] - base[s]) for s in v]
+            cols += [f"{st.mean(v.values()):.3f} ± {st.stdev(v.values()):.3f}", f"{st.mean(d):+.1f} ± {st.stdev(d):.1f}, {sum(x > 0 for x in d)}/{len(d)}"]
+        print(f"| {ds} | {tgt} | {budget} | " + " | ".join(cols) + " |")
+    print("\n**Re-index on the same query model, for scale:**\n")
+    for (ds, tgt, budget, c), v in sorted(idx.items()):
+        if c == "reindex" and budget == 60:
+            print(f"- {ds}, {tgt}, budget 60: {st.mean(v.values()):.3f}")
+    old = {(r["dataset"], r["candidate"], r["budget"]): r["metrics"]["ndcg@5"] for r in read("m3_b/old_model.jsonl")}
+    print("\n## With the old model alive, for D4: absolute `nDCG@5`. No bridge, no seed, reranker reading the original query\n")
+    print("| Set | Budget | Native (human English) | Old model on opus-mt | + BM25 on it | Old model on MADLAD | + BM25 on it |\n| --- | --- | --- | --- | --- | --- | --- |")
+    for ds, budget in sorted({(k[0], k[2]) for k in old}):
+        print(f"| {ds} | {budget} | " + " | ".join(f"{old[(ds, c, budget)]:.3f}" for c in ("native", "TMo", "TBo", "TMm", "TBm")) + " |")
+
+
 if __name__ == "__main__":
-    {"a6": a6, "full": full, "b": b, "table1": lambda: table1(int(sys.argv[2]) if len(sys.argv) > 2 else 60)}[sys.argv[1]]()
+    if sys.argv[1] == "b_confirm":
+        b_confirm()
+        sys.exit()
+    {"a6": a6, "1m": one_m, "full": full, "b": b, "table1": lambda: table1(int(sys.argv[2]) if len(sys.argv) > 2 else 60)}[sys.argv[1]]()
