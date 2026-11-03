@@ -97,6 +97,7 @@ def main() -> None:
     p.add_argument("--backend", default="exact", help="exact, or the path of a saved HNSW index")
     p.add_argument("--ef", type=int, default=500)
     p.add_argument("--device", default="cpu")
+    p.add_argument("--search-device", default=None, help="where exact search runs, if not --device: an index too large for the GPU, with the models on it")
     p.add_argument("--threads", type=int, default=10)
     p.add_argument("--n", type=int, default=20)
     p.add_argument("--no-rerank", action="store_true", help="time encode, project, search and fetch only")
@@ -119,7 +120,7 @@ def main() -> None:
     index = Index(store, ds.texts, ds.titles)
     t0 = time.perf_counter()
     if args.backend == "exact":
-        backend = ExactBackend(store[np.arange(len(store))] if len(store) < 3_000_000 else _load_all(store), device=args.device)
+        backend = ExactBackend(store[np.arange(len(store))] if len(store) < 3_000_000 else _load_all(store), device=args.search_device or args.device)
     else:
         import faiss
 
@@ -137,7 +138,7 @@ def main() -> None:
         torch.cuda.reset_peak_memory_stats()
     queries = ds.queries[: args.n + 1]
     for pool in args.pool:
-        key = f"{ds.name}|{args.backend}|{args.device}|t{args.threads}|pool{pool}|ef{args.ef}" + ("|norerank" if args.no_rerank else "") + (f"|{args.reranker}" if args.reranker != DEFAULT_RERANKER else "") + ("|lexical" if lexical else "")
+        key = f"{ds.name}|{args.backend}|{args.device}|t{args.threads}|pool{pool}|ef{args.ef}" + ("|norerank" if args.no_rerank else "") + (f"|{args.reranker}" if args.reranker != DEFAULT_RERANKER else "") + ("|lexical" if lexical else "") + (f"|search-{args.search_device}" if args.search_device else "")
         if key in done:
             continue
         searcher.search(queries[0], pool=pool)  # warmup
@@ -148,7 +149,7 @@ def main() -> None:
             if reranker is not None:
                 tokens.append(reranker.count_tokens())
         rec = {"key": key, "dataset": ds.name, "N": ds.N, "backend": args.backend, "ef": args.ef, "device": args.device, "threads": args.threads, "pool": pool, "n": len(rows), "rerank": not args.no_rerank, "reranker": args.reranker,
-               "stages_ms": percentile_table(rows), "load_s": load_s, "lexical": lexical is not None, "index_model": args.index_model, "query_model": args.query_model}
+               "stages_ms": percentile_table(rows), "load_s": load_s, "lexical": lexical is not None, "search_device": args.search_device or args.device, "index_model": args.index_model, "query_model": args.query_model}
         if tokens:
             rec["tokens_per_pair"], rec["tokens_per_doc"] = (float(v) for v in np.mean(tokens, axis=0))
         if args.device.startswith("cuda"):
