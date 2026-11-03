@@ -3,11 +3,14 @@
     uv run python scripts/summarize_m3.py a6 > outputs/phase1/m3_tables/a6.md
     uv run python scripts/summarize_m3.py full > outputs/phase1/m3_tables/full.md
     uv run python scripts/summarize_m3.py b > outputs/phase1/m3_tables/b.md
+    uv run python scripts/summarize_m3.py table1 60 > outputs/phase1/m3_tables/table1.md
 """
 import statistics as st
 import sys
 from collections import defaultdict
 from pathlib import Path
+
+import numpy as np
 
 from spacebridge_bench import durable
 
@@ -200,6 +203,98 @@ def full() -> None:
         print(f"| {ds} | {t} | {row} | {mean_over_pairs(rs):.3f} | {100 * seed_sd(rs):.2f} | {w[0]}: {w[1]:.3f} |")
 
 
+# Size, label, BM25 on by the library's rule, then (corpus, record files, K) as the library's profile sets it.
+TABLE1 = [
+    (5_183, "5.2K", False, 2048, [("SciFact", ["w5_grid/grid_scifact.jsonl"])]),
+    (10_000, "10K", False, 2048, [("MS MARCO", ["m1_grid/ms_10k.jsonl"])]),
+    (20_000, "20K", False, 2048, [("MS MARCO", ["m1_grid/ms_20k.jsonl"])]),
+    (50_000, "50K", False, 2048, [("MS MARCO", ["w5_grid/grid_msmarco.jsonl"]), ("NQ", ["w5_grid/grid_nq.jsonl"]), ("HotpotQA", ["m1_switch/hotpot_k2048.jsonl"])]),
+    (100_000, "100K", True, 4096, [("MS MARCO", ["m3_a6/ms100000.jsonl"]), ("NQ", ["m3_a6/nq100000.jsonl"]), ("HotpotQA", ["m3_a6/hp100000.jsonl"])]),
+    (150_000, "150K", True, 4096, [("MS MARCO", ["m3_a6/ms150000.jsonl"]), ("NQ", ["m3_a6/nq150000.jsonl"]), ("HotpotQA", ["m3_a6/hp150000.jsonl"])]),
+    (171_332, "171K", True, 8192, [("TREC-COVID", ["m3_a6/trec_covid.jsonl"])]),
+    (200_000, "200K", True, 8192, [("MS MARCO", ["m3_a6/ms200000.jsonl"]), ("NQ", ["m3_a6/nq200000.jsonl"]), ("HotpotQA", ["m3_a6/hp200000.jsonl"])]),
+    (500_000, "500K", True, 8192, [("MS MARCO", ["m3_a6/ms500000.jsonl"]), ("NQ", ["m3_a6/nq500000.jsonl"]), ("HotpotQA", ["m3_a6/hp500000.jsonl"])]),
+    (1_000_000, "1M", True, 8192, [("MS MARCO", ["m3_1m/ms.jsonl"]), ("NQ", ["m3_1m/nq.jsonl"]), ("HotpotQA", ["m3_1m/hp.jsonl"])]),
+    (5_233_329, "5.23M", True, 8192, [("HotpotQA", ["m3_full/hp.jsonl"])]),
+    (8_841_823, "8.84M", True, 8192, [("MS MARCO", ["m3_full/ms_t1.jsonl", "m3_full/ms_t3.jsonl"])]),
+]
+ROW_AT = {60: "9h", 100: "9hw", 300: "9hx"}
+
+
+class Timing:
+    """A query's time by size: the stages measured at one size, with search and BM25 replaced by their time at this size. On the
+    GPU, sizes above 1M search on the CPU, since the GPU can't hold them."""
+
+    def __init__(self):
+        self.records = read("m1_timing/timing.jsonl", "m2_timing/timing.jsonl", "m3_timing/timing.jsonl")
+        self.lexical_points = sorted((r["N"], r["stages_ms"]["lexical"]["p50"]) for r in self.records if r.get("lexical") and r["device"] == "cpu" and r["dataset"].startswith("msmarco"))
+
+    def search_ms(self, device: str, size: int) -> float:
+        if size > 1_000_000:
+            device = "cpu"
+        hnsw = [r for r in self.records if r["device"] == device and not r["rerank"] and r["backend"] != "exact" and r["threads"] == 10 and r["ef"] == 500]
+        if size == 1_000_000 and hnsw:
+            return hnsw[-1]["stages_ms"]["search"]["p50"]
+        pts = sorted({r["N"]: r["stages_ms"]["search"]["p50"] for r in self.records if r["device"] == device and r["backend"] == "exact" and r.get("search_device", device) == device and (not r["rerank"] or r["N"] > 1_000_000)}.items())
+        return float(np.interp(size, *zip(*pts)))
+
+    def lexical_ms(self, size: int) -> float:
+        return float(np.interp(size, *zip(*([(0, 0.0)] + self.lexical_points)))) if self.lexical_points else 0.0
+
+    def run(self, device: str, corpus: str, pool: int, lexical: bool):
+        """The latest record at this pool; a BM25 run may stand in for a plain one, since BM25's own time is taken off."""
+        runs = [r for r in self.records if r["device"] == device and r["threads"] == 10 and r["rerank"] and r["dataset"] == corpus and r["pool"] == pool and not r.get("reranker", "").startswith("onnx") and r.get("reranker", "BAAI/bge-reranker-v2-m3") == "BAAI/bge-reranker-v2-m3"]
+        chosen = [r for r in runs if bool(r.get("lexical")) == lexical] or runs
+        return chosen[-1] if chosen else None
+
+    def query_s(self, device: str, corpus: str, size: int, pool: int, q: str, lexical: bool) -> float:
+        r = self.run(device, corpus, pool, lexical)
+        if r is None:
+            return float("nan")
+        st_ = {k: v[q] for k, v in r["stages_ms"].items()}
+        rest = st_["total"] - st_["search"] - st_.get("lexical", 0.0)
+        return (rest + self.search_ms(device, size) + (self.lexical_ms(size) if lexical else 0.0)) / 1e3
+
+
+def table1(budget_above_1m: int = 60) -> None:
+    timing = Timing()
+    print(f"**Table 1: what the library does.** Seconds for one query, p50 (p95), through `Searcher`, and retention on the hardest corpus measured at each size. The CPU columns stop at the first size over 60 s. Budget above 1M: {budget_above_1m}.\n")
+    print("| Size | BM25 | Budget | K | Tier 1 (corpus) | Tier 3 (corpus) | CPU, short | CPU, long | GPU, short | GPU, long |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    stopped = {"short": False, "long": False}
+    for size, label, lexical, K, corpora in TABLE1:
+        budget = budget_above_1m if size > 1_000_000 else 60
+        row = ROW_AT[budget] if lexical else "9"
+        by_tier = defaultdict(list)
+        for name, files in corpora:
+            recs = [r for r in read(*files) if r.get("row") == row and r.get("reranker") == "bge-reranker-v2-m3" and r["K"] == K]
+            for t in ("T1", "T3"):
+                rs = [r for r in recs if tier(r) == t]
+                if rs:
+                    by_tier[t].append((mean_over_pairs(rs), name))
+        lines = LINES if size <= 1_000_000 else STRETCH
+        cell = {}
+        for t in ("T1", "T3"):
+            if by_tier[t]:
+                v, name = min(by_tier[t])
+                cell[t] = f"{v:.3f}{'' if v >= lines[t] else ' **miss**'} ({name})"
+            else:
+                cell[t] = "-"
+        times = {}
+        for kind, corpus, full in (("short", "msmarco-1m", "msmarco-full"), ("long", "trec-covid", None)):
+            big = size > 1_000_000 and kind == "short" and timing.run("cpu", full, budget, True) is not None
+            source = full if big else corpus
+            p50 = timing.query_s("cpu", source, size, budget, "p50", lexical)
+            if stopped[kind]:
+                times[f"cpu_{kind}"] = "stop"
+            else:
+                over = p50 > 60
+                text = f"{p50:.1f} ({timing.query_s('cpu', source, size, budget, 'p95', lexical):.1f})"
+                times[f"cpu_{kind}"] = f"**{text}**" if over else text
+                stopped[kind] = over
+            times[f"gpu_{kind}"] = f"{timing.query_s('cuda', source, size, budget, 'p50', lexical):.2f} ({timing.query_s('cuda', source, size, budget, 'p95', lexical):.2f})"
+        print(f"| {label} | {'on' if lexical else 'off'} | {budget} | {K:,} | {cell['T1']} | {cell['T3']} | {times['cpu_short']} | {times['cpu_long']} | {times['gpu_short']} | {times['gpu_long']} |")
+
+
 def b() -> None:
     recs = read("m3_b/screen.jsonl")
     print("# M3 Part B: cross-language candidates, Chinese to English, `bge-large-en` ← `qwen3-0.6b`, K = 2,048, seed 0\n")
@@ -223,4 +318,4 @@ def b() -> None:
 
 
 if __name__ == "__main__":
-    {"a6": a6, "full": full, "b": b}[sys.argv[1]]()
+    {"a6": a6, "full": full, "b": b, "table1": lambda: table1(int(sys.argv[2]) if len(sys.argv) > 2 else 60)}[sys.argv[1]]()
