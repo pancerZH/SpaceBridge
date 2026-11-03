@@ -110,7 +110,7 @@ def table(records: list[dict], rows: tuple[str, ...], lines: dict, title: str) -
     g = group(records)
     print(f"\n{title}\n")
     head = " | ".join(f"{r} ({BUDGET[r]})" for r in rows)
-    print(f"| Set | Tier | {head} | Plain → BM25 at 60, points, (pair, seed) cells | 9h strict | 9h worst pair | 9h absolute | Native, re-index at 60 |")
+    print(f"| Set | Tier | {head} | Plain → BM25 at 60, points, (pair, seed) cells | 9h strict | 9h worst pair | Absolute, plain → 9h | Native, re-index at 60 |")
     print("| --- | --- | " + " | ".join("---" for _ in rows) + " | --- | --- | --- | --- | --- |")
     for ds, t in sorted({(k[0], k[1]) for k in g}, key=lambda x: (x[0].split("@")[0], size_key(x[0]), x[1])):
         cols = []
@@ -123,7 +123,7 @@ def table(records: list[dict], rows: tuple[str, ...], lines: dict, title: str) -
             base = h[0]["baselines"]
             n = st.mean(r["baselines"]["native"]["ndcg@5"] for r in h)
             o = st.mean(r["baselines"]["oracle"]["ndcg@5"] for r in h)
-            tail = f"{cells_positive(h, plain) if plain else ''} | {mean_over_pairs(h, strict):.3f} | {w[1]:.3f} | {mean_over_pairs(h, absolute):.3f} | {n:.3f}, {o:.3f}"
+            tail = f"{cells_positive(h, plain) if plain else ''} | {mean_over_pairs(h, strict):.3f} | {w[1]:.3f} | {f'{mean_over_pairs(plain, absolute):.3f} → ' if plain else ''}{mean_over_pairs(h, absolute):.3f} | {n:.3f}, {o:.3f}"
         else:
             tail = " |  |  |  | "
         print(f"| {ds} | {t} | " + " | ".join(cols) + f" | {tail} |")
