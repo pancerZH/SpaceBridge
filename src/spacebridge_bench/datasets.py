@@ -53,6 +53,11 @@ DATASETS: dict[str, DatasetSpec] = {
         "mteb/hotpotqa", "en", "Given a multi-hop question, retrieve documents that can help answer the question",
         max_docs=1_000_000, max_queries=2_000,
     ),
+    # The same documents with positives first: prefixes up to 1M, with embeddings from scripts/reorder_embeddings.py.
+    "hotpotqa-1m-nested": DatasetSpec(
+        "mteb/hotpotqa", "en", "Given a multi-hop question, retrieve documents that can help answer the question",
+        max_docs=1_000_000, max_queries=2_000, nested_docs=1_000_000,
+    ),
     "quora": DatasetSpec(
         "mteb/quora", "en", "Given a question, retrieve questions that are semantically equivalent to the given question",
         max_docs=50_000, max_queries=2_000,
