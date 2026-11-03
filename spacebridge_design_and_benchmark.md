@@ -1,6 +1,6 @@
 # Technical Design Document (v2.4): `SpaceBridge` Cross-Model Alignment Engine & Benchmark Suite
 
-**Status:** Phase 0 complete (2026-11-01); Phase 1 in progress. Goal: 1M documents; ceiling of the whole project: 8.84M (§2.1)  
+**Status:** Phase 0 complete (2026-11-01); Phase 1 complete (2026-11-03). Goal: 1M documents; ceiling of the whole project: 8.84M (§2.1)  
 **Target Environment:** Local Linux Host (Intel i5-12600K, NVIDIA RTX 5070 Ti 16GB VRAM, PyTorch built for CUDA $\ge 12.8$ / `sm_120`)  
 **Scope:** Zero-Reindexing Cross-Model, Cross-Dimension, and Cross-Language Query Alignment, up to 8.84M documents on one machine  
 
@@ -56,7 +56,7 @@ Querying a frozen vector index with a different embedding model, for example aft
 | **Approved targets (the 1M goal)** | up to 1M | End to end $\ge 98\%$ Tier 1, $\ge 94\%$ Tier 3, pool $\le 300$, on two corpora |
 | **Stretch line** | above 1M, up to 8.84M | End to end $\ge 95\%$ Tier 1, $\ge 90\%$ Tier 3, pool $= 300$ |
 
-Two ranges are reported from these. The **best range** is the largest measured size meeting the approved targets on every corpus measured at that size. The **supported range** is the largest measured size meeting the stretch line. Anything above is "measured, not recommended", with its numbers. A miss at 8.84M is not a project failure; the best range is then restricted to 1M or below. A reranker is required above 200K documents, so document text must be available at query time (first-stage-only use loses far more at 1M). There is no `Recall@30` target at $K = 8,192$: large indexes are judged end to end, with recall at the rerank depth reported.
+Two ranges are reported from these. The **best range** is the largest measured size meeting the approved targets on every corpus measured at that size. The **supported range** is the largest measured size meeting the stretch line. Anything above is "measured, not recommended", with its numbers. A reranker is required above 200K documents, so document text must be available at query time (first-stage-only use loses far more at 1M). There is no `Recall@30` target at $K = 8,192$: large indexes are judged end to end, with recall at the rerank depth reported.
 
 | Migration Tier | Example Test Case | Pure Vector `Recall@30` $\rho_{\text{ceil}}$ | End-to-End `NDCG@5` $\rho_{\text{ceil}}$ (RRF + Reranker) |
 | :--- | :--- | :--- | :--- |
@@ -78,28 +78,33 @@ Two ranges are reported from these. The **best range** is the largest measured s
 > [!WARNING]
 > **Retention falls as the index grows, and the targets above don't hold at every size on their own.** The same map on growing subsets of one index (MS MARCO, $K = 2,048$, `Recall@30`, 50K / 200K / 500K / 1M): Tier 1 0.970 / 0.933 / 0.890 / 0.860, Tier 3 0.921 / 0.855 / 0.790 / 0.732. NQ replicates it: 0.970 / 0.944 at 50K, 0.844 / 0.745 at 1M. A denser index turns the same small query error into more rank losses among near-duplicate passages, and most are near misses: the positive's median rank goes from 0 to 2–8. Small subsets also flatter the bridge (native `Recall@30` is 0.99 at 50K, 0.94 at 1M). Real queries instead of proxies add only 2–5 points at $K = 2,048$, and even 32,768 real query pairs reach only 0.83–0.91 at 1M, which points to a limit of the linear map; no nonlinear map was tested. `scripts/scale_diagnosis.py`, `scripts/scale_anchors_depth.py`.
 
-**Status above 171K documents (Phase 1, 2026-11-02).** End to end, `nDCG@5` $\rho_{\text{ceil}}$ at `rerank_pool = 300`, `bge-reranker-v2-m3`, $K$ = 8,192 random anchors, mean over pairs, 3 seeds. Tiers 1 and 3 only; Tiers 2, 4 and 5 are not measured above 171K. Tier 1 at 200K and 500K is one direction.
+**Status at and above 75K documents (Phase 1, final, 2026-11-03).** End to end, `nDCG@5` $\rho_{\text{ceil}}$, `bge-reranker-v2-m3`, mean over pairs, 3 seeds, exact search. Tiers 1 and 3 only. "BM25" is the bridge plus BM25 in a budget of 60 (§4.6), which is what the library serves above 50K. **Retention above 1 is not a gain over native:** "strict" gives native and re-index BM25 too.
 
-| Corpus | Size | Queries | Tier 1 ($\ge 98\%$) | Tier 3 ($\ge 94\%$) |
-| :--- | :--- | :--- | :--- | :--- |
-| MS MARCO | 200K | 500 | 0.993 | 0.980 |
-| NQ | 200K | 500 | 0.999 | 0.995 |
-| MS MARCO | 500K | 500 | 0.990 | 0.965 |
-| NQ | 500K | 500 | 0.993 | 0.980 |
-| MS MARCO | 1M | 2,000 | 0.986 | 0.957 |
-| NQ | 1M | 2,000 | 0.989 | 0.972 |
-| HotpotQA | 1M | 2,000 | **0.956** | **0.898** |
-| MS MARCO | 8.84M | 2,000 | 0.963 [0.948, 0.977] | not measured |
+| Corpus | Size | $K$ | Queries | Plain, pool 60 | Plain, pool 300 | BM25, budget 60 | Strict | Worst pair, BM25 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| MS MARCO | 100K | 4,096 | 500 | 0.983, 0.947 | | 0.998, 0.997 | 0.993, 0.995 | 0.998, 0.997 |
+| NQ | 100K | 4,096 | 500 | 0.987, 0.967 | | 0.997, 0.998 | 0.997, 0.996 | 0.997, 0.996 |
+| HotpotQA | 100K | 4,096 | 500 | 0.941, 0.891 | | 1.000, 1.016 | 0.995, 1.001 | 1.000, 1.014 |
+| MS MARCO | 500K | 8,192 | 500 | 0.967, 0.919 | 0.990, 0.965 | 0.996, 0.989 | 0.995, 0.989 | 0.996, 0.984 |
+| NQ | 500K | 8,192 | 500 | 0.967, 0.948 | 0.993, 0.980 | 0.989, 0.988 | 0.993, 0.985 | 0.989, 0.987 |
+| HotpotQA | 500K | 8,192 | 500 | 0.901, 0.821 | 0.962, 0.909 | 0.997, 1.016 | 0.994, 0.993 | 0.997, 1.011 |
+| MS MARCO | 1M | 8,192 | 2,000 | 0.959, 0.899 | 0.986, 0.957 | 0.995, 0.982 | 0.994, 0.983 | 0.994, 0.979 |
+| NQ | 1M | 8,192 | 2,000 | 0.951, 0.915 | 0.989, 0.972 | 0.985, 0.979 | 0.985, 0.975 | 0.984, 0.977 |
+| HotpotQA | 1M | 8,192 | 2,000 | 0.881, 0.795 | 0.956, 0.898 | 0.995, 1.020 | 0.989, 0.988 | 0.993, 1.015 |
+| HotpotQA | 5.23M | 8,192 | 2,000 | 0.786, 0.665 | 0.886, 0.798 | 0.985, 1.009 | 0.967, 0.961 | 0.983, 1.005 |
+| MS MARCO | 8.84M | 8,192 | 2,000 | 0.910, 0.796 | 0.963, 0.895 | 0.979, 0.946 | 0.981, 0.945 | 0.978, 0.945 |
 
-- **Best range (the approved targets, on every corpus measured at that size): 500K,** on MS MARCO and NQ. HotpotQA has not been measured at 500K. It reads 0.967 and 0.932 at 50K, pool 100, $K$ = 2,048, the largest pool measured there.
-- **1M passes on MS MARCO and NQ and misses on HotpotQA,** by 2.4 and 4.2 points. Its first stage is the weaker: `Recall@300` retention 0.946 and 0.896, against 0.970 and 0.942 on MS MARCO. The cause is untested.
-- **Supported range (the stretch line, 95% Tier 1 and 90% Tier 3): up to 1M,** with HotpotQA's Tier 3 0.2 points under the line, inside the $\pm 0.3$ re-encoding noise.
-- **8.84M is a Tier 1 first look only: measured, not recommended.** A rule fixed in advance stopped the work there, because $0.95 \le T < 0.97$ with $T = 0.963$. Tier 3 has been about 3× Tier 1's loss up to 1M on MS MARCO, which would predict 0.889, but that ratio is unmeasured above 1M (2.3× on HotpotQA and 2.5× on NQ at 1M). First-stage `Recall@300` retention there is 0.901; $K$ = 32,768 adds 1.3 points.
-- **The smallest pool that passes is not the default.** Pool 200 passes on MS MARCO and NQ at 1M (Tier 1 0.982 on both, Tier 3 0.947 and 0.962) and misses on HotpotQA, so the default stays 300 (§5). Pools below that are available with `pool=`.
-- **Smaller index models do worse:** `minilm` ← `bge-large-en` reads 0.935 and `minilm` ← `qwen3-0.6b` 0.912 at 1M, pool 300. They are not in the approved target set; Tier 4's line is 92%.
-- **Through HNSW** ($M = 32$, $\text{ef}_{\text{construction}} = 200$, MS MARCO 1M only), Tier 1 reads 0.983 at pool 300 and ef 500, against 0.986 exact. Tier 3's one indexed pair shows no loss.
+Each cell is Tier 1, Tier 3. Tier 1 at 500K and below is one direction. Results at 500 queries move by about $\pm 1.5$ points, and absolute values fall with size for every system: at 8.84M, MS MARCO reads 0.419 and 0.405 absolute at budget 60, against 0.429 for native and re-index.
 
-**Speed, one query on the reference machine** (`scripts/summarize_library.py`): on 10 CPU threads, short passages take 11 s up to 200K and 51 s above it; long documents take 36 s and 171 s, so they cross a minute just above 200K, where the pool steps from 60 to 300. The GPU takes at most 1.3 s at p95 up to 1M. CPU rerank seconds $\approx 1.91\text{ ms} \times \text{pool} \times \text{tokens per pair}$, within 4.0% on average and 9.6% at worst over five corpora from 97 to 412 tokens per pair. At 1M, re-indexing pays for itself on compute after about 2,900-6,900 queries with the larger query models and about 130-1,100 with the smaller two.
+- **Best range, with BM25: up to 1M, on all three corpora, Tiers 1 and 3, budget 60.** Passes at every measured size from 75K to 1M.
+- **Supported range, with BM25: up to 8.84M, budget 60.** That top size rests on MS MARCO alone; HotpotQA is measured to its whole corpus, 5.23M; NQ isn't measured above 1M; no corpus was held out from the budget above 1M; there is no HNSW index above 1M.
+- **Without BM25, multi-hop questions miss at the library's defaults at every size measured,** from 50K (0.953, 0.903) to 5.23M (0.886, 0.798). MS MARCO and NQ pass up to 1M at pool 300. MS MARCO at 8.84M is measured, not recommended: 0.963, 0.895.
+- **Where BM25 hurts:** FiQA and TREC-COVID, held out from its choice, lose 0.9 to 2.2 points in every (pair, seed) cell and still pass: FiQA 1.018 and 0.981, TREC-COVID 1.001 and 0.987 (50 queries). SciDocs stays off by size (§4.6).
+- **Smaller index models hold with BM25:** `minilm` ← `bge-large-en` and ← `qwen3-0.6b` read 0.981 and 0.975 at 1M, budget 60, against 0.935 and 0.912 plain at pool 300. Tier 4's line is 92%.
+- **The retired-model fit holds with BM25:** at budget 100, the pool it gets, 0.997 and 1.020 on HotpotQA 1M, 0.997 and 0.982 on MS MARCO 1M, on one pair per tier and 500 queries.
+- **Through HNSW** ($M = 32$, $\text{ef}_{\text{construction}} = 200$, ef 500, MS MARCO 1M only), BM25 costs at most 0.08 points against exact search: Tier 1 reads 0.995 and Tier 3's one indexed pair 0.978 at budget 60.
+- **Tier 3 has been about 3× Tier 1's loss:** at 8.84M, plain at pool 300, it's 2.8×, and 2.6× with BM25 at budget 60. On HotpotQA 5.23M it's 1.8×.
+- **First-stage `Recall@300` retention keeps falling with size,** which is what BM25 and the reranker are holding up: MS MARCO Tier 3 0.942 at 1M, 0.826 at 8.84M; HotpotQA 0.943 and 0.893 at 1M, 0.862 and 0.779 at 5.23M.
 
 * **Solver Budget (any model, reference hardware):** Stage-1 + Stage-2 + validation on precomputed embeddings should take about **$250\text{ ms}$** on the RTX 5070 Ti. This is a reference for spotting regressions, not a promise on other machines. Measured at the default $K$: 143–176 ms for indexes up to 1024-d, 173 ms into a 2560-d index; 239–263 ms at the large-index $K = 8,192$.
 * **Mount Budget (revised and approved 2026-11-01):** the mount encodes the $K$ query proxies plus, for doc↔doc pairs, the $K$ anchor docs **truncated to 128 tokens** (`spacebridge.DOC_PAIR_TOKENS`, configurable), and its cost is bounded **relative to re-indexing the corpus with $M_{\text{tgt}}$**:

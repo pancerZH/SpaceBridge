@@ -301,6 +301,21 @@ def table1(budget_above_1m: int = 60) -> None:
         print(f"| {label} | {'on' if lexical else 'off'} | {budget} | {K:,} | {cell['T1']} | {cell['T3']} | {times['cpu_short']} | {times['cpu_long']} | {times['gpu_short']} | {times['gpu_long']} |")
 
 
+def break_even() -> None:
+    """Queries until re-indexing would have been cheaper in compute: re-index seconds / what the bridge adds per query. At budget 60 that's BM25 alone."""
+    timing = Timing()
+    rate = {(r["model"], r["device"]): r for r in read("m1_timing/mount.jsonl") if r.get("mode") == "rate"}
+    lex = {size: timing.lexical_ms(size) / 1e3 for size in (1_000_000, 8_841_823)}
+    print(f"\n**Break-even at budget 60.** A re-indexed system would also rerank about 60, so what the bridge adds per query is BM25: {1e3 * lex[1_000_000]:.1f} ms at 1M and {1e3 * lex[8_841_823]:.1f} ms at 8.84M, p50, through `Searcher` on the CPU.\n")
+    print("| Query model | Re-index 1M: GPU, CPU | Queries to pay back, GPU, CPU | Re-index 8.84M: GPU, CPU | Queries to pay back, GPU, CPU |\n| --- | --- | --- | --- | --- |")
+    for m in ("minilm", "bge-base-en", "bge-large-en", "qwen3-0.6b"):
+        cells = []
+        for size in (1_000_000, 8_841_823):
+            sec = {d: size * rate[m, d]["tokens_per_doc"] / rate[m, d]["tokens_per_s"] for d in ("cuda", "cpu")}
+            cells += [", ".join(f"{sec[d] / 3600:.1f} h" for d in ("cuda", "cpu")), ", ".join(f"{sec[d] / lex[size] / 1e6:.1f}M" for d in ("cuda", "cpu"))]
+        print(f"| `{m}` | " + " | ".join(cells) + " |")
+
+
 def b() -> None:
     recs = read("m3_b/screen.jsonl")
     print("# M3 Part B: cross-language candidates, Chinese to English, `bge-large-en` ← `qwen3-0.6b`, K = 2,048, seed 0\n")
@@ -355,4 +370,4 @@ if __name__ == "__main__":
     if sys.argv[1] == "b_confirm":
         b_confirm()
         sys.exit()
-    {"a6": a6, "1m": one_m, "full": full, "b": b, "table1": lambda: table1(int(sys.argv[2]) if len(sys.argv) > 2 else 60)}[sys.argv[1]]()
+    {"a6": a6, "1m": one_m, "full": full, "break_even": break_even, "b": b, "table1": lambda: table1(int(sys.argv[2]) if len(sys.argv) > 2 else 60)}[sys.argv[1]]()
