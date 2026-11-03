@@ -1,4 +1,4 @@
-"""The lexical channel (design §4.5): BM25 over the index's own text, a quarter of the rerank pool.
+"""The lexical channel (design §4.6): BM25 over the index's own text, a quarter of the rerank pool.
 
 The map loses the detail that picks out the right document, and better calibration can't repair that (HotpotQA study). BM25
 doesn't use the map at all, so it holds much of what the map loses. Only a reranker can merge the two lists, and only queries in

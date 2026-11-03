@@ -148,7 +148,7 @@ class Searcher:
     Above ``LARGE_INDEX_DOCS`` documents a reranker is required: first-stage results lose far more there (MS MARCO 1M, nDCG@5
     0.33-0.44 instead of 0.66-0.69). ``allow_no_reranker=True`` opts out, to time search alone.
 
-    ``lexical`` puts BM25 in the rerank pool, a quarter of it (design §4.5). ``"auto"`` builds a ``LexicalIndex`` from the index
+    ``lexical`` puts BM25 in the rerank pool, a quarter of it (design §4.6). ``"auto"`` builds a ``LexicalIndex`` from the index
     above ``LEXICAL_MIN_DOCS`` documents, if the index is in English and there's a reranker to merge the two lists. A
     ``LexicalIndex`` is used whatever the size and language. ``None`` turns it off. With it on, the pool defaults to 60, or 100
     for a weak or source-free fit, and a query in a language other than the index's skips BM25 and takes the pool it would take
