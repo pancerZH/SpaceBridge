@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from spacebridge import CrossEncoderReranker, ExactBackend, HnswBackend, Index, Searcher, SpaceBridge, freeze, mount
+from spacebridge import CrossEncoderReranker, ExactBackend, HnswBackend, Index, LexicalIndex, Searcher, SpaceBridge, freeze, mount
 from spacebridge.encoders import CPU_BATCH_TOKENS, predict_pairs, token_lengths
 from spacebridge_bench import durable
 from spacebridge_bench.datasets import load_beir
@@ -101,6 +101,7 @@ def main() -> None:
     p.add_argument("--n", type=int, default=20)
     p.add_argument("--no-rerank", action="store_true", help="time encode, project, search and fetch only")
     p.add_argument("--reranker", default=DEFAULT_RERANKER, help="Hugging Face id of the cross-encoder, or onnx:PATH (needs --extra onnx)")
+    p.add_argument("--lexical", type=Path, default=None, help="a LexicalIndex to serve with: BM25 in the pool and in the breakdown (default: BM25 off)")
     p.add_argument("--out", type=Path, default=None)
     args = p.parse_args()
 
@@ -130,12 +131,13 @@ def main() -> None:
     if not args.no_rerank:
         onnx = args.reranker.startswith("onnx:")
         reranker = RememberingReranker(OnnxReranker(args.reranker[5:], args.threads) if onnx else CrossEncoderReranker(args.reranker, device=args.device))
-    searcher = Searcher(bridge, encoder, backend, index, reranker, device=args.device, allow_no_reranker=args.no_rerank)
+    lexical = LexicalIndex.load(args.lexical) if args.lexical else None
+    searcher = Searcher(bridge, encoder, backend, index, reranker, device=args.device, allow_no_reranker=args.no_rerank, lexical=lexical)
     if args.device.startswith("cuda"):
         torch.cuda.reset_peak_memory_stats()
     queries = ds.queries[: args.n + 1]
     for pool in args.pool:
-        key = f"{ds.name}|{args.backend}|{args.device}|t{args.threads}|pool{pool}|ef{args.ef}" + ("|norerank" if args.no_rerank else "") + (f"|{args.reranker}" if args.reranker != DEFAULT_RERANKER else "")
+        key = f"{ds.name}|{args.backend}|{args.device}|t{args.threads}|pool{pool}|ef{args.ef}" + ("|norerank" if args.no_rerank else "") + (f"|{args.reranker}" if args.reranker != DEFAULT_RERANKER else "") + ("|lexical" if lexical else "")
         if key in done:
             continue
         searcher.search(queries[0], pool=pool)  # warmup
@@ -146,7 +148,7 @@ def main() -> None:
             if reranker is not None:
                 tokens.append(reranker.count_tokens())
         rec = {"key": key, "dataset": ds.name, "N": ds.N, "backend": args.backend, "ef": args.ef, "device": args.device, "threads": args.threads, "pool": pool, "n": len(rows), "rerank": not args.no_rerank, "reranker": args.reranker,
-               "stages_ms": percentile_table(rows), "load_s": load_s, "index_model": args.index_model, "query_model": args.query_model}
+               "stages_ms": percentile_table(rows), "load_s": load_s, "lexical": lexical is not None, "index_model": args.index_model, "query_model": args.query_model}
         if tokens:
             rec["tokens_per_pair"], rec["tokens_per_doc"] = (float(v) for v in np.mean(tokens, axis=0))
         if args.device.startswith("cuda"):

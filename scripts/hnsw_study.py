@@ -16,15 +16,16 @@ from pathlib import Path
 import faiss
 import numpy as np
 
-from spacebridge import Index, build_hnsw, freeze, mount
+from spacebridge import Index, build_hnsw, freeze, merge_pool, mount
+from spacebridge.lexical import LEXICAL_SHARE
 from spacebridge.serving import HNSW_SAVE_SECONDS, save_faiss_index
 from spacebridge_bench import durable
 from spacebridge_bench.datasets import load_beir
 from spacebridge_bench.encode import Encoder, MountEncoder
 from spacebridge_bench.metrics import per_query
 from spacebridge_bench.models import MODELS
-from spacebridge_bench.rerank import RERANKERS, Reranker, rerank
-from spacebridge_bench.run import _DocTexts, _first_docs, _first_queries
+from spacebridge_bench.rerank import RERANKERS, Reranker, rerank, rerank_pools
+from spacebridge_bench.run import _DocTexts, _first_docs, _first_queries, cached_lexical
 from spacebridge_bench.search import cached_search, search
 
 HNSW_CACHE = Path("data/cache/hnsw")
@@ -68,6 +69,20 @@ def rankings_report(res: Results, tag: str, approx: np.ndarray, exact: np.ndarra
             recall_pool_approx=float(first_a.get(f"recall@{pool}", first_a["recall@100"]).mean()),
             recall_pool_exact=float(first_e.get(f"recall@{pool}", first_e["recall@100"]).mean()),
         )
+
+
+def lexical_report(res: Results, tag: str, approx: np.ndarray, exact: np.ndarray, lexical_top: list[np.ndarray], ds, queries, rr, pools) -> None:
+    """Absolute end-to-end nDCG@5 with BM25 in the pool, through the approximate first stage and the exact one."""
+    docs = _DocTexts(ds.titles, ds.texts)
+    for pool in pools:
+        key = f"{tag}|pool{pool}"
+        if key in res.done:
+            continue
+        share = pool // LEXICAL_SHARE
+        a, e = ([merge_pool(r, b[:share], pool) for r, b in zip(ranked, lexical_top)] for ranked in (approx, exact))
+        pq_a, pq_e = (per_query(rerank_pools(rr, x, queries, docs, ds.task), ds.qrels) for x in (a, e))
+        res.add(key, tag=tag, pool=pool, share=share, ndcg5_approx=float(pq_a["ndcg@5"].mean()), ndcg5_exact=float(pq_e["ndcg@5"].mean()),
+                recall30_approx=float(pq_a["recall@30"].mean()), recall30_exact=float(pq_e["recall@30"].mean()))
 
 
 def hnsw_search(index, Q: np.ndarray, k: int, ef: int) -> np.ndarray:
@@ -125,11 +140,13 @@ def main() -> None:
     p.add_argument("--save-seconds", type=float, default=HNSW_SAVE_SECONDS, help="save a growing HNSW index this often")
     p.add_argument("--index-dir", type=Path, default=HNSW_CACHE, help="where indexes are kept")
     p.add_argument("--pools", type=int, nargs="+", default=list(POOLS), help="candidates sent to the reranker")
+    p.add_argument("--efs", type=int, nargs="+", default=list(EFS), help="efSearch values to read")
+    p.add_argument("--lexical", action="store_true", help="also put BM25 in the pool; refuses to build: it only reads an index that exists")
     p.add_argument("--build-only", action="store_true")
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
-    pools = tuple(args.pools)
+    pools, efs = tuple(args.pools), tuple(args.efs)
 
     ds = load_beir(args.dataset)
     if args.max_docs is not None:
@@ -144,6 +161,8 @@ def main() -> None:
     enc.unload()
 
     path = args.index_dir / f"{ds.name}_{store.path.stem}_{store.dim}d_M{args.M}_efc{args.ef_construction}.faiss"
+    if args.lexical and not path.exists():
+        raise SystemExit(f"--lexical only reads an existing index, and {path} is not there")
     t0 = time.perf_counter()
     was_complete = "build" in res.done
     index = build_hnsw(
@@ -159,7 +178,11 @@ def main() -> None:
     rr = Reranker(RERANKERS["bge-reranker-v2-m3"], args.device)
     maxk = max(pools)
     exact_native = cached_search(Q_native, store, 1000, args.device, exclude=ds.self_rows)
-    for ef in EFS:
+    lexical_top = None
+    if args.lexical:
+        lexical = cached_lexical(ds, Index(store, ds.texts, ds.titles))
+        lexical_top = [lexical.top(q, maxk // LEXICAL_SHARE, exclude=s) for q, s in zip(ds.queries, ds.self_rows.tolist())]
+    for ef in efs:
         ranked = hnsw_search(index, Q_native, maxk, ef)
         rankings_report(res, f"hnsw|native|ef{ef}", ranked, exact_native, ds, ds.index_lang_queries, rr, pools)
     rr.unload()
@@ -188,7 +211,9 @@ def main() -> None:
                 res.add(key, tag="oracle", tgt=tgt_key, pool=pool, ndcg5_exact=float(pq["ndcg@5"].mean()))
         rr.unload()
         for seed in args.seed:
-            if all(f"hnsw|{tgt_key}|s{seed}|ef{ef}|pool{pool}" in res.done for ef in EFS for pool in pools) and (
+            if all(f"hnsw|{tgt_key}|s{seed}|ef{ef}|pool{pool}" in res.done for ef in efs for pool in pools) and (
+                not args.lexical or all(f"lexical|{tgt_key}|s{seed}|ef{ef}|pool{pool}" in res.done for ef in efs for pool in pools)
+            ) and (
                 not args.ivfpq or all(f"{args.ivfpq}|{tgt_key}|s{seed}|nprobe{n}|pool{pool}" in res.done for n in args.nprobe for pool in pools)
             ):
                 continue
@@ -196,9 +221,11 @@ def main() -> None:
             bridge = mount(bundle, pool_index, MountEncoder(MODELS[tgt_key], ds.task, args.device), device=args.device)
             Q_hat = bridge.transform_query(Q_tgt)
             exact = search(Q_hat, store, 1000, args.device, exclude=ds.self_rows)
-            for ef in EFS:
+            for ef in efs:
                 ranked = hnsw_search(index, Q_hat, maxk, ef)
                 rankings_report(res, f"hnsw|{tgt_key}|s{seed}|ef{ef}", ranked, exact, ds, ds.queries, rr, pools)
+                if args.lexical:
+                    lexical_report(res, f"lexical|{tgt_key}|s{seed}|ef{ef}", ranked, exact, lexical_top, ds, ds.queries, rr, pools)
             if pq_index is not None:
                 reader = QuantizedIndex(pq_index, ds, store.dim)
                 pq_bundle = freeze(reader, MountEncoder(src, ds.task, args.device), ds.lang, seed, args.K or None, device=args.device)
