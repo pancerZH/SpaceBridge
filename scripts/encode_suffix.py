@@ -2,7 +2,8 @@
 
 1. Checks that the corpus's first rows are the prefix corpus's documents, in order.
 2. Encodes the rest as their own input list, so ``Encoder`` keeps them resumable.
-3. Checks the prefix file against 1,000 of its rows encoded again: cosine must be above 0.9999.
+3. Checks the prefix file against 1,000 of its rows encoded again: mean cosine above 0.9999, and 99% of rows above 0.999. Not every
+   row: a very short document's vector can move by several percent with its batch alone (one read 0.937 between a batch and alone).
 4. Writes the file ``Encoder`` expects for the whole list, atomically. The suffix file stays, so a rerun costs nothing.
 
 A rerun continues: an encode in progress resumes from its last part, and a finished file is skipped.
@@ -22,7 +23,8 @@ from spacebridge_bench.encode import Encoder, concat_embeddings
 from spacebridge_bench.models import MODELS
 
 CHECK_ROWS = 1_000
-MIN_COSINE = 0.9999
+MIN_MEAN_COSINE = 0.9999
+MIN_ROW_COSINE, MIN_SHARE = 0.999, 0.99
 
 
 def main() -> None:
@@ -52,9 +54,9 @@ def main() -> None:
         enc.unload()
         stored = np.asarray(np.load(prefix_path, mmap_mode="r")[rows], dtype=np.float32)
         cos = (fresh * (stored / np.linalg.norm(stored, axis=1, keepdims=True))).sum(1)
-        check = {"model": key, "rows": CHECK_ROWS, "cos_min": float(cos.min()), "cos_mean": float(cos.mean())}
+        check = {"model": key, "rows": CHECK_ROWS, "cos_min": float(cos.min()), "cos_mean": float(cos.mean()), "share_above_0.9999": float((cos > 0.9999).mean()), "share_above_0.999": float((cos > MIN_ROW_COSINE).mean())}
         durable.progress(f"{full.name} {key}: prefix check {json.dumps(check)}")
-        if cos.min() <= MIN_COSINE:
+        if cos.mean() <= MIN_MEAN_COSINE or (cos > MIN_ROW_COSINE).mean() < MIN_SHARE:
             raise ValueError(f"{prefix_path} doesn't match a fresh encode: {check}")
         concat_embeddings([prefix_path, suffix.path], target)
         back = np.load(target, mmap_mode="r")
