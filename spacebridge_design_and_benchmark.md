@@ -26,6 +26,8 @@ Querying a frozen vector index with a different embedding model, for example aft
 
 **Positioning (decided 2026-11-01): instant compatibility and migration.** Serve the frozen index right away with the new query model, then re-index in the background if traffic justifies it. It is not a quality upgrade and not a compute saving: at scale a bridged model can stay below the old model's own queries in the first stage, and the wider rerank pool it needs costs compute on every query.
 
+**BM25 is part of the same-language product (decided 2026-11-02).** The map loses the detail that picks out the right document, and better calibration can't repair that, so above 50K documents the rerank pool also holds BM25's best matches over the document text (§4.6). That needs no new model and no change to the index, only the text the reranker already reads. It doesn't cross languages.
+
 **Translation (decided 2026-11-02).** The positioning stands for same-language migration, where translation does not apply. For cross-language search, use machine translation while the old query model is available, and the bridge once it is retired: translation needs the old model alive at query time. On Chinese to English, MADLAD-400 3B leads the best bridge by 2.5–4 points of `nDCG@5` at pool 60 (`xquad-zh`, `mlqa-zh`). The evidence is Chinese to English only.
 
 **Scale.** The reference deployment is low-traffic, self-hosted, one GPU, HNSW: models, vectors and text are all local, and the index lives in RAM. **1M documents is the goal; 8.84M (MS MARCO's full corpus) is the stretch and the ceiling of the whole project.** Nothing above it is planned or measured. If a goal does not fit this machine, the algorithm is optimized; more hardware is not assumed. §2.1 gives the lines.
@@ -145,12 +147,12 @@ Modern asymmetric embedding models map **queries** (with task instructions or `"
 
 `SpaceBridge` handles all three shifts on the query side only.
 
-The chart shows what the library does (`freeze`, `mount`, `Searcher`). Operator D (§4.3), BM25 fusion and language detection are designed but not implemented; a caller passes the query language, and the first stage is the bridged dense search alone.
+The chart shows what the library does (`freeze`, `mount`, `Searcher`). Operator D (§4.3) and language detection are designed but not implemented: a caller passes the query language.
 
 ```mermaid
 flowchart TD
     subgraph Freeze["1. freeze: once, with M_src, or with no model if M_src is retired"]
-        Docs["Frozen index: vectors E_src (never modified) and document text"] --> Anchors["K anchors: K = 2,048 k-means medoids up to 150K docs, K = 8,192 random above"]
+        Docs["Frozen index: vectors E_src (never modified) and document text"] --> Anchors["K anchors: k-means medoids, K = 2,048 up to 70K docs, K = 4,096 up to 150K; K = 8,192 random above"]
         Anchors --> Proxies["Title or lead-sentence query proxies"]
         Proxies --> EncSrc["M_src encodes the proxies -> X^q (skipped if retired)"]
         Docs --> Distract["Sample up to 50K distractor rows for rho_val"]
@@ -173,9 +175,12 @@ flowchart TD
         TgtOnline --> LangCenter["Subtract the query mean; a registered language has its own mean"]
         LangCenter --> Proj["Project via W*, add mu_X^q, L2 normalize"]
         Proj --> Search["HNSW or exact search of E_src, top-pool"]
-        Report --> Pool["pool: set by hand, or the report's: §5"]
+        Report --> Pool["pool: set by hand, or from the report and BM25: §5"]
         Pool --> Search
-        Search --> Fetch["Fetch document text"]
+        UserQ --> Lexical["BM25 over the document text, top pool / 4. On above 50K documents for an English index, a reranker and a query in the index's language: §4.6"]
+        Search --> Merge["merge_pool: all of BM25's rows, then the top of the dense list up to the pool"]
+        Lexical --> Merge
+        Merge --> Fetch["Fetch document text"]
         Fetch --> Rerank["Cross-encoder -> top-k. Required above 200K documents"]
     end
 ```
@@ -185,7 +190,7 @@ flowchart TD
 ## 4. Core Algorithms & Mathematical Formulation
 
 ### 4.1 Full-Rank Anchor Selection (`AnchorSelector`)
-To prevent rank deficiency on $1024\text{d}$–$1536\text{d}$ models, the default anchor budget is **$K = \min(2,048, N)$** ($K_{\text{train}} = 1,638$, $K_{\text{val}} = 410$), and **$K = 8,192$ above $N = 150\text{K}$** (`spacebridge.default_anchor_count`, §2.1 large-index profile). Fit quality depends on $K$ relative to the embedding dimensions, not on $K/N$: v2.4 briefly capped $K \le N/10$, which on `scifact` forced $K = 518$ and cost Tier 1 about 5 points of `Recall@30` retention (91% vs. 96% at $K = 2,048$), so the cap was removed. Small corpora such as `scifact` remain smoke tests; `fiqa` ($K/N = 3.6\%$) is the authoritative benchmark.
+To prevent rank deficiency on $1024\text{d}$–$1536\text{d}$ models, the default anchor budget is **$K = \min(2,048, N)$** ($K_{\text{train}} = 1,638$, $K_{\text{val}} = 410$), **$K = 4,096$ above $N = 70\text{K}$**, and **$K = 8,192$ above $N = 150\text{K}$** (`spacebridge.default_anchor_count`, §2.1 large-index profile). Fit quality depends on $K$ relative to the embedding dimensions, not on $K/N$: v2.4 briefly capped $K \le N/10$, which on `scifact` forced $K = 518$ and cost Tier 1 about 5 points of `Recall@30` retention (91% vs. 96% at $K = 2,048$), so the cap was removed. Small corpora such as `scifact` remain smoke tests; `fiqa` ($K/N = 3.6\%$) is the authoritative benchmark.
 
 1. **Medoid Sampling ($N \ge 5,000$):** Partition document embeddings into $K$ clusters with spherical k-means (k-means++ seeding, then full-batch Lloyd steps on the GPU) and select the actual document $d_k$ closest in cosine similarity to each centroid, yielding $(D_{\text{anchor}}, X^{(d)} \in \mathbb{R}^{K \times d_s})$, with $X^{(d)}$ read **exactly as stored in the index**. (Use Farthest Point Sampling when $N < 5,000$.)
 
@@ -322,7 +327,7 @@ $$\mu_{Y, L_q}^{(q)} = \mu_{Y, L_{\text{src}}}^{(q)} + \left(\mu_{\text{FLORES},
 > **FLORES bank (close-out, 2026-11-01).** With an HF token, the bank is the Belebele-filtered FLORES `dev` split (§7.1 rule 6). The filter leaves **94 of 997** `dev` sentences (and 244 of 1,012 `devtest`): Belebele's 488 passages cover 91% / 76% of the two splits. All 94 are used (`load_shift_bank`, Tatoeba as the fallback). Row 7b, 3 seeds, $K$ = 2,048 / 4,096, mean over the 4 models: on `xquad-zh` (decision set) filtered FLORES 0.911 / 0.930 vs. Tatoeba 0.909 / 0.926 (`Recall@30` +0.3 [−0.3, +0.8], 10 / 24 cells; `nDCG@10` +1.2 [+0.4, +2.0]); 256 unfiltered `dev` pairs add nothing (+0.1). Held out on **MLQA-zh** (5,137 Chinese questions into an untitled English index of 10,894 MLQA contexts) FLORES beats Tatoeba by +0.8 [+0.4, +1.2] (21 / 24) and +1.4 [+0.8, +2.0] `nDCG@10` (Tatoeba's `cmn` side mixes Traditional script). Row 7b meets the Tier 5a 78% target on every model of `xquad-zh`, MLQA-zh (0.843 / 0.873) and XQuAD de / es / ru / ar / hi / vi (0.840–0.916 / 0.871–0.931), and Δμ helps on all of them (7b − 8b +0.2 to +3.6 points).
 
 > [!TIP]
-> **Cross-Lingual Retrieval Routing:** Whenever $L_q \neq L_{\text{src}}$, lexical BM25 overlap is near zero (`BM25` weight is automatically disabled or down-weighted), candidate pool widens to `Top-60`, and a **multilingual Cross-Encoder** (`BAAI/bge-reranker-v2-m3` or `Qwen/Qwen3-Reranker-0.6B`) scores `(zh_query, en_doc)` pairs directly.
+> **Cross-Lingual Retrieval Routing:** Whenever $L_q \neq L_{\text{src}}$, lexical BM25 overlap is near zero, so such a query skips BM25 (§4.6), the candidate pool is at least `Top-60`, and a **multilingual Cross-Encoder** (`BAAI/bge-reranker-v2-m3` or `Qwen/Qwen3-Reranker-0.6B`) scores `(zh_query, en_doc)` pairs directly.
 
 #### Regime L2: Disjoint Monolingual-to-Monolingual Bridge (e.g., `zh`-Only Index $\leftrightarrow$ `en`-Only Query Model)
 * **Scenario:** $M_{\text{src}}$ is Chinese-only (`bge-large-zh-v1.5`) and $M_{\text{tgt}}$ is English-only (`bge-large-en-v1.5`), so neither model can natively encode the other's corpus text.
@@ -340,6 +345,16 @@ $$\mu_{Y, L_q}^{(q)} = \mu_{Y, L_{\text{src}}}^{(q)} + \left(\mu_{\text{FLORES},
 When $M_{\text{src}}$ is gone, `freeze(index, None)` leaves `X_query_raw` empty and `mount` calls `fit_source_free`, which uses only stored vectors and $M_{\text{tgt}}$. Stage 1 is the Stiefel map on doc↔doc pairs (128 tokens). Queries are centered on $M_{\text{tgt}}$'s **doc** mean and restored on the stored doc mean, so the map carries $M_{\text{tgt}}$'s query/doc relation across. Stage 2 is InfoNCE only, on proxy and doc rows, with no teacher and no KL term. The status is `NO_TEACHER`, and the quality report has the fit's own measurements but no score, because no signal available without the source model predicts retention across corpora (own-doc MRR: correlation about 0.1 with TREC-COVID set aside). The rerank pool is at least 100.
 
 > **Finding (Phase 1, 2026-11-02).** First-stage `Recall@30` $\rho_{\text{ceil}}$ against the with-source fit, 3 pairs, 3 seeds: HotpotQA 0.880 / 0.874, MS MARCO 1M 0.855 / 0.850, TREC-COVID 0.946 / 0.953, FiQA 0.887 / 0.914. End to end at MS MARCO 1M, pool 300, it passes the approved targets: 0.985 Tier 1, 0.952 and 0.970 Tier 3, 0.2–0.6 points ahead of with-source on every pair and pool. FiQA needs a deeper pool: up to 4 points behind at pool 30, level at pool 300. NQ was not run. Doc-centered, query-centered and doc-rows-only Stage 2 tie within about a point on the mean, and FiQA's lead for doc rows did not hold on the other sets. Doc-centered with both rows is the default: it is clearly best on HotpotQA and needs no Stage 1 selection, which picked worse maps on Tier 3. On NQ 1M (2,000 queries, 3 seeds) it also passes at pool 300, 0.985 and 0.970, but it trails with-source: by 0.38 and 0.18 points at pool 300, and by up to 2.6 points on one pair at pool 60. So its lead on MS MARCO doesn't generalize, and the default keeps its teacher term.
+
+### 4.6 Lexical Channel (BM25 in the Rerank Pool)
+
+`spacebridge.LexicalIndex` holds BM25 ($k_1 = 0.9$, $b = 0.4$) over title and text, on lowercased `[a-z0-9]+` tokens with a short stop list, as one sparse matrix on the CPU. At a budget of $B$ documents, `merge_pool` sends the reranker all of BM25's top $B/4$, then the top of the bridged list up to $B$, with no repeats. The bridged list is asked for all of $B$, not $B - B/4$, because the two lists overlap. Bridged rows come first, so a tie in the reranker keeps first-stage order. There is no score fusion: only the reranker compares the two lists, which is why BM25 stays off without one. `Searcher` and the benchmark rows `9h`, `9hw` and `9hx` call the same `merge_pool`, so benchmarks test what ships.
+
+**Why it works where calibration doesn't.** A map carries a query's general direction and loses the detail that picks out the right document (§7.3.2). BM25 doesn't use the map at all, so what the map loses is often what BM25 holds. Retention above 1 under this channel is not a gain over native as a retrieval system, because the bridge then has a channel plain native lacks: the strict retention gives native and re-index the same BM25.
+
+**What it needs and costs.** The document text, which the reranker needs anyway. No GPU route exists: building is tokenizing text, 14–22 s at 1M and 128 s at 8.84M on one thread, at 214–361 MB at 1M and 2.2 GB at 8.84M on disk. A query takes 2–3 ms at 1M and 24 ms at 8.84M, p50, on one CPU thread (`outputs/phase1/hp_fixes/bm25time.jsonl`).
+
+**Limits.** The tokenizer keeps only `[a-z0-9]+`, so it needs an English index, and Chinese queries match only numbers and Latin names. Where relevance isn't lexical it can hurt: SciDocs (25.7K, citation links) goes from 1.022 to 0.961 on Tier 1 at budget 60, on one seed, which is why the default starts above 50K. That size is a judgment from such checks, not a measured line. $k_1$, $b$, stemming and other tokenizers have not been tuned.
 
 ---
 
@@ -483,14 +498,19 @@ class CalibrationBundle:
 
 **On disk,** a bundle and a fitted bridge are each a directory: `arrays.npz`, `meta.json` and `manifest.json`, which holds the kind, the format version and checksums. The manifest is written last and every file is written atomically (`spacebridge.durable`), so a save cut short by a crash fails to load, and saving again repairs it. A saved bridge holds what serving needs: $W$, the means, the quality report and the confidence map. Stage-2 checkpoints and the validation pool stay behind, so `validate_query_language` needs a fresh fit.
 
-**Serving.** `Searcher` runs encode, project, search, fetch and rerank, and returns a timing breakdown with each result.
+**Serving.** `Searcher` runs encode, project, search, BM25, fetch and rerank, and returns a timing breakdown with each result.
 
 ```python
 searcher = spacebridge.Searcher(bridge, tgt_encoder, backend, index, reranker=reranker)   # ExactBackend or HnswBackend
 result = searcher.search("query text", k=5)   # result.ids, .scores, .texts, .confidence, .pool, .timing_ms
+
+# BM25 (§4.6). lexical="auto" builds it when the rules in §5 say so. To build once and keep it, or to turn it off:
+lexical = spacebridge.LexicalIndex.build(index); lexical.save("lexical/")
+searcher = spacebridge.Searcher(bridge, tgt_encoder, backend, index, reranker=reranker, lexical=spacebridge.LexicalIndex.load("lexical/"))
+searcher = spacebridge.Searcher(bridge, tgt_encoder, backend, index, reranker=reranker, lexical=None)
 ```
 
-The pool follows §5. Above 200K documents, `reranker=None` raises `ValueError` unless the caller passes `allow_no_reranker=True`. `result.confidence` is NaN for a source-model-free bridge, which has no teacher to calibrate it on; it serves normally otherwise. `HnswBackend` searches at `ef_search = 500` by default, and `build_hnsw` saves as it grows, so a rerun continues.
+The pool follows §5, and `result.pool` counts the candidates actually sent. Above 200K documents, `reranker=None` raises `ValueError` unless the caller passes `allow_no_reranker=True`. `ExactBackend(vectors, device="cuda")` raises `ValueError`, naming `HnswBackend` and `device="cpu"`, when the vectors won't fit on the GPU. `result.confidence` is NaN for a source-model-free bridge, which has no teacher to calibrate it on; it serves normally otherwise. `HnswBackend` searches at `ef_search = 500` by default, and `build_hnsw` saves as it grows, so a rerun continues.
 
 `SpaceBridge.fit` remains available for ablation rows and studies. `fit(mode="auto")` requires `Y_doc_raw` unless the bridge was built with `doc_pairs=False`.
 
@@ -583,6 +603,7 @@ Every test pair runs through the following configurations:
 | **8b** | + Doc↔Doc pairs in Stage 1 and Stage 2 (anchor docs encoded by $M_{\text{tgt}}^{\text{doc}}$, each pair type centered on its own cone mean). **Default engine since M2.** | Whether extra pairs offset the proxy-positive shortcut; costs a second, ~4–5× longer encoding pass. |
 | **7b** | Row 8b + $\Delta\mu_{L_q \to L_{\text{src}}}$ *(Tier 5a)*. **Default engine on cross-lingual sets.** | Whether the language shift still helps on top of doc pairs and Stage 2. |
 | **9** | + **Hybrid RRF + Candidate Relative Rescorer + Reranker** (`bge-reranker-v2-m3` and `Qwen3-Reranker-0.6B`) | End-to-end RAG `NDCG@5` & `Recall@5` recovery across all 5 tiers; reranker comparison. Implemented as rows `9n` / `9` / `9w` (rerank bridged top-30 / 60 / 100); native and oracle are reranked at the same depth so $\rho_{\text{ceil}}$ compares like with like. |
+| **9h, 9hw, 9hx** | Row 8b + BM25, a quarter of a budget of 60 / 100 / 300, + reranker (§4.6); same-language sets only | What the library serves above 50K documents. $\rho_{\text{ceil}}$ stays against plain native and re-index at the same budget. The record's `baselines_lexical` gives the same fix on native and re-index, and the strict retention against them. |
 
 > [!NOTE]
 > **Seed variance (M2 follow-up).** The seed changes the anchors, the train/val split and the distractor pool; per-run bootstrap CIs cover only query sampling. Over 3 seeds × 6 pairs on `fiqa`, the s.d. across seeds of the mean over pairs is 0.0–0.8 points (1.1–1.5 on `xquad-zh` for rows without Δμ), much less than single-pair CIs (±4). The default-engine gains are consistent across seeds: Row 8b − Row 6 +3.2 ± 0.5 points `Recall@30` at $K = 2,048$ (15/18 pair-seed cells positive) and +2.6 ± 0.3 at 4,096 (17/18). On `xquad-zh` (3 seeds × 4 models), Row 7b − Row 8b (Δμ) is +2.0 ± 1.0 at 2,048 and +2.7 ± 0.5 at 4,096 (11/12 positive at each K). `scripts/summarize_seeds.py` produces these tables.
@@ -606,6 +627,16 @@ Every test pair runs through the following configurations:
 **Crash safety.** Every long job writes through `spacebridge_bench.durable` and continues from what is on disk when rerun: encoding parts at most every 2 minutes, rerank scores every 30 s, benchmark results per cell, HNSW builds at least every 10 minutes. Each was tested with a real `kill -9`, the HNSW build on a real 400K build (killed after a save, continued from 200,000 rows, recall 0.978 at ef 500). A real power loss was not tested; that case rests on `fsync`.
 
 **Run long jobs through `scripts/steps.sh`.** It also sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. Without that, exact search at 8.84M runs out of VRAM on 16 GB: its 7.6 GB shards fragment the allocator, and one run failed this way on its second shard.
+
+### 7.3.2 Why the map loses more on some corpora (Phase 1)
+
+HotpotQA read lowest among corpora at 1M without BM25, so a study looked for the cause (`scripts/hotpot_study.py`, `scripts/summarize_hotpot.py`; 1M, $K = 8,192$, seed 0, first stage, `bge-large-en` ← `bge-base-en` and ← `qwen3-0.6b`).
+
+**Partly explained.** The map carries a query's general direction over and loses the detail that picks out the right document, and HotpotQA has less room for that loss. Among native's top 1,000 for each query, the map adds the same score noise as on MS MARCO (0.031 and 0.038, by tier), but HotpotQA's top scores sit closer together (spread 0.022, against 0.029 and 0.025), and a positive keeps less of its score lead (0.64 and 0.60, against 0.69–0.79). **Why it keeps less there is unknown.** Entity names are the closest evidence, on one corpus: cosine falls from 0.723 to 0.689 when a query is cut to its entities.
+
+**Ruled out or small, as tested:** one shared offset (4% of the error), multi-clause form, rare entities, the two models disagreeing (re-index finds 76–84% of what the map loses), and coverage of the calibration pairs (real query pairs add +1.3 and +3.3 points at 84,000 pairs). The map class isn't the limit: a residual MLP on 84,000 real pairs gains under 0.02 of cosine and reads lower on retrieval. That is one architecture, trained on cosine.
+
+**Don't judge a map by cosine to the native query.** Real-query fits chosen by cosine raise it from 0.723 to 0.798 and lower `Recall@300` retention from 0.938 to 0.914, because shrinkage pulls queries toward the mean. Compare maps on retrieval.
 
 ### 7.4 Metrics Logged per Run
 * **Mount Wall-Clock Breakdown:** Anchor `bf16` encoding (`ms`, tokens/s), FLORES language shift (`ms`), Stage-1 Stiefel/Dual-Ridge (`ms`), Stage-2 GPU InfoNCE (`ms`), $\rho_{\text{val}}$ computation (`ms`), peak VRAM.
