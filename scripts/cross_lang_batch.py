@@ -8,6 +8,11 @@ Index in English, queries in Chinese through Row 7b, the reranker reading the or
     X4o, X4m  no bridge: BM25 on one translation, then the reranker
     X5  local residuals on Row 7b's first stage: the calibration pairs nearest the query correct it
 
+and, for the comparison with translation while the old model is alive, no bridge at all:
+
+    TMo, TMm  the old model searching on a translation: M1's translation baseline
+    TBo, TBm  the same, with BM25 on that translation, a quarter of the budget
+
 One JSON line per (set, query model, seed, candidate, budget) goes to --out as it finishes; a rerun skips those. Translations come
 from the cache (scripts/translation_baseline.py) and no translator loads if they're all there.
 
@@ -39,7 +44,7 @@ from spacebridge_bench.search import cached_search, search  # noqa: E402
 
 MAX_QUERIES = {"mlqa-zh": 1_500}
 LOCAL = {"k": 50, "tau": 20.0, "g": 0.5}  # from exp_local in scripts/hotpot_study.py, chosen there on same-language test queries
-CANDIDATES = ("7b", "reindex", "native", "X1", "X2", "X3", "X4o", "X4m", "X5")
+CANDIDATES = ("7b", "reindex", "native", "X1", "X2", "X3", "X4o", "X4m", "X5", "TMo", "TMm", "TBo", "TBm")
 
 
 def local_first_stage(bridge, bundle, tgt_mount, Q_tgt: np.ndarray, Q_hat: np.ndarray, lang: str, device: str) -> np.ndarray:
@@ -91,22 +96,29 @@ def run(name: str, tgt_key: str, seed: int, budgets: list[int], K: int, candidat
     local = search(local_first_stage(bridge, bundle, tgt_mount, Q_tgt, Q_hat, lang, device), E_src, 1000, device, exclude=ds.self_rows) if "X5" in candidates else None
     lex = cached_lexical(ds, index)
     opus, madlad = translate_cached("opus", ds.queries, device), translate_cached("madlad", ds.queries, device)
-    texts = {"X1": ds.queries, "X2": opus, "X3": madlad, "X4o": opus, "X4m": madlad}
+    texts = {"X1": ds.queries, "X2": opus, "X3": madlad, "X4o": opus, "X4m": madlad, "TBo": opus, "TBm": madlad}
+    old_model = {}
+    if {"TMo", "TMm", "TBo", "TBm"} & set(candidates):
+        enc = Encoder(src, device)
+        for tag, translated in (("o", opus), ("m", madlad)):
+            old_model[tag] = cached_search(enc.queries(translated, ds.task), E_src, 1000, device, exclude=ds.self_rows)
+        enc.unload()
     rr, docs = Reranker(RERANKERS["bge-reranker-v2-m3"], device), _DocTexts(ds.titles, ds.texts)
     for key, (c, b) in keys.items():
         if key in done:
             continue
         t0 = time.time()
         first = None
-        if c in ("7b", "reindex", "native", "X5"):
-            ranked, qs = {"7b": (bridged, ds.queries), "reindex": (reindexed, ds.queries), "native": (native, ds.index_lang_queries), "X5": (local, ds.queries)}[c]
+        if c in ("7b", "reindex", "native", "X5", "TMo", "TMm"):
+            ranked, qs = {"7b": (bridged, ds.queries), "reindex": (reindexed, ds.queries), "native": (native, ds.index_lang_queries), "X5": (local, ds.queries),
+                          "TMo": (old_model.get("o"), ds.queries), "TMm": (old_model.get("m"), ds.queries)}[c]
             rows = rerank(rr, ranked, b, qs, docs, ds.task)
             first = per_query(ranked, ds.qrels)["recall@300"].mean()
             pool_mean = float(b)
         else:
             share = b if c.startswith("X4") else b // LEXICAL_SHARE
             lexical = [lex.top(t, share, exclude=s) for t, s in zip(texts[c], ds.self_rows.tolist())]
-            dense = [np.empty(0, dtype=np.int64)] * len(lexical) if c.startswith("X4") else bridged
+            dense = [np.empty(0, dtype=np.int64)] * len(lexical) if c.startswith("X4") else old_model[c[-1]] if c.startswith("TB") else bridged
             pools = [merge_pool(d, x, b) for d, x in zip(dense, lexical)]
             if not all(len(p) for p in pools):  # a translation with no word in the index, and no bridge to fall back on
                 pools = [p if len(p) else np.array([0], dtype=np.int64) for p in pools]
