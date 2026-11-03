@@ -26,10 +26,14 @@ def test_select_anchors_random_is_a_seeded_uniform_sample():
 
 def test_large_indexes_get_more_anchors_chosen_at_random():
     from spacebridge import LARGE_INDEX_DOCS, LARGE_PROFILE_DOCS, default_anchor_count, resolve_anchor_method
+    from spacebridge.anchors import MID_PROFILE_DOCS
 
     assert default_anchor_count(1_000) == 1_000
-    assert default_anchor_count(LARGE_PROFILE_DOCS) == 2_048
+    assert default_anchor_count(MID_PROFILE_DOCS) == 2_048
+    assert default_anchor_count(MID_PROFILE_DOCS + 1) == 4_096
+    assert default_anchor_count(LARGE_PROFILE_DOCS) == 4_096
     assert default_anchor_count(LARGE_PROFILE_DOCS + 1) == 8_192
+    assert resolve_anchor_method(MID_PROFILE_DOCS + 1) == "kmeans"  # as measured
     assert default_anchor_count(LARGE_INDEX_DOCS) == 8_192  # the anchor switch comes before the reranker requirement
     assert resolve_anchor_method(LARGE_PROFILE_DOCS) == "kmeans"
     assert resolve_anchor_method(LARGE_PROFILE_DOCS + 1) == "random"

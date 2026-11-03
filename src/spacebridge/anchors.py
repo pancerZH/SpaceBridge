@@ -15,9 +15,14 @@ FPS_THRESHOLD = 5_000
 # and NQ at 100K-200K, +2.7 to +5.0 on held-out HotpotQA; no clear change on trec-covid at 50 queries). Below it, K = 8,192
 # is over the 10% mount budget on short passages: 1.1M tokens is 10% of about 145K MS MARCO documents.
 LARGE_PROFILE_DOCS = 150_000
+# Above this and up to LARGE_PROFILE_DOCS, K = 4,096 k-means fits the budget (0.55M tokens is 9.2% of 70K MS MARCO passages at
+# 85 tokens) and clears the misses K = 2,048 leaves at pool 60: MS MARCO and NQ at 100K and 150K, Tier 3 +1.4 to +2.3 points,
+# at no query-time cost. Below it, K = 4,096 is over the budget on short passages.
+MID_PROFILE_DOCS = 70_000
 # Above this a reranker is required, and the quality score is outside its calibrated range.
 LARGE_INDEX_DOCS = 200_000
 DEFAULT_ANCHORS = 2_048
+MID_INDEX_ANCHORS = 4_096
 LARGE_INDEX_ANCHORS = 8_192
 MAX_DISTRACTORS = 50_000
 
@@ -32,7 +37,7 @@ def _l2(a: np.ndarray) -> np.ndarray:
 
 def default_anchor_count(N: int) -> int:
     """The anchor budget K for an index of N documents (design §4.1)."""
-    return min(LARGE_INDEX_ANCHORS if N > LARGE_PROFILE_DOCS else DEFAULT_ANCHORS, N)
+    return min(LARGE_INDEX_ANCHORS if N > LARGE_PROFILE_DOCS else MID_INDEX_ANCHORS if N > MID_PROFILE_DOCS else DEFAULT_ANCHORS, N)
 
 
 def resolve_anchor_method(N: int, method: str = "auto") -> str:
