@@ -99,6 +99,13 @@ def index_size_check(report: QualityReport, index_size: int) -> QualityReport:
     return report
 
 
+def lexical_rerank_pool(report: Optional[QualityReport], source_free: bool = False) -> int:
+    """The rerank pool with BM25 in it: 60, or 100 for a weak or source-free fit. Read from the grade and the health flag,
+    since ``report.rerank_pool`` may hold the 300 that ``index_size_check`` wrote, which a plain bridge needs and this doesn't."""
+    weak = source_free or (report is not None and (report.grade in ("C", "D") or bool(report.details.get("stage2", {}).get("health_flag"))))
+    return RERANK_POOL_BY_GRADE["D"] if weak else DEFAULT_RERANK_POOL
+
+
 def grade(score: float) -> str:
     return next((g for lo, g in GRADES if score >= lo), "D")
 

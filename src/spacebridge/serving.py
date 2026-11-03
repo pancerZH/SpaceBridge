@@ -12,8 +12,9 @@ import torch
 from . import durable
 from .anchors import LARGE_INDEX_DOCS
 from .bridge import SpaceBridge
+from .lexical import LEXICAL_MIN_DOCS, LEXICAL_SHARE, LexicalIndex, merge_pool, timed_build
 from .mount import IndexReader, QueryEncoder
-from .quality import size_rerank_pool
+from .quality import lexical_rerank_pool, size_rerank_pool
 
 HNSW_SAVE_SECONDS = 600  # a crash loses at most this much building
 HNSW_BATCH_ROWS = 100_000
@@ -36,6 +37,14 @@ class ExactBackend:
 
     def __init__(self, vectors: np.ndarray, device: str = "cpu"):
         self.device = device if torch.cuda.is_available() else "cpu"
+        if self.device.startswith("cuda"):
+            n, d = vectors.shape
+            need, free = n * (d + 1) * 4, torch.cuda.mem_get_info(self.device)[0]  # the vectors, and one score per row
+            if need > free:
+                raise ValueError(
+                    f"{n:,} x {d} vectors need {need / 2**30:.1f} GB on the GPU and {free / 2**30:.1f} GB is free; "
+                    'use HnswBackend, or ExactBackend(vectors, device="cpu")'
+                )
         self.vectors = torch.as_tensor(np.asarray(vectors, dtype=np.float32), device=self.device)
 
     def search(self, q: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
@@ -55,7 +64,8 @@ class HnswBackend:
     def search(self, q: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
         self.index.hnsw.efSearch = max(self.ef_search, k)
         scores, ids = self.index.search(np.asarray(q, dtype=np.float32), k)
-        return ids[0], scores[0]
+        found = ids[0] >= 0  # a graph can return fewer than k, padded with -1
+        return ids[0][found], scores[0][found]
 
 
 def save_faiss_index(index, path: Path) -> None:
@@ -128,8 +138,8 @@ class SearchResult:
     texts: list[str]
     confidence: float               # predicted top-10 agreement with native retrieval (design §5.1); NaN for a
                                     # source-model-free bridge, which has no teacher to calibrate it on
-    pool: int                       # candidates sent to the reranker
-    timing_ms: dict[str, float] = field(default_factory=dict)  # encode, project, search, fetch, rerank, total
+    pool: int                       # candidates actually sent to the reranker
+    timing_ms: dict[str, float] = field(default_factory=dict)  # encode, project, search, lexical, fetch, rerank, total
 
 
 class Searcher:
@@ -137,11 +147,18 @@ class Searcher:
 
     Above ``LARGE_INDEX_DOCS`` documents a reranker is required: first-stage results lose far more there (MS MARCO 1M, nDCG@5
     0.33-0.44 instead of 0.66-0.69). ``allow_no_reranker=True`` opts out, to time search alone.
+
+    ``lexical`` puts BM25 in the rerank pool, a quarter of it (design §4.5). ``"auto"`` builds a ``LexicalIndex`` from the index
+    above ``LEXICAL_MIN_DOCS`` documents, if the index is in English and there's a reranker to merge the two lists. A
+    ``LexicalIndex`` is used whatever the size and language. ``None`` turns it off. With it on, the pool defaults to 60, or 100
+    for a weak or source-free fit, and a query in a language other than the index's skips BM25 and takes the pool it would take
+    with BM25 off.
     """
 
     def __init__(
         self, bridge: SpaceBridge, encoder: QueryEncoder, backend: SearchBackend, index: IndexReader,
         reranker: Optional[Reranker] = None, pool: Optional[int] = None, device: str = "cpu", allow_no_reranker: bool = False,
+        lexical: LexicalIndex | str | None = "auto",
     ):
         if reranker is None and len(index) > LARGE_INDEX_DOCS and not allow_no_reranker:
             raise ValueError(
@@ -149,10 +166,25 @@ class Searcher:
                 "design §2.1); pass one, or allow_no_reranker=True to serve first-stage results anyway"
             )
         self.bridge, self.encoder, self.backend, self.index, self.reranker = bridge, encoder, backend, index, reranker
-        if pool is None:
-            pool = bridge.quality.rerank_pool if bridge.quality is not None else size_rerank_pool(len(index))
-        self.pool = pool
+        self.lexical = self._resolve_lexical(lexical)
+        self.plain_pool = pool or (bridge.quality.rerank_pool if bridge.quality is not None else size_rerank_pool(len(index)))
+        self.pool = self.plain_pool
+        if self.lexical is not None and pool is None:
+            self.pool = lexical_rerank_pool(bridge.quality, source_free=bridge.status == "NO_TEACHER")
         self.device = device
+
+    def _resolve_lexical(self, lexical: LexicalIndex | str | None) -> Optional[LexicalIndex]:
+        if isinstance(lexical, str) and lexical != "auto":
+            raise ValueError(f"lexical must be a LexicalIndex, 'auto' or None, not {lexical!r}")
+        if lexical is None or self.reranker is None:  # only a reranker can merge the two lists
+            return None
+        if lexical != "auto":
+            if len(lexical) != len(self.index):
+                raise ValueError(f"the lexical index has {len(lexical):,} documents and the index {len(self.index):,}")
+            return lexical
+        if len(self.index) <= LEXICAL_MIN_DOCS or self.bridge.src_lang != "en":  # the tokenizer keeps only [a-z0-9]+
+            return None
+        return timed_build(self.index)
 
     def _now(self) -> float:
         if self.device.startswith("cuda") and torch.cuda.is_available():
@@ -160,7 +192,8 @@ class Searcher:
         return time.perf_counter()
 
     def search(self, query: str, k: int = 5, query_lang: Optional[str] = None, pool: Optional[int] = None) -> SearchResult:
-        pool = pool or self.pool
+        lexical = self.lexical if query_lang in (None, self.bridge.src_lang) else None
+        pool = pool or (self.pool if lexical is not None else self.plain_pool)
         timing = {}
         t0 = t = self._now()
 
@@ -176,6 +209,9 @@ class Searcher:
         lap("project")
         ids, scores = self.backend.search(q_hat, pool)
         lap("search")
+        if lexical is not None:
+            ids = merge_pool(ids, lexical.top(query, pool // LEXICAL_SHARE), pool)
+        lap("lexical")
         titles, texts = self.index.titles(ids), self.index.texts(ids)
         docs = [f"{title}\n{text}" if title else text for title, text in zip(titles, texts)]
         lap("fetch")
@@ -185,4 +221,4 @@ class Searcher:
             ids, scores, docs = ids[order], scores[order], [docs[i] for i in order]
         lap("rerank")
         timing["total"] = 1e3 * (t - t0)
-        return SearchResult(ids[:k], scores[:k], docs[:k], float(confidence[0]), pool, timing)
+        return SearchResult(ids[:k], scores[:k], docs[:k], float(confidence[0]), len(ids), timing)
