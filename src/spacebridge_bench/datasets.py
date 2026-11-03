@@ -91,6 +91,10 @@ DATASETS: dict[str, DatasetSpec] = {
     "nq-full": DatasetSpec(
         "mteb/nq", "en", "Given a question, retrieve Wikipedia passages that answer the question", nested_docs=1_000_000,
     ),
+    "hotpotqa-full": DatasetSpec(
+        "mteb/hotpotqa", "en", "Given a multi-hop question, retrieve documents that can help answer the question",
+        max_queries=2_000, nested_docs=1_000_000,
+    ),
     # The same row order cut at 1M: prefixes up to 1M for models with no whole-corpus embeddings. Same documents as
     # msmarco-1m and nq-1m, so scripts/reorder_embeddings.py makes their embeddings with no encoding.
     "msmarco-1m-nested": DatasetSpec(

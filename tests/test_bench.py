@@ -464,3 +464,19 @@ def test_the_lexical_cache_is_keyed_by_the_corpus_rows(tmp_path, monkeypatch):
     prefix = replace(ds, doc_ids=ds.doc_ids[:4])
     assert len(run.cached_lexical(prefix, Index(np.zeros((4, 2)), texts, titles))) == 4  # other rows, another index
     assert len(list(tmp_path.iterdir())) == 2
+
+
+def test_concat_embeddings_writes_a_file_np_load_reads_and_nothing_on_failure(tmp_path):
+    from spacebridge_bench.encode import concat_embeddings
+
+    a, b = np.arange(12, dtype=np.float16).reshape(4, 3), -np.arange(9, dtype=np.float16).reshape(3, 3)
+    np.save(tmp_path / "a.npy", a)
+    np.save(tmp_path / "b.npy", b)
+    concat_embeddings([tmp_path / "a.npy", tmp_path / "b.npy"], tmp_path / "ab.npy", chunk_rows=2)
+    back = np.load(tmp_path / "ab.npy", mmap_mode="r")
+    assert back.dtype == np.float16 and back.shape == (7, 3)
+    np.testing.assert_array_equal(back, np.concatenate([a, b]))
+    np.save(tmp_path / "c.npy", np.zeros((2, 5), dtype=np.float16))
+    with pytest.raises(ValueError, match="line up"):
+        concat_embeddings([tmp_path / "a.npy", tmp_path / "c.npy"], tmp_path / "bad.npy")
+    assert not (tmp_path / "bad.npy").exists()

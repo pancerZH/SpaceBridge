@@ -205,6 +205,19 @@ class Encoder:
         return h.hexdigest()[:24]
 
 
+def concat_embeddings(parts: list[str | Path], target: str | Path, chunk_rows: int = 65_536) -> None:
+    """One embedding file from several with the same dtype and width, one after the other, written whole or not at all."""
+    arrays = [np.load(p, mmap_mode="r") for p in parts]
+    if len({(a.dtype, a.shape[1]) for a in arrays}) != 1:
+        raise ValueError(f"these don't line up: {[(a.dtype, a.shape) for a in arrays]}")
+    header = {"descr": np.lib.format.dtype_to_descr(arrays[0].dtype), "fortran_order": False, "shape": (sum(len(a) for a in arrays), arrays[0].shape[1])}
+    with durable.atomic_file(target) as f:
+        np.lib.format.write_array_header_2_0(f, header)
+        for a in arrays:
+            for s in range(0, len(a), chunk_rows):
+                f.write(np.asarray(a[s : s + chunk_rows]).tobytes())
+
+
 class MountEncoder:
     """``Encoder`` as the engine's ``QueryEncoder``: cached, with the model's prompts and the dataset's task."""
 
