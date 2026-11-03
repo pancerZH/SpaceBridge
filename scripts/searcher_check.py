@@ -15,13 +15,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from spacebridge import CrossEncoderReranker, ExactBackend, Index, Searcher, SentenceTransformerEncoder, freeze, mount
+from spacebridge import LARGE_PROFILE_DOCS, CrossEncoderReranker, ExactBackend, Index, Searcher, SentenceTransformerEncoder, default_anchor_count, freeze, mount
 from spacebridge_bench import durable
 from spacebridge_bench.datasets import load_beir, load_shift_bank
-from spacebridge_bench.encode import Encoder
+from spacebridge_bench.encode import Encoder, MountEncoder
 from spacebridge_bench.metrics import per_query
 from spacebridge_bench.models import MODELS
-from spacebridge_bench.run import cached_lexical
+from spacebridge_bench.run import cached_anchors, cached_lexical
 
 
 def adapter(key: str, task: str, device: str) -> SentenceTransformerEncoder:
@@ -42,12 +42,14 @@ def main() -> None:
     p.add_argument("--n", type=int, default=200)
     p.add_argument("--budgets", type=int, nargs="+", default=[60])
     p.add_argument("--K", type=int, default=None, help="anchors (default: the index size's)")
+    p.add_argument("--bench-fit", action="store_true", help="fit through the benchmark's cached encoders, so the map is the row's and only serving differs")
+    p.add_argument("--same-anchors", action="store_true", help="the benchmark's cached anchors rather than a fresh selection, to set anchor noise aside")
     p.add_argument("--translate", default=None, help="a cached translator of scripts/translation_baseline.py: BM25 reads its output, through Searcher(translate=)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
 
-    done = {r["budget"] for r in durable.read_jsonl(args.out)[0]} if args.out.exists() else set()
+    done = {r["budget"] for r in durable.read_jsonl(args.out)[0] if r.get("same_anchors", False) == args.same_anchors and r.get("bench_fit", False) == args.bench_fit} if args.out.exists() else set()
     budgets = [b for b in args.budgets if b not in done]
     if not budgets:
         return
@@ -57,13 +59,28 @@ def main() -> None:
     enc.unload()
     index = Index(store, ds.texts, ds.titles)
     t0 = time.perf_counter()
-    src = adapter(args.index_model, ds.task, args.device)
-    bundle = freeze(index, src, ds.lang, args.seed, args.K, device=args.device)
+    src = MountEncoder(MODELS[args.index_model], ds.task, args.device) if args.bench_fit else adapter(args.index_model, ds.task, args.device)
+    anchor_ids = None
+    if args.same_anchors:
+        K = args.K or default_anchor_count(ds.N)
+        anchor_ids = cached_anchors(ds, args.index_model, store, np.setdiff1d(np.arange(ds.N), ds.self_rows), K, args.seed)
+    bundle = freeze(index, src, ds.lang, args.seed, args.K, anchor_ids=anchor_ids, device=args.device)
+    if not args.same_anchors and ds.N <= LARGE_PROFILE_DOCS:
+        cached = cached_anchors(ds, args.index_model, store, np.setdiff1d(np.arange(ds.N), ds.self_rows), bundle.K, args.seed)
+        durable.progress(f"fresh anchors against the benchmark's cached ones: {len(set(bundle.anchor_ids.tolist()) & set(cached.tolist())):,} of {bundle.K:,} shared")
+    if args.bench_fit:
+        src.unload()
     del src
-    tgt = adapter(args.query_model, ds.task, args.device)
     langs = [ds.query_lang] if ds.query_lang else []
     banks = {ds.query_lang: load_shift_bank(ds.query_lang)[:2]} if ds.query_lang else None
-    bridge = mount(bundle, index, tgt, langs, device=args.device, shift_banks=banks)
+    if args.bench_fit:
+        fit_encoder = MountEncoder(MODELS[args.query_model], ds.task, args.device)
+        bridge = mount(bundle, index, fit_encoder, langs, device=args.device, shift_banks=banks)
+        fit_encoder.unload()
+        tgt = adapter(args.query_model, ds.task, args.device)
+    else:
+        tgt = adapter(args.query_model, ds.task, args.device)
+        bridge = mount(bundle, index, tgt, langs, device=args.device, shift_banks=banks)
     durable.progress(f"mounted in {time.perf_counter() - t0:.0f} s: K {bundle.K}, grade {bridge.quality.grade}, stored pool {bridge.quality.rerank_pool}")
     vectors = np.empty(store.shape, dtype=np.float32)
     for s in range(0, len(store), 200_000):
@@ -90,7 +107,7 @@ def main() -> None:
                 durable.progress(f"budget {budget}: {i + 1} / {len(qs)} queries")
         metrics = {m: float(v.mean()) for m, v in per_query(rows, qrels).items()}
         rec = {"dataset": ds.name, "src": args.index_model, "tgt": args.query_model, "seed": args.seed, "K": bundle.K, "n": len(qs), "budget": budget,
-               "default_budget": searcher.pool, "grade": bridge.quality.grade, "translate": args.translate, "pool_mean": float(np.mean(sent)), "metrics": metrics}
+               "default_budget": searcher.pool, "grade": bridge.quality.grade, "translate": args.translate, "same_anchors": args.same_anchors, "bench_fit": args.bench_fit, "pool_mean": float(np.mean(sent)), "metrics": metrics}
         durable.append_lines(args.out, [json.dumps(rec)])
         durable.progress(f"budget {budget}: nDCG@5 {metrics['ndcg@5']:.5f}")
 
