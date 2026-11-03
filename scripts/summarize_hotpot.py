@@ -287,6 +287,8 @@ def bm25_tables() -> None:
         h = r["bm25_holds_lost"]
         rows.append([label(r["corpus"]), TIER[r["tier"]], r["n_lost"], f3(h["15"]), f3(h["30"]), f3(h["75"]), f3(h["300"]), f3(r["bm25_holds_kept"]["15"])])
     table(["Corpus", "Tier", "Positives lost", "Top 15", "Top 30", "Top 75", "Top 300", "Top 15, positives the map kept"], rows)
+    print("BM25's time per query, `bm25time.jsonl`: idle machine, one CPU thread, 200 queries, top 60.\n")
+    table(["Corpus", "Documents", "Postings", "p50, ms", "p95, ms", "Max, ms"], [[label(r["corpus"]), f"{r['docs']:,}", f"{r['postings']:,}", f"{r['p50_ms']:.1f}", f"{r['p95_ms']:.1f}", f"{r['max_ms']:.1f}"] for r in read(FIXES / "bm25time.jsonl")])
     print("BM25 alone, `bm25.jsonl`:\n")
     table(["Corpus", "`R@5`", "`R@10`", "`R@30`", "`R@100`", "`R@300`", "`R@1000`", "`nDCG@5`"], [[label(r["corpus"])] + [f3(r[f"recall@{k}"]) for k in (5, 10, 30, 100, 300, 1000)] + [f3(r["ndcg@5"])] for r in read(FIXES / "bm25.jsonl")])
 
