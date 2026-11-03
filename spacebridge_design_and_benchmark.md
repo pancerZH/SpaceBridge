@@ -374,19 +374,23 @@ where the student uses $\hat{q}_{\text{src}}$ and the teacher uses native $X^{(q
 
 **Per-language validation (Regime L1).** English-anchor $\rho_{\text{val}}$ says nothing about Chinese queries. For each registered $L_q$, a second score $\rho_{\text{val}, L_q}$ uses FLORES `devtest` pairs (disjoint from the 256 `dev` sentences used for $\Delta\mu$): $L_q$ sentences are projected as queries and must retrieve their $L_{\text{src}}$ counterparts, encoded once by $M_{\text{src}}^{\text{doc}}$ and mixed into $\mathcal{P}$. Routing uses $\rho_{\text{val}, L_q}$ for queries in $L_q$.
 
-**What the library does (Phase 1, 2026-11-02).** The index size and the §5.1 grade set the rerank pool. The $\rho_{\text{val}}$ label in `bridge.status` is reported but routes nothing, and Operator D and BM25 fusion are not in the serving path (§3).
+**What the library does (Phase 1).** The index size, the language and the §5.1 grade set BM25 (§4.6) and the rerank pool. The $\rho_{\text{val}}$ label in `bridge.status` is reported but routes nothing, and Operator D is not in the serving path (§3).
 
-| Index | Rerank pool (`QualityReport.rerank_pool`; `pool=` overrides it) | Reranker in `Searcher` |
+| Situation | BM25 (`lexical="auto"`) | Rerank pool (`pool=` overrides it) |
 | :--- | :--- | :--- |
-| Up to 200K documents | Grade A or B: 60. Grade C or D, a Stage-2 health flag, or a source-model-free fit: 100 | Optional |
-| Above 200K documents | 300 with a warning, whatever the grade | Required: raises `ValueError` unless `allow_no_reranker=True` |
-| A bridge with no quality report | 60 up to 200K documents, 300 above | As above |
+| Above 50K documents, English index, a reranker | On | Grade A or B: 60. Grade C or D, a Stage-2 health flag, or a source-model-free fit: 100 |
+| Up to 50K documents | Off | The same |
+| No reranker, or an index not in English | Off | Up to 200K as above; above 200K, 300 with a warning, whatever the grade |
+| `lexical=None` | Off | The same |
+| A `LexicalIndex` passed in | On, whatever the size and language | As the first row |
+| A query in another language | Skipped for that query, unless `translate=` is set | What it would be with BM25 off, or as the first row with `translate=` |
+| A bridge with no quality report | As above | As above, with no grade to widen it |
 
-A bridge saved before a rule changes keeps the pool stored in its report.
+A reranker is required above 200K documents: `Searcher` raises `ValueError` without one, unless `allow_no_reranker=True`. A bridge saved earlier keeps the pool stored in its report, and that's what it serves with BM25 off. With BM25 on, the pool comes from its grade and health flag instead, so it never inherits the 300 that `index_size_check` writes above 200K.
 
-**Why 300 above 200K, not 200.** End to end, $K$ = 8,192, 2,000 queries, 3 seeds, Tier 1 then Tier 3 mean at pool 200: MS MARCO 1M 0.982 and 0.947, NQ 1M 0.982 and 0.962, which pass, and through HNSW at ef 500 on MS MARCO, by 0.03 points. The held-out HotpotQA 1M misses at pool 200 (0.940, 0.879) and also at pool 300 (0.956, 0.898), so the default stays 300 and 1M is outside the best range (§2.1).
+**Why 60 with BM25.** End to end, 3 seeds, Tier 1 then Tier 3, with BM25 at budget 60: at 1M, 2,000 queries, HotpotQA 0.995 and 1.020, MS MARCO 0.995 and 0.982, NQ 0.985 and 0.979. At 75K to 500K, 500 queries, the lowest reads are 0.989 and 0.988 (§2.1). Budget 60 costs on the CPU what a re-indexed system's rerank costs (§2.1).
 
-**Known gap at or below 200K.** The library serves pool 60 at 100K and 150K on MS MARCO and NQ, because every pair grades A or B, and that misses: at 150K, Tier 1 and Tier 3 read 0.976 and 0.918 on MS MARCO, 0.979 and 0.938 on NQ; at 100K, Tier 3 reads 0.933 on MS MARCO (K = 2,048, 500 queries, 3 seeds). The routing is unchanged, pending a decision.
+**Why 300 above 200K with BM25 off, not 200.** End to end, $K$ = 8,192, 2,000 queries, 3 seeds, Tier 1 then Tier 3 mean at pool 200: MS MARCO 1M 0.982 and 0.947, NQ 1M 0.982 and 0.962, which pass, and through HNSW at ef 500 on MS MARCO, by 0.03 points. The held-out HotpotQA 1M misses at pool 200 (0.940, 0.879) and also at pool 300 (0.956, 0.898), so there's no pool up to 300 that a plain bridge can rely on, and the default stays 300.
 
 **The earlier thresholds.** $\rho_{\text{val}} = 0.58$ and $0.40$ came from 180 `scifact` fits (real `Recall@30` ceiling retention $\approx 0.85\,\rho_{\text{val}} + 0.41$, $R^2 = 0.87$) and did not transfer to `fiqa` (the same fit implies 0.505 and 0.347). They now only name the `bridge.status` label.
 
@@ -406,7 +410,7 @@ Approved routing (2026-10-30), **made advisory 2026-10-31** (after the M2 calibr
 | **B** | $85\text{–}95$ | `rerank_pool = 60` |
 | **C** | $70\text{–}85$ | `rerank_pool = 100`, warn |
 | **D** | $< 70$ | `rerank_pool = 100`, warn and recommend native re-indexing |
-| *any, index above 200K docs* | | `rerank_pool = 300`, warn (§5) |
+| *any, index above 200K docs* | | `rerank_pool = 300`, warn; `Searcher` with BM25 reads the grade instead (§5) |
 
 Unscored reports (no calibration available) also get 60. Why advisory: the score transfers to an unseen corpus with a ±4.3-point error, about half a grade, and it over-predicts hard corpora (`trec-covid` by 8 points), so an A could put a hard corpus at `rerank_pool = 30`, where Tier 3 misses its end-to-end target even on `fiqa` (mean 0.94, worst 0.89–0.91). At 60, `fiqa` meets the Tier 1 end-to-end target on every pair, and Tier 3 on 4 of 4 pairs with `bge-reranker-v2-m3` (worst 0.941) and 3 of 4 with `Qwen3-Reranker-0.6B` (worst 0.930). Shrinking the pool for grade A should come back only with a signal that detects hard datasets.
 
