@@ -180,6 +180,20 @@ def rerank(
     return np.take_along_axis(cand, order, axis=1)
 
 
+def rerank_pools(reranker: Reranker, pools: list[np.ndarray], queries: list[str], doc_texts, task: str) -> np.ndarray:
+    """Like ``rerank``, for candidate lists that may differ in length: (n_queries, longest) row ids, padded with -1. Ties keep
+    each list's order."""
+    flat = np.concatenate(pools)
+    q_idx = np.repeat(np.arange(len(pools)), [len(x) for x in pools])
+    scores = reranker.score([queries[i] for i in q_idx], [doc_texts[j] for j in flat.tolist()], task)
+    out = np.full((len(pools), max(len(x) for x in pools)), -1, dtype=np.int64)
+    at = 0
+    for i, x in enumerate(pools):
+        out[i, : len(x)] = x[np.argsort(-scores[at : at + len(x)], kind="stable")]
+        at += len(x)
+    return out
+
+
 def topk_jaccard(a: np.ndarray, b: np.ndarray, k: int = 5) -> np.ndarray:
     """Per-query Jaccard overlap of the top-k sets of two rankings."""
     return np.array([len(set(x[:k]) & set(y[:k])) / len(set(x[:k]) | set(y[:k])) for x, y in zip(a, b)])

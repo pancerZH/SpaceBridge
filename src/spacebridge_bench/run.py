@@ -6,6 +6,7 @@ Example:
 """
 
 import argparse
+import hashlib
 import json
 import time
 from collections import Counter
@@ -16,16 +17,17 @@ from typing import Optional
 import numpy as np
 
 from spacebridge import (
-    DOC_PAIR_TOKENS, Index, RefineConfig, SpaceBridge, extract_query_proxy, freeze, make_query_proxies, mount, random_anchors,
+    DOC_PAIR_TOKENS, Index, LexicalIndex, RefineConfig, SpaceBridge, extract_query_proxy, freeze, make_query_proxies, merge_pool, mount, random_anchors,
     default_anchor_count, resolve_anchor_method, select_anchors,
 )
+from spacebridge.lexical import LEXICAL_SHARE
 
 from . import durable
 from .datasets import DATASETS, FLORES_SPLITS, SHIFT_BANKS, RetrievalDataset, flores_available, load_beir, load_flores, load_shift_bank
 from .encode import Encoder, MountEncoder
 from .metrics import bootstrap_ratio_ci, per_query, retention
 from .models import MODELS
-from .rerank import RERANKERS, Reranker, rerank, topk_jaccard
+from .rerank import RERANKERS, Reranker, rerank, rerank_pools, topk_jaccard
 from .search import cached_search, search
 from .store import EmbeddingStore
 
@@ -59,6 +61,9 @@ ROWS = {
     "9x": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-300 + cross-encoder rerank",
     "9y": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-500 + cross-encoder rerank",
     "9z": "Default engine (Row 8b; 7b on cross-lingual sets) bridged top-1,000 + cross-encoder rerank",
+    "9h": "Row 8b + BM25, a quarter of a budget of 60, + cross-encoder rerank (same-language sets only)",
+    "9hw": "Row 8b + BM25, a quarter of a budget of 100, + cross-encoder rerank (same-language sets only)",
+    "9hx": "Row 8b + BM25, a quarter of a budget of 300, + cross-encoder rerank (same-language sets only)",
 }
 
 # row -> (anchor embeddings used as Y, fit mode, pair type, restore source mean)
@@ -101,7 +106,10 @@ SEARCH_K = 1_000  # as fast as top-100, and reports recall at rerank depth
 VAL_K = 10  # rho_val's top-k (spacebridge.bridge.VAL_K)
 ANCHOR_CACHE = Path("data/cache/anchors")
 _warm = False
-RERANK_DEPTH = {"9t": 10, "9u": 20, "9n": 30, "9": 60, "9w": 100, "9p": 150, "9q": 200, "9x": 300, "9y": 500, "9z": 1_000}
+LEXICAL_ROWS = {"9h": 60, "9hw": 100, "9hx": 300}
+RERANK_DEPTH = {"9t": 10, "9u": 20, "9n": 30, "9": 60, "9w": 100, "9p": 150, "9q": 200, "9x": 300, "9y": 500, "9z": 1_000, **LEXICAL_ROWS}
+LEXICAL_CACHE = Path("data/cache/lexical")
+_LEXICAL: dict[Path, LexicalIndex] = {}  # one copy per process: 2.2 GB at 8.84M, and every seed and pair reads it
 CI_METRICS = ("recall@30", "ndcg@5", "ndcg@10")
 PROXY_STYLES = ("title", "title-any", "lead", "short")
 
@@ -130,6 +138,23 @@ def cached_anchors(
     path.parent.mkdir(parents=True, exist_ok=True)
     durable.save_npy(path, ids)
     return ids
+
+
+def cached_lexical(ds: RetrievalDataset, index: Index) -> LexicalIndex:
+    """BM25 over a corpus's rows, kept on disk: it depends on nothing but those rows, in that order."""
+    h = hashlib.blake2b(digest_size=12)
+    for doc_id in ds.doc_ids:
+        h.update(str(doc_id).encode() + b"\x00")
+    path = LEXICAL_CACHE / f"{ds.name}_{h.hexdigest()}"
+    if path not in _LEXICAL:
+        if (path / "manifest.json").exists():
+            _LEXICAL[path] = LexicalIndex.load(path)
+        else:
+            t0 = time.perf_counter()
+            _LEXICAL[path] = LexicalIndex.build(index)
+            _LEXICAL[path].save(path)
+            durable.progress(f"lexical {ds.name}: built and saved in {time.perf_counter() - t0:.0f} s, {_LEXICAL[path].X.nnz:,} postings")
+    return _LEXICAL[path]
 
 
 def run_pair(
@@ -322,30 +347,61 @@ def run_pair(
                     rec["confidence"] = _confidence_study(bridge, Q_tgt, ranked, native_ranked, pq, native_pq, oracle_pq)
         records.append(_score_record(rec, pq, native_pq, oracle_pq))
 
-    rerank_rows = [r for r in rows if r in RERANK_DEPTH]
+    # Same-language only: BM25 can't match a query against an index in another language.
+    rerank_rows = [r for r in rows if r in RERANK_DEPTH and not (r in LEXICAL_ROWS and ds.query_lang)]
     if rerank_rows and rerankers:
         ranked8, fit8, _, _ = fit_row(rerank_base)
         docs = _DocTexts(ds.titles, ds.texts)
+        lexical_top = None
+        if set(rerank_rows) & set(LEXICAL_ROWS):
+            lexical = cached_lexical(ds, index)
+            deepest = max(LEXICAL_ROWS[r] for r in rerank_rows if r in LEXICAL_ROWS) // LEXICAL_SHARE
+            lexical_top = [lexical.top(q, deepest, exclude=s) for q, s in zip(ds.queries, ds.self_rows.tolist())]
         for rr_key in rerankers:
             rr = Reranker(RERANKERS[rr_key], device)
             for row in rerank_rows:
                 depth = RERANK_DEPTH[row]
                 out = {name: rerank(rr, r, depth, qs, docs, ds.task) for name, r, qs in
-                       (("native", native_ranked, ds.index_lang_queries), ("oracle", oracle_ranked, ds.queries),
-                        ("bridge", ranked8, ds.queries))}
+                       (("native", native_ranked, ds.index_lang_queries), ("oracle", oracle_ranked, ds.queries))}
+                candidates = ranked8[0, :depth]
+                extra = {}
+                if row in LEXICAL_ROWS:
+                    # The plain lists above are the ceiling every row uses; the same fix on native and re-index is the strict one.
+                    share = depth // LEXICAL_SHARE
+                    pools = {name: [merge_pool(a, b[:share], depth) for a, b in zip(r, lexical_top)]
+                             for name, r in (("native", native_ranked), ("oracle", oracle_ranked), ("bridge", ranked8))}
+                    fixed = {name: rerank_pools(rr, pools[name], qs, docs, ds.task) for name, qs in
+                             (("native", ds.index_lang_queries), ("oracle", ds.queries), ("bridge", ds.queries))}
+                    out["bridge"] = fixed["bridge"]
+                    candidates = pools["bridge"][0]
+                    extra = {"lexical_share": share, "pool_mean": float(np.mean([len(x) for x in pools["bridge"]])),
+                             "lexical_in_dense": float(np.mean([len(set(a[:depth].tolist()) & set(b[:share].tolist())) for a, b in zip(ranked8, lexical_top)]))}
+                else:
+                    out["bridge"] = rerank(rr, ranked8, depth, ds.queries, docs, ds.task)
                 pqs = {name: per_query(r, ds.qrels) for name, r in out.items()}
                 rec = {**base, "row": row, "description": ROWS[row], "reranker": rr_key, "depth": depth, "fit": fit8,
-                       "first_stage_row": rerank_base}
+                       "first_stage_row": rerank_base, **extra}
                 rec["baselines"] = {name: {m: float(v.mean()) for m, v in pqs[name].items()} for name in ("native", "oracle")}
                 rec["jaccard@5"] = {
                     "bridge_vs_oracle": float(topk_jaccard(out["bridge"], out["oracle"]).mean()),
                     "bridge_vs_native": float(topk_jaccard(out["bridge"], out["native"]).mean()),
                     "native_vs_oracle": float(topk_jaccard(out["native"], out["oracle"]).mean()),
                 }
-                rec["rerank_ms_per_query"] = rr.timed_ms_per_query(ds.queries[0], [docs[j] for j in ranked8[0, :depth]], ds.task)
+                rec["rerank_ms_per_query"] = rr.timed_ms_per_query(ds.queries[0], [docs[j] for j in candidates], ds.task)
+                if row in LEXICAL_ROWS:
+                    rec["baselines_lexical"] = _strict_retention({name: per_query(fixed[name], ds.qrels) for name in fixed})
                 records.append(_score_record(rec, pqs["bridge"], pqs["native"], pqs["oracle"]))
             rr.unload()
     return records
+
+
+def _strict_retention(pqs: dict[str, dict]) -> dict:
+    """What native and re-index read through the same fix, and the bridge's retention against that stricter ceiling."""
+    bridge, native, oracle = ({m: float(v.mean()) for m, v in pqs[name].items()} for name in ("bridge", "native", "oracle"))
+    return {
+        "native": native, "oracle": oracle, "rho_ceil": retention(bridge, native, oracle)[1],
+        "ci_ceil": {m: bootstrap_ratio_ci(pqs["bridge"][m], pqs["native"][m] if native[m] <= oracle[m] else pqs["oracle"][m]) for m in CI_METRICS},
+    }
 
 
 class _DocTexts:

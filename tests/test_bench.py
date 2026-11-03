@@ -402,3 +402,65 @@ def test_onnx_reranker_goes_through_the_cache_and_the_cpu_budget(tmp_path):
     assert len(rr._model.seen) == 3
     rr.score(["q"] * 3, ["doc 1", "doc 2", "doc 3"], "")
     assert len(rr._model.seen) == 3
+
+
+def test_rerank_pools_handles_lists_of_any_length_and_keeps_order_on_ties():
+    from spacebridge_bench.rerank import rerank_pools
+
+    docs = [f"doc {i}" for i in range(10)]
+    out = rerank_pools(_FakeReranker(), [np.array([1, 5, 3]), np.array([2])], ["a", "b"], docs, "")
+    assert out.tolist() == [[5, 3, 1], [2, -1, -1]]
+
+    class Flat:
+        def score(self, queries, docs, task):
+            return np.zeros(len(docs))
+
+    assert rerank_pools(Flat(), [np.array([7, 2, 9])], ["a"], docs, "").tolist() == [[7, 2, 9]]
+
+
+def test_strict_retention_uses_the_lower_of_the_two_fixed_baselines():
+    from spacebridge_bench.run import _strict_retention
+
+    pq = lambda v: {m: np.array(v, dtype=float) for m in ("recall@30", "ndcg@5", "ndcg@10")}
+    out = _strict_retention({"bridge": pq([0.4, 0.6]), "native": pq([0.8, 0.8]), "oracle": pq([0.5, 0.7])})
+    assert out["native"]["ndcg@5"] == 0.8 and out["oracle"]["ndcg@5"] == 0.6
+    assert out["rho_ceil"]["ndcg@5"] == pytest.approx(0.5 / 0.6)
+    lo, hi = out["ci_ceil"]["ndcg@5"]
+    assert lo <= out["rho_ceil"]["ndcg@5"] <= hi
+
+
+def test_lexical_rows_are_rerank_rows_with_a_quarter_for_bm25():
+    from spacebridge.lexical import LEXICAL_SHARE
+    from spacebridge_bench.run import LEXICAL_ROWS, RERANK_DEPTH, ROWS
+
+    assert LEXICAL_ROWS == {"9h": 60, "9hw": 100, "9hx": 300} and LEXICAL_SHARE == 4
+    assert all(RERANK_DEPTH[r] == b and r in ROWS for r, b in LEXICAL_ROWS.items())
+
+
+def test_the_lexical_cache_is_keyed_by_the_corpus_rows(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    from spacebridge import Index
+    from spacebridge_bench import run
+    from spacebridge_bench.datasets import RetrievalDataset
+
+    monkeypatch.setattr(run, "LEXICAL_CACHE", tmp_path)
+    monkeypatch.setattr(run, "_LEXICAL", {})
+    texts, titles = [f"word{i} common" for i in range(6)], [""] * 6
+    ds = RetrievalDataset("toy", "en", "task", [str(i) for i in range(6)], titles, texts, [], [], np.empty(0, dtype=np.int64))
+    index = Index(np.zeros((6, 2)), texts, titles)
+    built = run.cached_lexical(ds, index)
+    assert built.top("word3", 2).tolist() == [3]
+    assert len(list(tmp_path.iterdir())) == 1
+    assert run.cached_lexical(ds, index) is built  # the same process keeps it
+
+    monkeypatch.setattr(run, "_LEXICAL", {})
+    monkeypatch.setattr(run.LexicalIndex, "build", lambda *_: pytest.fail("a rerun must not rebuild"))
+    assert run.cached_lexical(ds, index).top("word3", 2).tolist() == [3]  # a new process loads it
+
+    monkeypatch.undo()
+    monkeypatch.setattr(run, "LEXICAL_CACHE", tmp_path)
+    monkeypatch.setattr(run, "_LEXICAL", {})
+    prefix = replace(ds, doc_ids=ds.doc_ids[:4])
+    assert len(run.cached_lexical(prefix, Index(np.zeros((4, 2)), texts, titles))) == 4  # other rows, another index
+    assert len(list(tmp_path.iterdir())) == 2
