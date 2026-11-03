@@ -2,8 +2,9 @@
 
 1. Checks that the corpus's first rows are the prefix corpus's documents, in order.
 2. Encodes the rest as their own input list, so ``Encoder`` keeps them resumable.
-3. Checks the prefix file against 1,000 of its rows encoded again: mean cosine above 0.9999, and 99% of rows above 0.999. Not every
-   row: a very short document's vector can move by several percent with its batch alone (one read 0.937 between a batch and alone).
+3. Checks the prefix file against 1,000 of its rows encoded again, beside the same check on 1,000 rows this run just wrote: the prefix must
+   read as well as those, within 0.00005 on the mean, with 99% of rows above 0.999. A fixed line doesn't work: `qwen3-0.6b` reads 0.99983
+   against vectors written minutes before, and a very short document's vector can move by several percent with its batch alone.
 4. Writes the file ``Encoder`` expects for the whole list, atomically. The suffix file stays, so a rerun costs nothing.
 
 A rerun continues: an encode in progress resumes from its last part, and a finished file is skipped.
@@ -23,8 +24,14 @@ from spacebridge_bench.encode import Encoder, concat_embeddings
 from spacebridge_bench.models import MODELS
 
 CHECK_ROWS = 1_000
-MIN_MEAN_COSINE = 0.9999
+MEAN_TOLERANCE = 0.00005
 MIN_ROW_COSINE, MIN_SHARE = 0.999, 0.99
+
+
+def against_fresh(enc: Encoder, inputs: list[str], stored: np.ndarray) -> np.ndarray:
+    fresh = enc.encode(inputs, cache=False)
+    stored = np.asarray(stored, dtype=np.float32)
+    return (fresh * (stored / np.linalg.norm(stored, axis=1, keepdims=True))).sum(1)
 
 
 def main() -> None:
@@ -49,14 +56,14 @@ def main() -> None:
         t0 = time.perf_counter()
         suffix = enc.docs_store(suffix_titles, suffix_texts)
         durable.progress(f"{full.name} {key}: suffix {suffix.shape} in {(time.perf_counter() - t0) / 60:.1f} min")
-        rows = np.sort(np.random.default_rng(0).choice(n, CHECK_ROWS, replace=False))
-        fresh = enc.encode([inputs[i] for i in rows], cache=False)
+        rng = np.random.default_rng(0)
+        cos = against_fresh(enc, [inputs[i] for i in (rows := np.sort(rng.choice(n, CHECK_ROWS, replace=False)))], np.load(prefix_path, mmap_mode="r")[rows])
+        rows = np.sort(rng.choice(len(suffix), CHECK_ROWS, replace=False))
+        baseline = against_fresh(enc, [inputs[n + i] for i in rows], np.load(suffix.path, mmap_mode="r")[rows])
         enc.unload()
-        stored = np.asarray(np.load(prefix_path, mmap_mode="r")[rows], dtype=np.float32)
-        cos = (fresh * (stored / np.linalg.norm(stored, axis=1, keepdims=True))).sum(1)
-        check = {"model": key, "rows": CHECK_ROWS, "cos_min": float(cos.min()), "cos_mean": float(cos.mean()), "share_above_0.9999": float((cos > 0.9999).mean()), "share_above_0.999": float((cos > MIN_ROW_COSINE).mean())}
+        check = {"model": key, "rows": CHECK_ROWS, "cos_min": float(cos.min()), "cos_mean": float(cos.mean()), "share_above_0.999": float((cos > MIN_ROW_COSINE).mean()), "baseline_mean": float(baseline.mean())}
         durable.progress(f"{full.name} {key}: prefix check {json.dumps(check)}")
-        if cos.mean() <= MIN_MEAN_COSINE or (cos > MIN_ROW_COSINE).mean() < MIN_SHARE:
+        if cos.mean() < baseline.mean() - MEAN_TOLERANCE or (cos > MIN_ROW_COSINE).mean() < MIN_SHARE:
             raise ValueError(f"{prefix_path} doesn't match a fresh encode: {check}")
         concat_embeddings([prefix_path, suffix.path], target)
         back = np.load(target, mmap_mode="r")
