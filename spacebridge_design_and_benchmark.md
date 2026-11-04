@@ -1,6 +1,6 @@
 # Technical Design Document (v2.4): `SpaceBridge` Cross-Model Alignment Engine & Benchmark Suite
 
-**Status:** Phase 0 complete (2026-11-01); Phase 1 complete, closed out 2026-11-04. Goal: 1M documents; ceiling of the whole project: 8.84M (§2.1)  
+**Status:** Phase 0 complete (2026-11-01); Phase 1 complete, closed out 2026-11-03. Goal: 1M documents; ceiling of the whole project: 8.84M (§2.1)  
 **Target Environment:** Local Linux Host (Intel i5-12600K, NVIDIA RTX 5070 Ti 16GB VRAM, PyTorch built for CUDA $\ge 12.8$ / `sm_120`)  
 **Scope:** Zero-Reindexing Cross-Model, Cross-Dimension, and Cross-Language Query Alignment, up to 8.84M documents on one machine  
 
@@ -85,7 +85,7 @@ Two ranges are reported from these. The **best range** is the largest measured s
 
 Each cell is Tier 1, Tier 3. Tier 1 at 500K and below is one direction. Results at 500 queries move by about $\pm 1.5$ points, and absolute values fall with size for every system: at 8.84M, MS MARCO reads 0.419 and 0.405 absolute at budget 60, against 0.429 for native and re-index.
 
-- **Best range, with BM25: up to 1M, on all three corpora, Tiers 1 and 3, budget 60.** Passes at every measured size up to 1M, and with BM25 passed in below 50K too (§4.6).
+- **Best range, with BM25: up to 1M, on all three corpora, Tiers 1 and 3, budget 60.** Passes at every measured size up to 1M. Below 50K BM25 is off by default, and it passes there too when a `LexicalIndex` is passed in (§4.6).
 - **Supported range, with BM25: up to 8.84M, budget 60, exact search.** That top size rests on MS MARCO alone; HotpotQA is measured to its whole corpus, 5.23M; NQ isn't measured above 1M; no corpus was held out from the budget above 1M. No size between crosses the line: MS MARCO falls steadily through 2M and 4M to 8.84M, Tier 3 0.982, 0.972, 0.962, 0.946.
 - **Without BM25, multi-hop questions miss at the library's defaults at every size measured,** from 10K (0.968, 0.937) through 50K (0.948, 0.880 on prefixes; 0.953, 0.903 on the `hotpotqa` set) to 5.23M (0.886, 0.798). MS MARCO and NQ pass up to 1M at pool 300. MS MARCO at 8.84M is measured, not recommended: 0.963, 0.895.
 - **Where BM25 hurts:** FiQA and TREC-COVID, held out from its choice, lose 0.9 to 2.2 points in every (pair, seed) cell and still pass: FiQA 1.018 and 0.981, TREC-COVID 1.001 and 0.987 (50 queries). SciDocs stays off by size (§4.6); given BM25 it goes from 1.013 and 1.018 to 0.984 and 0.970 and still passes.
