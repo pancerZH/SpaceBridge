@@ -2,6 +2,7 @@
 
     uv run python scripts/summarize_closeout.py a1 > outputs/phase1/closeout/tables/a1.md
     ... b1, b2, b3, b4, b5, b6, b7
+    uv run python scripts/summarize_closeout.py final > outputs/phase1/final/final.md: the checks of the decisions accepted on 2026-11-04
 """
 import json
 import statistics as st
@@ -346,5 +347,29 @@ def b7() -> None:
         print("; ".join(f"Tier {t[1]} at ef {ef}: {x:.3f}" for (t, ef), x in sorted(verdict.items())) + f". {v}.")
 
 
+def final() -> None:
+    print("# The checks of the decisions accepted on 2026-11-04 (`scripts/final_checks.sh`, `outputs/phase1/final/`)\n")
+    print("## The mount budget at K = 8,192's line, 160,001 MS MARCO documents, real mounts\n")
+    print("| Index ← query | K | Proxy tokens | Anchor-doc tokens | Re-index tokens | Share | Within 10%? |\n| --- | --- | --- | --- | --- | --- | --- |")
+    for r in read("final/budget160k.jsonl"):
+        m = r.get("mount")
+        if m:
+            share = (m["n_tokens"] + m.get("doc_n_tokens", 0)) / m["corpus_tokens_est"]
+            print(f"| {short(r)} | {r['K']:,} | {m['n_tokens']:,} | {m.get('doc_n_tokens', 0):,} | {m['corpus_tokens_est']:,.0f} | {100 * share:.1f}% | {'yes' if share <= BUDGET_LINE else '**no**'} |")
+    print("\n## Both sides of the line, budget 60, 500 queries, 3 seeds: K = 2,048 k-means at 160,000, K = 8,192 random at 160,001\n")
+    print("| Corpus | Tier | K = 2,048, BM25 | K = 8,192, BM25 | Points, (pair, seed) cells | Strict, 2,048 then 8,192 | Worst pair, 2,048 | Plain, 2,048 then 8,192 | Absolute, 2,048 then 8,192 |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    for corpus, tag in (("MS MARCO", "ms"), ("NQ", "nq"), ("HotpotQA", "hp")):
+        lo_recs, hi_recs = ([r for r in read(f"final/{tag}{n}.jsonl") if "depth" in r] for n in (160_000, 160_001))
+        for t in ("T1", "T3"):
+            pick = lambda recs, row: [r for r in recs if r["row"] == row and tier(r) == t]
+            a, b = pick(lo_recs, "9h"), pick(hi_recs, "9h")
+            if a and b:
+                print(f"| {corpus} | {t[1]} | {mean_over_pairs(a):.3f} | {mean_over_pairs(b):.3f} | {cells_positive(b, a)} | {mean_over_pairs(a, strict):.3f}, {mean_over_pairs(b, strict):.3f} | {worst(a)[1]:.3f} | {mean_over_pairs(pick(lo_recs, '9')):.3f}, {mean_over_pairs(pick(hi_recs, '9')):.3f} | {mean_over_pairs(a, absolute):.3f}, {mean_over_pairs(b, absolute):.3f} |")
+    print("\n## The real `Searcher` below BM25's old line, HotpotQA's 50K set, `bge-large-en` ← `bge-base-en`, seed 0, 200 queries\n")
+    row = [r for r in read("final/searcher_row.jsonl") if r["row"] == "9h" and "depth" in r]
+    for r in read("final/searcher_check.jsonl"):
+        print(f"`Searcher` `nDCG@5` {r['metrics']['ndcg@5']:.5f}, row `9h` {row[0]['metrics']['ndcg@5']:.5f}, {100 * (r['metrics']['ndcg@5'] - row[0]['metrics']['ndcg@5']):+.3f} points. K {r['K']:,}, grade {r['grade']}, the library's own budget {r['default_budget']}, pool sent {r['pool_mean']:.1f}.")
+
+
 if __name__ == "__main__":
-    {"a1": a1, "b1": b1, "b2": b2, "b3": b3, "b4": b4, "b5": b5, "b6": b6, "b7": b7}[sys.argv[1]]()
+    {"final": final, "a1": a1, "b1": b1, "b2": b2, "b3": b3, "b4": b4, "b5": b5, "b6": b6, "b7": b7}[sys.argv[1]]()

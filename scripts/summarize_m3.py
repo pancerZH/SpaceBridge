@@ -211,13 +211,16 @@ def full() -> None:
 
 # Size, label, BM25 on by the library's rule, then (corpus, record files, K) as the library's profile sets it.
 TABLE1 = [
-    (5_183, "5.2K", False, 2048, [("SciFact", ["w5_grid/grid_scifact.jsonl"])]),
-    (10_000, "10K", False, 2048, [("MS MARCO", ["m1_grid/ms_10k.jsonl"]), ("MS MARCO", ["closeout/b1_ms10000.jsonl"]), ("NQ", ["closeout/b1_nq10000.jsonl"]), ("HotpotQA", ["followup/hp10000.jsonl"])]),
-    (20_000, "20K", False, 2048, [("MS MARCO", ["m1_grid/ms_20k.jsonl"]), ("MS MARCO", ["closeout/b1_ms20000.jsonl"]), ("NQ", ["closeout/b1_nq20000.jsonl"]), ("HotpotQA", ["followup/hp20000.jsonl"])]),
-    (30_000, "30K", False, 2048, [("MS MARCO", ["closeout/b1_ms30000.jsonl"]), ("NQ", ["closeout/b1_nq30000.jsonl"]), ("HotpotQA", ["followup/hp30000.jsonl"])]),
-    (50_000, "50K", False, 2048, [("MS MARCO", ["w5_grid/grid_msmarco.jsonl"]), ("MS MARCO", ["closeout/b1_ms50000.jsonl"]), ("NQ", ["w5_grid/grid_nq.jsonl"]), ("NQ", ["closeout/b1_nq50000.jsonl"]), ("HotpotQA", ["m1_switch/hotpot_k2048.jsonl"]), ("HotpotQA", ["followup/hp50000.jsonl"])]),
-    (100_000, "100K", True, 4096, [("MS MARCO", ["m3_a6/ms100000.jsonl"]), ("NQ", ["m3_a6/nq100000.jsonl"]), ("HotpotQA", ["m3_a6/hp100000.jsonl"])]),
-    (150_000, "150K", True, 4096, [("MS MARCO", ["m3_a6/ms150000.jsonl"]), ("NQ", ["m3_a6/nq150000.jsonl"]), ("HotpotQA", ["m3_a6/hp150000.jsonl"])]),
+    (5_183, "5.2K", True, 2048, [("SciFact", ["closeout/b1_scifact.jsonl"])]),
+    (10_000, "10K", True, 2048, [("MS MARCO", ["closeout/b1_ms10000.jsonl"]), ("NQ", ["closeout/b1_nq10000.jsonl"]), ("HotpotQA", ["followup/hp10000.jsonl"])]),
+    (20_000, "20K", True, 2048, [("MS MARCO", ["closeout/b1_ms20000.jsonl"]), ("NQ", ["closeout/b1_nq20000.jsonl"]), ("HotpotQA", ["followup/hp20000.jsonl"])]),
+    (25_657, "25.7K", True, 2048, [("SciDocs", ["followup/scidocs.jsonl"])]),
+    (30_000, "30K", True, 2048, [("MS MARCO", ["closeout/b1_ms30000.jsonl"]), ("NQ", ["closeout/b1_nq30000.jsonl"]), ("HotpotQA", ["followup/hp30000.jsonl"])]),
+    (50_000, "50K", True, 2048, [("MS MARCO", ["closeout/b1_ms50000.jsonl"]), ("NQ", ["closeout/b1_nq50000.jsonl"]), ("HotpotQA", ["followup/hp50000.jsonl"])]),
+    (100_000, "100K", True, 2048, [("MS MARCO", ["closeout/b2_ms100000.jsonl"]), ("NQ", ["closeout/b2_nq100000.jsonl"]), ("HotpotQA", ["closeout/b2_hp100000.jsonl"])]),
+    (150_000, "150K", True, 2048, [("MS MARCO", ["closeout/b2_ms150000.jsonl"]), ("NQ", ["closeout/b2_nq150000.jsonl"]), ("HotpotQA", ["closeout/b2_hp150000.jsonl"])]),
+    (160_000, "160K", True, 2048, [("MS MARCO", ["final/ms160000.jsonl"]), ("NQ", ["final/nq160000.jsonl"]), ("HotpotQA", ["final/hp160000.jsonl"])]),
+    (160_001, "160K + 1", True, 8192, [("MS MARCO", ["final/ms160001.jsonl"]), ("NQ", ["final/nq160001.jsonl"]), ("HotpotQA", ["final/hp160001.jsonl"])]),
     (171_332, "171K", True, 8192, [("TREC-COVID", ["m3_a6/trec_covid.jsonl"])]),
     (200_000, "200K", True, 8192, [("MS MARCO", ["m3_a6/ms200000.jsonl"]), ("NQ", ["m3_a6/nq200000.jsonl"]), ("HotpotQA", ["m3_a6/hp200000.jsonl"])]),
     (500_000, "500K", True, 8192, [("MS MARCO", ["m3_a6/ms500000.jsonl"]), ("NQ", ["m3_a6/nq500000.jsonl"]), ("HotpotQA", ["m3_a6/hp500000.jsonl"])]),
