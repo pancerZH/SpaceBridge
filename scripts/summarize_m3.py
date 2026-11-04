@@ -304,18 +304,25 @@ def table1(budget_above_1m: int = 60) -> None:
 
 
 def break_even() -> None:
-    """Queries until re-indexing would have been cheaper in compute: re-index seconds / what the bridge adds per query. At budget 60 that's BM25 alone."""
+    """Queries until re-indexing would have been cheaper in compute: re-index seconds / what the bridge adds per query. It depends on what the
+    re-indexed system does. If it also reranks about 60, the bridge adds BM25 and the projection. If it doesn't rerank, it adds the reranking too."""
     timing = Timing()
     rate = {(r["model"], r["device"]): r for r in read("m1_timing/mount.jsonl") if r.get("mode") == "rate"}
-    lex = {size: timing.lexical_ms(size) / 1e3 for size in (1_000_000, 8_841_823)}
-    print(f"\n**Break-even at budget 60.** A re-indexed system would also rerank about 60, so what the bridge adds per query is BM25: {1e3 * lex[1_000_000]:.1f} ms at 1M and {1e3 * lex[8_841_823]:.1f} ms at 8.84M, p50, through `Searcher` on the CPU.\n")
-    print("| Query model | Re-index 1M: GPU, CPU | Queries to pay back, GPU, CPU | Re-index 8.84M: GPU, CPU | Queries to pay back, GPU, CPU |\n| --- | --- | --- | --- | --- |")
+    sizes = {1_000_000: "msmarco-1m", 8_841_823: "msmarco-full"}
+    stage = {(size, d): timing.run(d, corpus, 60, True)["stages_ms"] for size, corpus in sizes.items() for d in ("cuda", "cpu")}
+    with_rerank = {key: (timing.lexical_ms(key[0]) + s["project"]["p50"]) / 1e3 for key, s in stage.items()}
+    no_rerank = {key: (s["total"]["p50"] - s["encode"]["p50"] - s["search"]["p50"]) / 1e3 for key, s in stage.items()}
+    short = lambda n: f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.0f}K" if n >= 1e4 else f"{n / 1e3:.1f}K" if n >= 1e3 else f"{n:.0f}"
+    print("\n**Break-even at budget 60, short passages.** What the bridge adds per query, p50, through `Searcher`, 1M and 8.84M. If the re-indexed system also reranks about 60: BM25 and the projection, "
+          f"{1e3 * with_rerank[1_000_000, 'cuda']:.0f} and {1e3 * with_rerank[8_841_823, 'cuda']:.0f} ms on the GPU, {1e3 * with_rerank[1_000_000, 'cpu']:.0f} and {1e3 * with_rerank[8_841_823, 'cpu']:.0f} ms on the CPU. "
+          f"If it doesn't rerank: {no_rerank[1_000_000, 'cuda']:.2f} and {no_rerank[8_841_823, 'cuda']:.2f} s on the GPU, {no_rerank[1_000_000, 'cpu']:.1f} and {no_rerank[8_841_823, 'cpu']:.1f} s on the CPU. Each pair of cells below is GPU, CPU.\n")
+    print("| Query model | Re-index 1M | It also reranks | It doesn't | Re-index 8.84M | It also reranks | It doesn't |\n| --- | --- | --- | --- | --- | --- | --- |")
     for m in ("minilm", "bge-base-en", "bge-large-en", "qwen3-0.6b"):
         cells = []
-        for size in (1_000_000, 8_841_823):
+        for size in sizes:
             sec = {d: size * rate[m, d]["tokens_per_doc"] / rate[m, d]["tokens_per_s"] for d in ("cuda", "cpu")}
             cells += [", ".join(f"{sec[d] / 60:.0f} min" if sec[d] < 3600 else f"{sec[d] / 3600:.1f} h" for d in ("cuda", "cpu")),
-                      ", ".join(f"{sec[d] / lex[size] / 1e6:.1f}M" if sec[d] / lex[size] >= 1e6 else f"{sec[d] / lex[size] / 1e3:.0f}K" for d in ("cuda", "cpu"))]
+                      ", ".join(short(sec[d] / with_rerank[size, d]) for d in ("cuda", "cpu")), ", ".join(short(sec[d] / no_rerank[size, d]) for d in ("cuda", "cpu"))]
         print(f"| `{m}` | " + " | ".join(cells) + " |")
 
 

@@ -67,19 +67,20 @@ Up to 500K is 500 queries, which moves a reading by about ±1.5 points, and Tier
 
 - **With BM25, best range: up to 1M,** on all three corpora, at budget 60, for models of one family and across families.
 - **With BM25, supported range: up to 8.84M,** at budget 60. The top size rests on MS MARCO alone, HotpotQA is measured to its whole corpus, 5.23M, and NQ isn't measured above 1M. Nothing was held out from this budget above 1M, and above 1M it's exact search: no HNSW index was built there.
-- **Without BM25, multi-hop questions miss at the library's defaults at every size measured,** from 50K (0.953, 0.903) to 5.23M. BM25 is off at 50K and below, so that includes 50K as shipped: pass a `LexicalIndex` there if your questions are like that.
+- **Without BM25, multi-hop questions miss at the library's defaults at every size measured,** from 10K (0.968, 0.937) through 50K (0.953, 0.903) to 5.23M. BM25 is off at 50K and below, so that includes those sizes as shipped: pass a `LexicalIndex` if your questions are like that. With one, HotpotQA reads 1.003 to 1.006 and 1.005 to 1.011 from 10K to 50K (500 queries).
 
 **Limits worth knowing:**
 
 - **BM25 needs document text and English.** Its tokenizer keeps only `[a-z0-9]+`. The reranker needs the text anyway. It's off for an index in another language, and a query in another language skips it.
-- **Where relevance isn't lexical, BM25 can cost you.** SciDocs, where relevance is citation links, went from 1.022 to 0.961 at budget 60 on one seed, which is why it's off below 50K. FiQA and TREC-COVID, held out from the choice, lost 0.9 to 2.2 points in every comparison and still passed: FiQA 1.018 and 0.981, TREC-COVID 1.001 and 0.987 on 50 queries. If you have labeled queries, compare with `lexical=None`.
+- **Where relevance isn't lexical, BM25 can cost you.** SciDocs, where relevance is citation links, goes from 1.013 and 1.018 to 0.984 and 0.970 at budget 60, in every comparison, though it still passes. At its 25.7K documents BM25 is off by default. FiQA and TREC-COVID, held out from the choice, lost 0.9 to 2.2 points in every comparison and still passed: FiQA 1.018 and 0.981, TREC-COVID 1.001 and 0.987 on 50 queries. If you have labeled queries, compare with `lexical=None`.
 - **Absolute quality falls with size for everyone.** On MS MARCO at 8.84M, `nDCG@5` reads 0.419 and 0.405, against 0.429 for native and re-index. The same search at 1M reads 0.72.
 - **Your corpus may be harder than these.** The score below doesn't reliably warn you. If you have labeled queries, measure.
 - **Scope:** English, on these model pairs. A small old index holds up too at 1M: `all-MiniLM-L6-v2` queried with `bge-large-en-v1.5` reads 0.981, and with `Qwen3-Embedding-0.6B` 0.975. Other kinds of pair aren't measured above 171K.
 - **Through HNSW, measured at 1M on MS MARCO only:** BM25 costs at most 0.08 points against exact search, reading 0.995 and 0.978 at budget 60.
 - **A pair graded C or D gets a budget of 100,** and so does a bridge with no old model. On our runs that's HotpotQA across families.
 - **The quality score over-predicts as the index grows.** It doesn't see BM25 either: it still grades HotpotQA B and C. Above 200K, treat it as a rough signal, and don't read `report.rerank_pool`'s 300 as what's served with BM25 on: `result.pool` is.
-- **K = 4,096 from 70K to 150K can run a little over the mount budget at its low end:** 9.9-11.0% of re-index tokens at 70K on short passages, depending on the query model, against a line of 10%.
+- **The anchor profiles can run a little over the mount budget at their low ends,** on short passages, against a line of 10% of re-index tokens: K = 4,096 reads 9.9-11.0% at 70K, and K = 8,192 reads 9.4-10.5% at 150K, depending on the query model.
+- **On multi-hop questions, BM25 and the reranker do most of the work.** With no bridge at all, budget 60, 2,000 queries, HotpotQA reads 0.958 and 1.001 at 1M, against 0.995 and 1.020 with the bridge, and 0.945 and 1.000 at 5.23M, against 0.985 and 1.009. On MS MARCO and NQ the bridge adds far more: 0.909 and 0.906 become 0.995 and 0.982 at 1M, and 0.863 and 0.870 become 0.985 and 0.979. So if your old index could be dropped, that baseline is worth trying first on questions that name things.
 
 ### How long one query takes
 
@@ -112,18 +113,23 @@ Seconds, p50 (p95), on 10 CPU threads or an RTX 5070 Ti, through `Searcher`, on 
 
 ### Re-index or bridge
 
-At budget 60 the bridge reranks no more than a re-indexed system would need, so **re-indexing no longer pays back in compute at any traffic you're likely to see.** What the bridge adds per query is BM25's time. Queries until re-indexing would have been cheaper:
+The compute answer depends on whether the re-indexed system would also rerank.
 
-| Query model | Re-index 1M: GPU, CPU | Queries to pay back | Re-index 8.84M: GPU, CPU | Queries to pay back |
-| --- | --- | --- | --- | --- |
-| `all-MiniLM-L6-v2` | 2 min, 1.4 h | 23K, 1.0M | 17 min, 12.8 h | 49K, 2.2M |
-| `bge-base-en-v1.5` | 5 min, 10.0 h | 55K, 7.0M | 41 min, 88.1 h | 117K, 14.9M |
-| `bge-large-en-v1.5` | 12 min, 35.1 h | 142K, 24.8M | 1.8 h, 309.9 h | 301K, 52.5M |
-| `Qwen3-Embedding-0.6B` | 28 min, 56.1 h | 335K, 39.7M | 4.2 h, 496.0 h | 710K, 84.0M |
+- **If it would,** the bridge adds only BM25 and the projection per query: 6-22 ms on a GPU and 16-35 ms on a CPU, from 1M to 8.84M. Re-indexing then doesn't pay back in compute at any traffic you're likely to see.
+- **If it wouldn't,** the bridge also costs a reranker on every query, 0.15 s on a GPU and about 11 s on a CPU on short passages, so re-indexing pays back within thousands of queries. But you'd get less: dense search on a re-indexed system reads `nDCG@5` 0.683, 0.651 and 0.811 at 1M on MS MARCO, NQ and HotpotQA, against 0.722, 0.772 and 0.882 for the bridge with BM25 and the reranker (Tier 1).
 
-If the re-indexed system runs BM25 too, the difference is nothing at all, and there's nothing to pay back.
+Queries until re-indexing would have been cheaper, on short passages. Each cell is GPU, CPU:
 
-**Re-index for quality, not compute.** Against a re-indexed system with BM25 too, the bridge gives up 0.6 to 2.5 points at 1M, and 1.9 to 5.5 points at the largest sizes, read from "with BM25 on both" above. Also re-index if you need results without a reranker, or your corpus is one where BM25 costs you. To get a better model's first-stage gain, you must re-index.
+| Query model | Re-index 1M | It also reranks | It doesn't | Re-index 8.84M | It also reranks | It doesn't |
+| --- | --- | --- | --- | --- | --- | --- |
+| `all-MiniLM-L6-v2` | 2 min, 1.4 h | 19K, 331K | 803, 476 | 17 min, 12.8 h | 46K, 1.3M | 7.0K, 4.4K |
+| `bge-base-en-v1.5` | 5 min, 10.0 h | 45K, 2.3M | 1.9K, 3.3K | 41 min, 88.1 h | 111K, 9.2M | 17K, 30K |
+| `bge-large-en-v1.5` | 12 min, 35.1 h | 117K, 8.0M | 5.0K, 12K | 1.8 h, 309.9 h | 285K, 32.3M | 43K, 106K |
+| `Qwen3-Embedding-0.6B` | 28 min, 56.1 h | 277K, 12.9M | 12K, 18K | 4.2 h, 496.0 h | 673K, 51.6M | 102K, 169K |
+
+If the re-indexed system runs BM25 and a reranker too, the only difference left is the projection: about 1 ms on a GPU and 11-13 ms on a CPU.
+
+**If you'd rerank either way, re-index for quality, not compute.** Against a re-indexed system with BM25 too, the bridge gives up 0.6 to 2.5 points at 1M, and 1.9 to 5.5 points at the largest sizes, read from "with BM25 on both" above. Also re-index if you need results without a reranker, or your corpus is one where BM25 costs you. To get a better model's first-stage gain, you must re-index.
 
 ### Queries in another language
 
