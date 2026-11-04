@@ -12,6 +12,7 @@ limit, counted between queries so they cost no timed work.
 """
 import argparse
 import json
+import resource
 import time
 from pathlib import Path
 
@@ -149,7 +150,8 @@ def main() -> None:
             if reranker is not None:
                 tokens.append(reranker.count_tokens())
         rec = {"key": key, "dataset": ds.name, "N": ds.N, "backend": args.backend, "ef": args.ef, "device": args.device, "threads": args.threads, "pool": pool, "n": len(rows), "rerank": not args.no_rerank, "reranker": args.reranker,
-               "stages_ms": percentile_table(rows), "load_s": load_s, "lexical": lexical is not None, "search_device": args.search_device or args.device, "index_model": args.index_model, "query_model": args.query_model}
+               "stages_ms": percentile_table(rows), "load_s": load_s, "lexical": lexical is not None, "search_device": args.search_device or args.device, "index_model": args.index_model, "query_model": args.query_model,
+               "peak_rss_gb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20}
         if tokens:
             rec["tokens_per_pair"], rec["tokens_per_doc"] = (float(v) for v in np.mean(tokens, axis=0))
         if args.device.startswith("cuda"):

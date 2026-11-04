@@ -3,7 +3,8 @@
 Builds a FAISS HNSW index over one model's stored vectors (crash-safe, resumable), then compares HNSW with exact search
 for native and bridged queries: recall of the exact top-pool, and end-to-end nDCG@5 through the reranker. ``--ivfpq`` adds
 one quantized index on retention only, with anchors read from the index's own lossy codes. One JSON line per unit of work
-goes to --out as it finishes, and a rerun skips what is there.
+goes to --out as it finishes, and a rerun skips what is there. Bridges use the anchors the benchmark's rows use: on a nested corpus,
+positives stay out of them, so a reading here compares with a row of the same pair and seed.
 
     uv run --extra hnsw python -u scripts/hnsw_study.py msmarco-1m --index-model bge-large-en \
         --query-models bge-base-en qwen3-0.6b --out outputs/phase1/w5_ann/ms1m.jsonl
@@ -16,7 +17,7 @@ from pathlib import Path
 import faiss
 import numpy as np
 
-from spacebridge import Index, build_hnsw, freeze, merge_pool, mount
+from spacebridge import Index, build_hnsw, default_anchor_count, freeze, merge_pool, mount
 from spacebridge.lexical import LEXICAL_SHARE
 from spacebridge.serving import HNSW_SAVE_SECONDS, save_faiss_index
 from spacebridge_bench import durable
@@ -25,7 +26,7 @@ from spacebridge_bench.encode import Encoder, MountEncoder
 from spacebridge_bench.metrics import per_query
 from spacebridge_bench.models import MODELS
 from spacebridge_bench.rerank import RERANKERS, Reranker, rerank, rerank_pools
-from spacebridge_bench.run import _DocTexts, _first_docs, _first_queries, cached_lexical
+from spacebridge_bench.run import _DocTexts, _first_docs, _first_queries, anchor_candidates, cached_anchors, cached_lexical
 from spacebridge_bench.search import cached_search, search
 
 HNSW_CACHE = Path("data/cache/hnsw")
@@ -161,8 +162,8 @@ def main() -> None:
     enc.unload()
 
     path = args.index_dir / f"{ds.name}_{store.path.stem}_{store.dim}d_M{args.M}_efc{args.ef_construction}.faiss"
-    if args.lexical and not path.exists():
-        raise SystemExit(f"--lexical only reads an existing index, and {path} is not there")
+    if args.lexical and (not path.exists() or faiss.read_index(str(path), faiss.IO_FLAG_MMAP | faiss.IO_FLAG_READ_ONLY).ntotal < store.shape[0]):
+        raise SystemExit(f"--lexical only reads a finished index, and {path} is not there or still building")
     t0 = time.perf_counter()
     was_complete = "build" in res.done
     index = build_hnsw(
@@ -217,7 +218,9 @@ def main() -> None:
                 not args.ivfpq or all(f"{args.ivfpq}|{tgt_key}|s{seed}|nprobe{n}|pool{pool}" in res.done for n in args.nprobe for pool in pools)
             ):
                 continue
-            bundle = freeze(pool_index, MountEncoder(src, ds.task, args.device), ds.lang, seed, args.K or None, device=args.device)
+            K = args.K or default_anchor_count(ds.N)
+            anchors = cached_anchors(ds, args.index_model, store, anchor_candidates(ds), K, seed)
+            bundle = freeze(pool_index, MountEncoder(src, ds.task, args.device), ds.lang, seed, K, anchor_ids=anchors, device=args.device)
             bridge = mount(bundle, pool_index, MountEncoder(MODELS[tgt_key], ds.task, args.device), device=args.device)
             Q_hat = bridge.transform_query(Q_tgt)
             exact = search(Q_hat, store, 1000, args.device, exclude=ds.self_rows)

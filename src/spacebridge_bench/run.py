@@ -140,6 +140,15 @@ def cached_anchors(
     return ids
 
 
+def anchor_candidates(ds: RetrievalDataset) -> np.ndarray:
+    """Rows a benchmark's anchors may come from (design §7.1 rule 3): corpus rows that are test queries (ArguAna) never become
+    anchors. On a nested corpus neither do positives: at small prefixes they would inflate results."""
+    allowed = np.setdiff1d(np.arange(ds.N), ds.self_rows)
+    if DATASETS[ds.name.split("@")[0]].nested_docs is not None:
+        allowed = np.setdiff1d(allowed, [d for rel in ds.qrels for d in rel])
+    return allowed
+
+
 def cached_lexical(ds: RetrievalDataset, index: Index) -> LexicalIndex:
     """BM25 over a corpus's rows, kept on disk: it depends on nothing but those rows, in that order."""
     h = hashlib.blake2b(digest_size=12)
@@ -186,11 +195,7 @@ def run_pair(
             lang_val[tag] = {"en": dt["en"], "lang": dt[ds.query_lang],
                              "X_query": enc.queries(dt["en"], ds.task), "X_doc": enc.docs([""] * len(dt["en"]), dt["en"])}
     enc.unload()
-    # Split hygiene (design §7.1 rule 3): corpus rows that are test queries (ArguAna) never become anchors. On a nested
-    # corpus neither do positives: at small prefixes they would inflate results.
-    allowed = np.setdiff1d(np.arange(ds.N), ds.self_rows)
-    if DATASETS[ds.name.split("@")[0]].nested_docs is not None:
-        allowed = np.setdiff1d(allowed, [d for rel in ds.qrels for d in rel])
+    allowed = anchor_candidates(ds)
     index = Index(E_src, ds.texts, ds.titles)
     bundle = freeze(
         index, MountEncoder(src, ds.task, device), ds.lang, seed, K,

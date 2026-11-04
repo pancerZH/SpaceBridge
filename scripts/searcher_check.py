@@ -2,6 +2,8 @@
 
 Freezes and mounts through the ``sentence-transformers`` adapters, with ``ExactBackend`` on the GPU, a saved ``LexicalIndex`` and
 the real ``CrossEncoderReranker``, then scores each query's pool. Writes one JSON line per budget to --out; a rerun skips those.
+Above what the GPU holds, ``--search-device cpu`` keeps exact search on the CPU and the models and reranker on the GPU. On a nested
+corpus the row at --max-queries n keeps only those n queries' positives out of its anchors, so ``--same-anchors`` does too.
 
     uv run python -u scripts/searcher_check.py hotpotqa-1m --index-model bge-large-en --query-model bge-base-en --n 200 --budgets 60 --out out.jsonl
 """
@@ -21,7 +23,7 @@ from spacebridge_bench.datasets import load_beir, load_shift_bank
 from spacebridge_bench.encode import Encoder, MountEncoder
 from spacebridge_bench.metrics import per_query
 from spacebridge_bench.models import MODELS
-from spacebridge_bench.run import cached_anchors, cached_lexical
+from spacebridge_bench.run import _first_queries, anchor_candidates, cached_anchors, cached_lexical
 
 
 def adapter(key: str, task: str, device: str) -> SentenceTransformerEncoder:
@@ -46,6 +48,7 @@ def main() -> None:
     p.add_argument("--same-anchors", action="store_true", help="the benchmark's cached anchors rather than a fresh selection, to set anchor noise aside")
     p.add_argument("--translate", default=None, help="a cached translator of scripts/translation_baseline.py: BM25 reads its output, through Searcher(translate=)")
     p.add_argument("--device", default="cuda")
+    p.add_argument("--search-device", default=None, help="where exact search runs, if not --device: an index too large for the GPU, with the models on it")
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
 
@@ -53,7 +56,7 @@ def main() -> None:
     budgets = [b for b in args.budgets if b not in done]
     if not budgets:
         return
-    ds = load_beir(args.dataset)
+    ds = _first_queries(load_beir(args.dataset), args.n)
     enc = Encoder(MODELS[args.index_model], args.device)
     store = enc.docs_store(ds.titles, ds.texts).prefix(ds.N)
     enc.unload()
@@ -63,10 +66,10 @@ def main() -> None:
     anchor_ids = None
     if args.same_anchors:
         K = args.K or default_anchor_count(ds.N)
-        anchor_ids = cached_anchors(ds, args.index_model, store, np.setdiff1d(np.arange(ds.N), ds.self_rows), K, args.seed)
+        anchor_ids = cached_anchors(ds, args.index_model, store, anchor_candidates(ds), K, args.seed)
     bundle = freeze(index, src, ds.lang, args.seed, args.K, anchor_ids=anchor_ids, device=args.device)
     if not args.same_anchors and ds.N <= LARGE_PROFILE_DOCS:
-        cached = cached_anchors(ds, args.index_model, store, np.setdiff1d(np.arange(ds.N), ds.self_rows), bundle.K, args.seed)
+        cached = cached_anchors(ds, args.index_model, store, anchor_candidates(ds), bundle.K, args.seed)
         durable.progress(f"fresh anchors against the benchmark's cached ones: {len(set(bundle.anchor_ids.tolist()) & set(cached.tolist())):,} of {bundle.K:,} shared")
     if args.bench_fit:
         src.unload()
@@ -85,7 +88,7 @@ def main() -> None:
     vectors = np.empty(store.shape, dtype=np.float32)
     for s in range(0, len(store), 200_000):
         vectors[s : s + 200_000] = store[np.arange(s, min(s + 200_000, len(store)))]
-    backend = ExactBackend(vectors, device=args.device)
+    backend = ExactBackend(vectors, device=args.search_device or args.device)
     del vectors
     translate = None
     if args.translate:
@@ -107,7 +110,7 @@ def main() -> None:
                 durable.progress(f"budget {budget}: {i + 1} / {len(qs)} queries")
         metrics = {m: float(v.mean()) for m, v in per_query(rows, qrels).items()}
         rec = {"dataset": ds.name, "src": args.index_model, "tgt": args.query_model, "seed": args.seed, "K": bundle.K, "n": len(qs), "budget": budget,
-               "default_budget": searcher.pool, "grade": bridge.quality.grade, "translate": args.translate, "same_anchors": args.same_anchors, "bench_fit": args.bench_fit, "pool_mean": float(np.mean(sent)), "metrics": metrics}
+               "default_budget": searcher.pool, "grade": bridge.quality.grade, "translate": args.translate, "same_anchors": args.same_anchors, "bench_fit": args.bench_fit, "search_device": args.search_device or args.device, "pool_mean": float(np.mean(sent)), "metrics": metrics}
         durable.append_lines(args.out, [json.dumps(rec)])
         durable.progress(f"budget {budget}: nDCG@5 {metrics['ndcg@5']:.5f}")
 
