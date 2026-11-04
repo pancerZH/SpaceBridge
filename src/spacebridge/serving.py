@@ -12,7 +12,7 @@ import torch
 from . import durable
 from .anchors import LARGE_INDEX_DOCS
 from .bridge import SpaceBridge
-from .lexical import LEXICAL_MIN_DOCS, LEXICAL_SHARE, LexicalIndex, merge_pool, timed_build
+from .lexical import LEXICAL_SHARE, LexicalIndex, merge_pool, timed_build
 from .mount import IndexReader, QueryEncoder
 from .quality import lexical_rerank_pool, size_rerank_pool
 
@@ -151,14 +151,13 @@ class Searcher:
     0.33-0.44 instead of 0.66-0.69). ``allow_no_reranker=True`` opts out, to time search alone.
 
     ``lexical`` puts BM25 in the rerank pool, a quarter of it (design §4.6). ``"auto"`` builds a ``LexicalIndex`` from the index
-    above ``LEXICAL_MIN_DOCS`` documents, if the index is in English and there's a reranker to merge the two lists. A
-    ``LexicalIndex`` is used whatever the size and language. ``None`` turns it off. With it on, the pool defaults to 60, or 100
-    for a weak or source-free fit, and a query in a language other than the index's skips BM25 and takes the pool it would take
-    with BM25 off.
+    at any size, if the index is in English and there's a reranker to merge the two lists. A ``LexicalIndex`` is used whatever the
+    language. ``None`` turns it off. With it on, the pool defaults to 60, or 100 for a source-free fit or a Stage-2 health flag, and
+    a query in a language other than the index's skips BM25 and takes the pool it would take with BM25 off.
 
     ``translate(query, query_lang)``, off by default, returns such a query in the index's language, so that BM25 can read it. Only
-    BM25 reads the translation: the bridge and the reranker keep the original query. It needs a lexical index, so below
-    ``LEXICAL_MIN_DOCS`` pass one. Measured Chinese to English only (design §4.6).
+    BM25 reads the translation: the bridge and the reranker keep the original query. It needs a lexical index. Measured Chinese to
+    English only (design §4.6).
     """
 
     def __init__(
@@ -190,7 +189,7 @@ class Searcher:
             if len(lexical) != len(self.index):
                 raise ValueError(f"the lexical index has {len(lexical):,} documents and the index {len(self.index):,}")
             return lexical
-        if len(self.index) <= LEXICAL_MIN_DOCS or self.bridge.src_lang != "en":  # the tokenizer keeps only [a-z0-9]+
+        if self.bridge.src_lang != "en":  # the tokenizer keeps only [a-z0-9]+
             return None
         return timed_build(self.index)
 

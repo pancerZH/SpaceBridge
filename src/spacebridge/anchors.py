@@ -12,18 +12,15 @@ FPS_THRESHOLD = 5_000
 # 500K, 0.73 at 1M), so large indexes get more anchors, and random ones: k-means over 1M docs did worse than a random
 # sample (-1.5 points Recall@30, 48/54 cells) while k-means wins on smaller sets (trec-covid, 171K: +1.3).
 # From LARGE_PROFILE_DOCS up that profile beats K = 2,048 k-means end to end (pool 60, Tier 3: +2.6 to +4.7 points on MS MARCO
-# and NQ at 100K-200K, +2.7 to +5.0 on held-out HotpotQA; no clear change on trec-covid at 50 queries). Below it, K = 8,192
-# is over the 10% mount budget on short passages: 1.1M tokens is 10% of about 145K MS MARCO documents.
-LARGE_PROFILE_DOCS = 150_000
-# Above this and up to LARGE_PROFILE_DOCS, K = 4,096 k-means clears the misses K = 2,048 leaves at pool 60: MS MARCO and NQ at 100K
-# and 150K, Tier 3 +1.4 to +2.3 points, at no query-time cost. The line follows the mount budget: real mounts at 80K MS MARCO
-# passages read 8.7-9.7% of re-index tokens, by query model, where 70K read 9.9-11.0%. Plain rows at 75K read lower at K = 2,048
-# (Tier 3 0.87-0.96, against 0.90-0.98); with BM25 on, the two read level.
-MID_PROFILE_DOCS = 80_000
+# and NQ at 100K-200K, +2.7 to +5.0 on held-out HotpotQA; no clear change on trec-covid at 50 queries). The line follows the 10%
+# mount budget: real mounts at 150,001 MS MARCO passages read 9.4-10.5% of re-index tokens, by query model, the highest reaching
+# 10% at 157.1K. With BM25 on, K = 2,048 up to here reads level with K = 4,096 (MS MARCO, NQ and HotpotQA at 100K and 150K: at most
+# +0.37 points at Tier 3, no corpus in all 6 cells), so there's no K between. A bridge with BM25 off loses from that (Tier 3 1.4 to
+# 5.0 points; MS MARCO and NQ miss 94% at 100K-150K), and can pass freeze(K=4096) itself.
+LARGE_PROFILE_DOCS = 160_000
 # Above this a reranker is required, and the quality score is outside its calibrated range.
 LARGE_INDEX_DOCS = 200_000
 DEFAULT_ANCHORS = 2_048
-MID_INDEX_ANCHORS = 4_096
 LARGE_INDEX_ANCHORS = 8_192
 MAX_DISTRACTORS = 50_000
 
@@ -38,7 +35,7 @@ def _l2(a: np.ndarray) -> np.ndarray:
 
 def default_anchor_count(N: int) -> int:
     """The anchor budget K for an index of N documents (design §4.1)."""
-    return min(LARGE_INDEX_ANCHORS if N > LARGE_PROFILE_DOCS else MID_INDEX_ANCHORS if N > MID_PROFILE_DOCS else DEFAULT_ANCHORS, N)
+    return min(LARGE_INDEX_ANCHORS if N > LARGE_PROFILE_DOCS else DEFAULT_ANCHORS, N)
 
 
 def resolve_anchor_method(N: int, method: str = "auto") -> str:

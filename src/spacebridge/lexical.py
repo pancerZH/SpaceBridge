@@ -17,7 +17,6 @@ import scipy.sparse as sp
 
 from . import durable, storage
 
-LEXICAL_MIN_DOCS = 50_000  # a judgment from small-corpus checks, not a measured line: SciDocs (25.7K) loses from BM25
 LEXICAL_SHARE = 4  # BM25 gets a quarter of the budget
 BUILD_BATCH_ROWS = 65_536
 _WORD = re.compile(r"[a-z0-9]+")

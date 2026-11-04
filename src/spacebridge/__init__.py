@@ -7,7 +7,7 @@ from .anchors import (
 from .bridge import DOC_PAIR_TOKENS, SpaceBridge, retrieval_stats
 from .bundle import CalibrationBundle
 from .encoders import CrossEncoderReranker, SentenceTransformerEncoder
-from .lexical import LEXICAL_MIN_DOCS, LexicalIndex, merge_pool
+from .lexical import LexicalIndex, merge_pool
 from .mount import Index, IndexReader, QueryEncoder, freeze, mount
 from .refine import RefineConfig
 from .serving import ExactBackend, HnswBackend, SearchResult, Searcher, build_hnsw
@@ -22,7 +22,6 @@ __all__ = [
     "IndexReader",
     "LARGE_INDEX_DOCS",
     "LARGE_PROFILE_DOCS",
-    "LEXICAL_MIN_DOCS",
     "LexicalIndex",
     "QueryEncoder",
     "RefineConfig",

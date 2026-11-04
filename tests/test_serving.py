@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from spacebridge import LARGE_INDEX_DOCS, LEXICAL_MIN_DOCS, ExactBackend, Index, LexicalIndex, Searcher, SpaceBridge, build_hnsw, freeze, merge_pool, mount
+from spacebridge import LARGE_INDEX_DOCS, ExactBackend, Index, LexicalIndex, Searcher, SpaceBridge, build_hnsw, freeze, merge_pool, mount
 from spacebridge.quality import QualityReport, lexical_rerank_pool, size_rerank_pool
 
 from conftest import l2
@@ -25,7 +25,7 @@ def test_exact_backend_returns_the_true_top_k():
 def test_searcher_runs_the_whole_path_and_reports_each_stage():
     vectors, index, src, tgt = make_mount_world(n_docs=800)
     bridge = mount(freeze(index, src, K=300, device="cpu"), index, tgt, device="cpu")
-    searcher = Searcher(bridge, tgt, ExactBackend(vectors), index, ReverseAlphabetReranker(), pool=30)
+    searcher = Searcher(bridge, tgt, ExactBackend(vectors), index, ReverseAlphabetReranker(), pool=30, lexical=None)
     out = searcher.search("question 17", k=5)
     assert len(out.ids) == 5 and out.pool == 30 and 0 <= out.confidence <= 1
     assert set(out.timing_ms) == {"encode", "project", "search", "lexical", "fetch", "rerank", "total"}
@@ -94,14 +94,14 @@ def counting_builds(monkeypatch, lexical):
     return built
 
 
-def test_auto_builds_above_the_size_line_for_an_english_index_with_a_reranker(world, monkeypatch):
+def test_auto_builds_at_any_size_for_an_english_index_with_a_reranker(world, monkeypatch):
     vectors, index, tgt, bridge = world
     backend, rr, lex = ExactBackend(vectors), ReverseAlphabetReranker(), LexicalIndex.build(index)
     built = counting_builds(monkeypatch, lex)
-    assert Searcher(bridge, tgt, backend, SizedIndex(index, LEXICAL_MIN_DOCS), rr).lexical is None
-    assert built == []
-    assert Searcher(bridge, tgt, backend, SizedIndex(index, LEXICAL_MIN_DOCS + 1), rr).lexical is lex
-    assert built == [LEXICAL_MIN_DOCS + 1]
+    assert Searcher(bridge, tgt, backend, index, rr).lexical is lex
+    assert Searcher(bridge, tgt, backend, SizedIndex(index, 5_000), rr).lexical is lex
+    assert Searcher(bridge, tgt, backend, SizedIndex(index, 1_000_000), rr).lexical is lex
+    assert built == [800, 5_000, 1_000_000]
 
 
 def test_auto_stays_off_for_another_language_and_with_no_reranker(world, monkeypatch):
@@ -219,8 +219,13 @@ def test_translate_needs_a_lexical_index_and_a_reranker(world):
     identity = lambda q, lang: q
     with pytest.raises(ValueError, match="needs a reranker and a lexical index"):
         Searcher(bridge, tgt, backend, index, ReverseAlphabetReranker(), lexical=None, translate=identity)
-    with pytest.raises(ValueError, match="needs a reranker and a lexical index"):
-        Searcher(bridge, tgt, backend, index, ReverseAlphabetReranker(), translate=identity)  # auto stays off at 800 documents
+    assert Searcher(bridge, tgt, backend, index, ReverseAlphabetReranker(), translate=identity).lexical is not None  # auto, any size
+    bridge.src_lang = "zh"
+    try:
+        with pytest.raises(ValueError, match="needs a reranker and a lexical index"):
+            Searcher(bridge, tgt, backend, index, ReverseAlphabetReranker(), translate=identity)  # auto stays off for this index
+    finally:
+        bridge.src_lang = "en"
     with pytest.raises(ValueError, match="needs a reranker and a lexical index"):
         Searcher(bridge, tgt, backend, index, lexical=lex, translate=identity)
 
@@ -230,10 +235,11 @@ def report(grade=None, stored=60, **stage2):
     return r
 
 
-def test_the_pool_with_bm25_follows_the_grade_and_never_inherits_the_300():
+def test_the_pool_with_bm25_ignores_the_grade_and_never_inherits_what_is_stored():
     assert lexical_rerank_pool(None) == 60
     assert lexical_rerank_pool(report("A", stored=300)) == lexical_rerank_pool(report("B", stored=300)) == 60
-    assert lexical_rerank_pool(report("C", stored=300)) == lexical_rerank_pool(report("D", stored=100)) == 100
+    assert lexical_rerank_pool(report("C", stored=300)) == lexical_rerank_pool(report("D", stored=100)) == 60
+    assert lexical_rerank_pool(report("C", stored=100, health_flag=1.0)) == 100
     assert lexical_rerank_pool(report("A", stored=100, health_flag=1.0)) == 100
     assert lexical_rerank_pool(report("A", health_flag=0.0)) == 60
     assert lexical_rerank_pool(report(stored=300), source_free=True) == 100

@@ -30,8 +30,8 @@ bridge.save("quickstart/bridge")
 report = bridge.quality_report()
 print(f"predicted retention {report.score:.0f}% (grade {report.grade}), rerank pool {report.rerank_pool}; notes: {report.notes}")
 
-# Serve: encode, project, search, fetch text, rerank. Above 50K documents, an English index also gets BM25 in the rerank pool,
-# built here from the same text; pass lexical=None to turn it off. This corpus is small enough to go without.
+# Serve: encode, project, search, fetch text, rerank. An English index also gets BM25 in the rerank pool, built here from the
+# same text; pass lexical=None to turn it off.
 searcher = spacebridge.Searcher(
     spacebridge.SpaceBridge.load("quickstart/bridge"), new_model, spacebridge.ExactBackend(vectors), index,
     spacebridge.CrossEncoderReranker(),
