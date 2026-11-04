@@ -97,6 +97,8 @@ def build_hnsw(
     import faiss
 
     path = Path(path)
+    for stale in path.parent.glob(f"{path.name}.tmp*"):  # a crash during a save leaves its copy behind, as large as the index
+        stale.unlink()
     if path.exists():
         index = faiss.read_index(str(path))
     else:

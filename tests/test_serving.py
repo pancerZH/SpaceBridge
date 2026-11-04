@@ -315,7 +315,10 @@ def test_hnsw_build_continues_after_a_crash_and_finds_neighbours(tmp_path):
     assert 0 < faiss.read_index(str(path)).ntotal < 3000  # saved work, and no partial file at the final path
     assert [p.name for p in tmp_path.iterdir()] == ["index.faiss"]
     seen = []
+    stale = path.with_name(f"{path.name}.tmp123")  # what a crash during a save leaves behind
+    stale.write_bytes(b"partial")
     index = build_hnsw(E, path, M=16, ef_construction=40, batch_rows=500, save_seconds=0, on_batch=lambda n, _: seen.append(n))
+    assert not stale.exists()
     assert index.ntotal == 3000 and seen[0] > 500 and faiss.read_index(str(path)).ntotal == 3000
     index.hnsw.efSearch = 100
     _, ids = index.search(E[:50], 1)
