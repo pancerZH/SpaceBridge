@@ -16,9 +16,10 @@ FPS_THRESHOLD = 5_000
 # is over the 10% mount budget on short passages: 1.1M tokens is 10% of about 145K MS MARCO documents.
 LARGE_PROFILE_DOCS = 150_000
 # Above this and up to LARGE_PROFILE_DOCS, K = 4,096 k-means clears the misses K = 2,048 leaves at pool 60: MS MARCO and NQ at 100K
-# and 150K, Tier 3 +1.4 to +2.3 points, at no query-time cost. The mount budget is tight at this end: real mounts at 70K MS MARCO
-# passages read 9.9-11.0% of re-index tokens, by query model, and the highest reaches 10% at 77.2K (an estimate had read 9.2%).
-MID_PROFILE_DOCS = 70_000
+# and 150K, Tier 3 +1.4 to +2.3 points, at no query-time cost. The line follows the mount budget: real mounts at 80K MS MARCO
+# passages read 8.7-9.7% of re-index tokens, by query model, where 70K read 9.9-11.0%. Plain rows at 75K read lower at K = 2,048
+# (Tier 3 0.87-0.96, against 0.90-0.98); with BM25 on, the two read level.
+MID_PROFILE_DOCS = 80_000
 # Above this a reranker is required, and the quality score is outside its calibrated range.
 LARGE_INDEX_DOCS = 200_000
 DEFAULT_ANCHORS = 2_048

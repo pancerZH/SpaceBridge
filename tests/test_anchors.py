@@ -28,6 +28,7 @@ def test_large_indexes_get_more_anchors_chosen_at_random():
     from spacebridge import LARGE_INDEX_DOCS, LARGE_PROFILE_DOCS, default_anchor_count, resolve_anchor_method
     from spacebridge.anchors import MID_PROFILE_DOCS
 
+    assert MID_PROFILE_DOCS == 80_000  # where the mount budget allows K = 4,096, as measured
     assert default_anchor_count(1_000) == 1_000
     assert default_anchor_count(MID_PROFILE_DOCS) == 2_048
     assert default_anchor_count(MID_PROFILE_DOCS + 1) == 4_096
