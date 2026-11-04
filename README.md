@@ -41,7 +41,7 @@ searcher = spacebridge.Searcher(bridge, new_model, backend, index, reranker, lex
 
 ## When to use this
 
-**Use it** when a new query model has to work on an existing index now, or when the model that built the index is gone. **Re-index instead** when you want the new model's first-stage quality, or the last few points. See [re-index or bridge](#re-index-or-bridge).
+**Use it** when a new query model has to work on an existing index now, or when the model that built the index is gone: serve right away, then re-index in the background if the last few points justify it, or if you'd run without a reranker. See [re-index or bridge](#re-index-or-bridge).
 
 ### How far it goes
 
@@ -79,7 +79,7 @@ Up to 500K is 500 queries, which moves a reading by about ±1.5 points, and Tier
 - **Through HNSW, measured at 1M on MS MARCO only:** BM25 costs at most 0.08 points against exact search, reading 0.995 and 0.978 at budget 60.
 - **A pair graded C or D gets a budget of 100,** and so does a bridge with no old model. On our runs that's HotpotQA across families.
 - **The quality score over-predicts as the index grows.** It doesn't see BM25 either: it still grades HotpotQA B and C. Above 200K, treat it as a rough signal, and don't read `report.rerank_pool`'s 300 as what's served with BM25 on: `result.pool` is.
-- **The anchor profiles can run a little over the mount budget at their low ends,** on short passages, against a line of 10% of re-index tokens: K = 4,096 reads 9.9-11.0% at 70K, and K = 8,192 reads 9.4-10.5% at 150K, depending on the query model.
+- **The mount budget is tight at the anchor profiles' low ends,** on short passages, against a line of 10% of re-index tokens: K = 4,096 reads 8.7-9.7% at 80K, where it starts, and K = 8,192 reads 9.4-10.5% at 150K, so one query model runs a little over there.
 - **On multi-hop questions, BM25 and the reranker do most of the work.** With no bridge at all, budget 60, 2,000 queries, HotpotQA reads 0.958 and 1.001 at 1M, against 0.995 and 1.020 with the bridge, and 0.945 and 1.000 at 5.23M, against 0.985 and 1.009. On MS MARCO and NQ the bridge adds far more: 0.909 and 0.906 become 0.995 and 0.982 at 1M, and 0.863 and 0.870 become 0.985 and 0.979. So if your old index could be dropped, that baseline is worth trying first on questions that name things.
 
 ### How long one query takes
@@ -113,7 +113,7 @@ Seconds, p50 (p95), on 10 CPU threads or an RTX 5070 Ti, through `Searcher`, on 
 
 ### Re-index or bridge
 
-The compute answer depends on whether the re-indexed system would also rerank.
+Serve right away, then re-index in the background if the last few points justify it, or if you'd run without a reranker. The compute answer depends on whether the re-indexed system would also rerank.
 
 - **If it would,** the bridge adds only BM25 and the projection per query: 6-22 ms on a GPU and 16-35 ms on a CPU, from 1M to 8.84M. Re-indexing then doesn't pay back in compute at any traffic you're likely to see.
 - **If it wouldn't,** the bridge also costs a reranker on every query, 0.15 s on a GPU and about 11 s on a CPU on short passages, so re-indexing pays back within thousands of queries. But you'd get less: dense search on a re-indexed system reads `nDCG@5` 0.683, 0.651 and 0.811 at 1M on MS MARCO, NQ and HotpotQA, against 0.722, 0.772 and 0.882 for the bridge with BM25 and the reranker (Tier 1).
@@ -133,7 +133,7 @@ If the re-indexed system runs BM25 and a reranker too, the only difference left 
 
 ### Queries in another language
 
-For Chinese queries into an English index, **give BM25 a translation.** It reads the translated query, while the bridge and the reranker keep the original. It's off by default:
+For Chinese queries into an English index, **use a translator feeding BM25, with the bridge doing the dense search.** BM25 reads the translated query, while the bridge and the reranker keep the original. While the old model is alive it can keep doing the dense search, and it reads about the same. This is Chinese to English only, on two Wikipedia question-answering sets, and it's off by default:
 
 ```python
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer   # uv sync --extra models --group translate
