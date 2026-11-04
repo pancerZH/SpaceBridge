@@ -37,7 +37,7 @@ searcher = spacebridge.Searcher(bridge, new_model, backend, index, reranker, lex
 searcher = spacebridge.Searcher(bridge, new_model, backend, index, reranker, lexical=None)   # off
 ```
 
-**Above 200K documents,** use HNSW (`uv sync --extra hnsw`, then `spacebridge.build_hnsw` and `spacebridge.HnswBackend`). A reranker is required there: `Searcher` raises `ValueError` without one, unless you pass `allow_no_reranker=True`. `ExactBackend` on a GPU raises `ValueError` if the vectors won't fit.
+**Above 200K documents,** use HNSW (`uv sync --extra hnsw`, then `spacebridge.build_hnsw` and `spacebridge.HnswBackend`). A rerun of `build_hnsw` continues from its last save. A reranker is required there: `Searcher` raises `ValueError` without one, unless you pass `allow_no_reranker=True`. `ExactBackend` on a GPU raises `ValueError` if the vectors won't fit.
 
 ## When to use this
 
@@ -60,23 +60,26 @@ Retention is end-to-end `nDCG@5` after `bge-reranker-v2-m3`, against the weaker 
 | MS MARCO | 1M | 0.995 | 0.982 | 0.994, 0.983 | 0.986, 0.957 |
 | NQ | 1M | 0.985 | 0.979 | 0.985, 0.975 | 0.989, 0.972 |
 | HotpotQA | 1M | 0.995 | 1.020 | 0.989, 0.988 | 0.956, 0.898 |
+| MS MARCO | 2M | 0.986 | 0.972 | 0.985, 0.973 | |
+| HotpotQA | 2M | 0.994 | 1.020 | 0.982, 0.981 | |
+| MS MARCO | 4M | 0.985 | 0.962 | 0.982, 0.958 | |
 | HotpotQA | 5.23M | 0.985 | 1.009 | 0.967, 0.961 | 0.886, 0.798 |
 | MS MARCO | 8.84M | 0.979 | 0.946 | 0.981, 0.945 | 0.963, 0.895 |
 
 Up to 500K is 500 queries, which moves a reading by about ±1.5 points, and Tier 1 there is one direction. 1M and above is 2,000 queries, both directions.
 
 - **With BM25, best range: up to 1M,** on all three corpora, at budget 60, for models of one family and across families.
-- **With BM25, supported range: up to 8.84M,** at budget 60. The top size rests on MS MARCO alone, HotpotQA is measured to its whole corpus, 5.23M, and NQ isn't measured above 1M. Nothing was held out from this budget above 1M, and above 1M it's exact search: no HNSW index was built there.
-- **Without BM25, multi-hop questions miss at the library's defaults at every size measured,** from 10K (0.968, 0.937) through 50K (0.953, 0.903) to 5.23M. BM25 is off at 50K and below, so that includes those sizes as shipped: pass a `LexicalIndex` if your questions are like that. With one, HotpotQA reads 1.003 to 1.006 and 1.005 to 1.011 from 10K to 50K (500 queries).
+- **With BM25, supported range: up to 8.84M,** at budget 60, exact search. The top size rests on MS MARCO alone, HotpotQA is measured to its whole corpus, 5.23M, and NQ isn't measured above 1M. Nothing was held out from this budget above 1M. No size between crosses the line: on MS MARCO, across families, it falls steadily from 0.982 at 1M through 0.972 and 0.962 to 0.946.
+- **Without BM25, multi-hop questions miss at the library's defaults at every size measured,** from 10K (0.968, 0.937) through 50K (0.948, 0.880) to 5.23M. BM25 is off at 50K and below, so that includes those sizes as shipped: pass a `LexicalIndex` if your questions are like that. With one, HotpotQA reads 1.003 to 1.006 and 1.005 to 1.011 from 10K to 50K (500 queries). MS MARCO and NQ pass at those sizes either way.
 
 **Limits worth knowing:**
 
 - **BM25 needs document text and English.** Its tokenizer keeps only `[a-z0-9]+`. The reranker needs the text anyway. It's off for an index in another language, and a query in another language skips it.
-- **Where relevance isn't lexical, BM25 can cost you.** SciDocs, where relevance is citation links, goes from 1.013 and 1.018 to 0.984 and 0.970 at budget 60, in every comparison, though it still passes. At its 25.7K documents BM25 is off by default. FiQA and TREC-COVID, held out from the choice, lost 0.9 to 2.2 points in every comparison and still passed: FiQA 1.018 and 0.981, TREC-COVID 1.001 and 0.987 on 50 queries. If you have labeled queries, compare with `lexical=None`.
+- **Where relevance isn't lexical, BM25 can cost you.** SciDocs, where relevance is citation links, goes from 1.013 and 1.018 to 0.984 and 0.970 at budget 60, in every comparison, though it still passes. At its 25.7K documents BM25 is off by default. FiQA and TREC-COVID lost 0.9 to 2.2 points in every comparison and still passed: FiQA 1.018 and 0.981, TREC-COVID 1.001 and 0.987 on 50 queries. SciFact and ArguAna gained 0.9 to 2.0. If you have labeled queries, compare with `lexical=None`.
 - **Absolute quality falls with size for everyone.** On MS MARCO at 8.84M, `nDCG@5` reads 0.419 and 0.405, against 0.429 for native and re-index. The same search at 1M reads 0.72.
 - **Your corpus may be harder than these.** The score below doesn't reliably warn you. If you have labeled queries, measure.
 - **Scope:** English, on these model pairs. A small old index holds up too at 1M: `all-MiniLM-L6-v2` queried with `bge-large-en-v1.5` reads 0.981, and with `Qwen3-Embedding-0.6B` 0.975. Other kinds of pair aren't measured above 171K.
-- **Through HNSW, measured at 1M on MS MARCO only:** BM25 costs at most 0.08 points against exact search, reading 0.995 and 0.978 at budget 60.
+- **Through HNSW, measured on MS MARCO only, one index per size:** with BM25, at budget 60, ef 500, it costs at most 0.08 points against exact search at 1M, reading 0.995 and 0.978, and 0.01 and 0.06 points at 8.84M, reading 0.978 and 0.945. At 8.84M that's one direction per tier, so the supported range itself stays stated as exact search. No HotpotQA or NQ index exists.
 - **A pair graded C or D gets a budget of 100,** and so does a bridge with no old model. On our runs that's HotpotQA across families.
 - **The quality score over-predicts as the index grows.** It doesn't see BM25 either: it still grades HotpotQA B and C. Above 200K, treat it as a rough signal, and don't read `report.rerank_pool`'s 300 as what's served with BM25 on: `result.pool` is.
 - **The mount budget is tight at the anchor profiles' low ends,** on short passages, against a line of 10% of re-index tokens: K = 4,096 reads 8.7-9.7% at 80K, where it starts, and K = 8,192 reads 9.4-10.5% at 150K, so one query model runs a little over there.
@@ -89,23 +92,28 @@ Seconds, p50 (p95), on 10 CPU threads or an RTX 5070 Ti, through `Searcher`, on 
 | Index size | BM25 | Budget | K | Same family | Across families | CPU, short | CPU, long | GPU, short | GPU, long |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 5.2K | off | 60 | 2,048 | 0.991 | 0.997 | 11.0 (12.1) | 35.7 (41.8) | 0.16 (0.17) | 0.29 (0.33) |
-| 10K | off | 60 | 2,048 | 0.992 | 0.984 | 11.0 (12.1) | 35.7 (41.8) | 0.16 (0.17) | 0.29 (0.33) |
-| 20K | off | 60 | 2,048 | 0.997 | 0.980 | 11.0 (12.1) | 35.7 (41.8) | 0.16 (0.17) | 0.29 (0.33) |
-| 50K | off | 60 | 2,048 | **0.953** | **0.903** | 11.0 (12.1) | 35.7 (41.8) | 0.16 (0.17) | 0.29 (0.33) |
+| 10K | off | 60 | 2,048 | **0.968** | **0.937** | 11.0 (12.1) | 35.7 (41.8) | 0.16 (0.17) | 0.29 (0.33) |
+| 20K | off | 60 | 2,048 | **0.956** | **0.917** | 11.0 (12.1) | 35.7 (41.8) | 0.16 (0.17) | 0.29 (0.33) |
+| 30K | off | 60 | 2,048 | **0.957** | **0.922** | 11.0 (12.1) | 35.7 (41.8) | 0.16 (0.17) | 0.29 (0.33) |
+| 50K | off | 60 | 2,048 | **0.948** | **0.880** | 11.0 (12.1) | 35.7 (41.8) | 0.16 (0.17) | 0.29 (0.33) |
 | 100K | on | 60 | 4,096 | 0.997 | 0.997 | 11.0 (12.5) | 36.8 (41.4) | 0.15 (0.16) | 0.30 (0.34) |
 | 150K | on | 60 | 4,096 | 1.000 | 0.997 | 11.1 (12.5) | 36.9 (41.4) | 0.15 (0.17) | 0.30 (0.34) |
 | 171K | on | 60 | 8,192 | 1.001 | 0.987 | 11.1 (12.5) | 36.9 (41.4) | 0.15 (0.17) | 0.30 (0.34) |
 | 200K | on | 60 | 8,192 | 0.995 | 0.995 | 11.1 (12.5) | 36.9 (41.4) | 0.15 (0.17) | 0.30 (0.34) |
 | 500K | on | 60 | 8,192 | 0.989 | 0.988 | 11.1 (12.5) | 36.9 (41.4) | 0.16 (0.17) | 0.31 (0.34) |
 | 1M | on | 60 | 8,192 | 0.985 | 0.979 | 11.0 (12.5) | 36.8 (41.4) | 0.16 (0.17) | 0.31 (0.34) |
-| 5.23M | on | 60 | 8,192 | 0.985 | 1.009 | 11.2 (11.8) | 37.4 (41.9) | 0.68 (0.73) | 0.85 (0.89) |
-| 8.84M | on | 60 | 8,192 | 0.979 | 0.946 | 11.6 (12.2) | 37.8 (42.3) | 1.09 (1.14) | 1.23 (1.27) |
+| 2M | on | 60 | 8,192 | 0.986 | 0.972 | 10.7 (13.3) | 37.0 (41.6) | 0.33 (0.43) | 0.51 (0.55) |
+| 4M | on | 60 | 8,192 | 0.985 | 0.962 | 10.9 (13.5) | 37.3 (41.8) | 0.55 (0.64) | 0.72 (0.76) |
+| 5.23M | on | 60 | 8,192 | 0.985 | 1.009 | 11.1 (13.7) | 37.4 (41.9) | 0.68 (0.77) | 0.86 (0.89) |
+| 8.84M | on | 60 | 8,192 | 0.979 | 0.946 | 11.5 (14.0) | 37.8 (42.3) | 1.07 (1.16) | 1.24 (1.27) |
+| 8.84M, HNSW | on | 60 | 8,192 | 0.978 | 0.945 | 10.6 (13.2) | 36.9 (41.5) | 0.20 (0.22) | 0.36 (0.40) |
 
-**Bold is a miss:** HotpotQA at 50K, where BM25 is off. Above 1M the lines are 95% and 90%. Above 1M this is exact search on the CPU, about 0.9 s at 8.84M, since the GPU can't hold those vectors; that row is 3 queries, and it isn't the reference deployment, which would use HNSW and has none at this size. Up to 500K, GPU search is exact on the GPU; at 1M it's HNSW.
+**Bold is a miss:** HotpotQA from 10K to 50K, where BM25 is off and the lines are 98% and 94%. Above 1M the lines are 95% and 90%. Those rows are exact search on the CPU, about 0.9 s at 8.84M, since the GPU can't hold those vectors. **The last row is the reference deployment:** one HNSW index, M = 32, ef 500, on MS MARCO at 8.84M, with retention through it on one direction per tier. The 8.84M rows are 20 queries each. 2M and 4M add search and BM25 at their size to those runs, by interpolation, and 5.23M does too. Up to 500K, GPU search is exact on the GPU; at 1M it's HNSW.
 
-- **Short passages:** a CPU stays under a minute at every size measured, up to 8.84M, at 11-12 s.
+- **Short passages:** a CPU stays under a minute at every size measured, up to 8.84M, at 11-12 s, p95 up to 14 s.
 - **Long documents:** a CPU stays under a minute at budget 60 at every size, at 36-38 s, and reaches it only at budget 100, at 60.6 s, which a grade C or D pair or a bridge with no old model gets.
-- **BM25 adds** 5 ms at 1M and 21 ms at 8.84M, p50, and it takes 2.3 GB of RAM at 8.84M. The query model and reranker together peak at 2.4 GB of GPU memory on short passages and 3.0 GB on long documents, on `Qwen3-Embedding-0.6B`.
+- **HNSW at 8.84M:** 38.6 GB on disk, built on the CPU in about 1.8 h on 12 threads, loaded in about 30 s from a warm page cache, and 45-47 GB resident while serving, with text and BM25, against 60-62 GB with exact search. Search takes 3-7 ms at ef 500 to 1000, against 0.9 s.
+- **BM25 adds** 5 ms at 1M and 30 ms at 8.84M, p50, and 41-58 ms in the HNSW runs on the same index, for a reason not tested. It takes 2.3 GB of RAM at 8.84M. The query model and reranker together peak at 2.4 GB of GPU memory on short passages and 3.0 GB on long documents, on `Qwen3-Embedding-0.6B`.
 - **With BM25 off,** above 200K the pool is 300: 51 s short and 171 s long on a CPU, and 0.40 s and 1.15 s on a GPU.
 - **Your own documents, on a CPU like this one:** rerank seconds ≈ 1.91 ms × pool × tokens per pair, within 4% on average and 10% at worst over five corpora from 97 to 412 tokens per pair. One query reaches a minute at pool × tokens per pair ≈ 31,400. Long documents go through a 512-token limit.
 - **16 threads** is about 30% faster than 10 (28-30% at the three points measured).
@@ -115,19 +123,19 @@ Seconds, p50 (p95), on 10 CPU threads or an RTX 5070 Ti, through `Searcher`, on 
 
 Serve right away, then re-index in the background if the last few points justify it, or if you'd run without a reranker. The compute answer depends on whether the re-indexed system would also rerank.
 
-- **If it would,** the bridge adds only BM25 and the projection per query: 6-22 ms on a GPU and 16-35 ms on a CPU, from 1M to 8.84M. Re-indexing then doesn't pay back in compute at any traffic you're likely to see.
+- **If it would,** the bridge adds only BM25 and the projection per query: 6-31 ms on a GPU and 16-41 ms on a CPU, from 1M to 8.84M. Re-indexing then doesn't pay back in compute at any traffic you're likely to see.
 - **If it wouldn't,** the bridge also costs a reranker on every query, 0.15 s on a GPU and about 11 s on a CPU on short passages, so re-indexing pays back within thousands of queries. But you'd get less: dense search on a re-indexed system reads `nDCG@5` 0.683, 0.651 and 0.811 at 1M on MS MARCO, NQ and HotpotQA, against 0.722, 0.772 and 0.882 for the bridge with BM25 and the reranker (Tier 1).
 
 Queries until re-indexing would have been cheaper, on short passages. Each cell is GPU, CPU:
 
 | Query model | Re-index 1M | It also reranks | It doesn't | Re-index 8.84M | It also reranks | It doesn't |
 | --- | --- | --- | --- | --- | --- | --- |
-| `all-MiniLM-L6-v2` | 2 min, 1.4 h | 19K, 331K | 803, 476 | 17 min, 12.8 h | 46K, 1.3M | 7.0K, 4.4K |
-| `bge-base-en-v1.5` | 5 min, 10.0 h | 45K, 2.3M | 1.9K, 3.3K | 41 min, 88.1 h | 111K, 9.2M | 17K, 30K |
-| `bge-large-en-v1.5` | 12 min, 35.1 h | 117K, 8.0M | 5.0K, 12K | 1.8 h, 309.9 h | 285K, 32.3M | 43K, 106K |
-| `Qwen3-Embedding-0.6B` | 28 min, 56.1 h | 277K, 12.9M | 12K, 18K | 4.2 h, 496.0 h | 673K, 51.6M | 102K, 169K |
+| `all-MiniLM-L6-v2` | 2 min, 1.4 h | 19K, 331K | 803, 476 | 17 min, 12.8 h | 33K, 1.1M | 7.2K, 4.4K |
+| `bge-base-en-v1.5` | 5 min, 10.0 h | 45K, 2.3M | 1.9K, 3.3K | 41 min, 88.1 h | 80K, 7.8M | 17K, 30K |
+| `bge-large-en-v1.5` | 12 min, 35.1 h | 117K, 8.0M | 5.0K, 12K | 1.8 h, 309.9 h | 206K, 27.4M | 44K, 107K |
+| `Qwen3-Embedding-0.6B` | 28 min, 56.1 h | 277K, 12.9M | 12K, 18K | 4.2 h, 496.0 h | 487K, 43.8M | 105K, 171K |
 
-If the re-indexed system runs BM25 and a reranker too, the only difference left is the projection: about 1 ms on a GPU and 11-13 ms on a CPU.
+If the re-indexed system runs BM25 and a reranker too, the only difference left is the projection: about 1 ms on a GPU and 11 ms on a CPU.
 
 **If you'd rerank either way, re-index for quality, not compute.** Against a re-indexed system with BM25 too, the bridge gives up 0.6 to 2.5 points at 1M, and 1.9 to 5.5 points at the largest sizes, read from "with BM25 on both" above. Also re-index if you need results without a reranker, or your corpus is one where BM25 costs you. To get a better model's first-stage gain, you must re-index.
 

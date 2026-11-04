@@ -212,15 +212,18 @@ def full() -> None:
 # Size, label, BM25 on by the library's rule, then (corpus, record files, K) as the library's profile sets it.
 TABLE1 = [
     (5_183, "5.2K", False, 2048, [("SciFact", ["w5_grid/grid_scifact.jsonl"])]),
-    (10_000, "10K", False, 2048, [("MS MARCO", ["m1_grid/ms_10k.jsonl"])]),
-    (20_000, "20K", False, 2048, [("MS MARCO", ["m1_grid/ms_20k.jsonl"])]),
-    (50_000, "50K", False, 2048, [("MS MARCO", ["w5_grid/grid_msmarco.jsonl"]), ("NQ", ["w5_grid/grid_nq.jsonl"]), ("HotpotQA", ["m1_switch/hotpot_k2048.jsonl"])]),
+    (10_000, "10K", False, 2048, [("MS MARCO", ["m1_grid/ms_10k.jsonl"]), ("MS MARCO", ["closeout/b1_ms10000.jsonl"]), ("NQ", ["closeout/b1_nq10000.jsonl"]), ("HotpotQA", ["followup/hp10000.jsonl"])]),
+    (20_000, "20K", False, 2048, [("MS MARCO", ["m1_grid/ms_20k.jsonl"]), ("MS MARCO", ["closeout/b1_ms20000.jsonl"]), ("NQ", ["closeout/b1_nq20000.jsonl"]), ("HotpotQA", ["followup/hp20000.jsonl"])]),
+    (30_000, "30K", False, 2048, [("MS MARCO", ["closeout/b1_ms30000.jsonl"]), ("NQ", ["closeout/b1_nq30000.jsonl"]), ("HotpotQA", ["followup/hp30000.jsonl"])]),
+    (50_000, "50K", False, 2048, [("MS MARCO", ["w5_grid/grid_msmarco.jsonl"]), ("MS MARCO", ["closeout/b1_ms50000.jsonl"]), ("NQ", ["w5_grid/grid_nq.jsonl"]), ("NQ", ["closeout/b1_nq50000.jsonl"]), ("HotpotQA", ["m1_switch/hotpot_k2048.jsonl"]), ("HotpotQA", ["followup/hp50000.jsonl"])]),
     (100_000, "100K", True, 4096, [("MS MARCO", ["m3_a6/ms100000.jsonl"]), ("NQ", ["m3_a6/nq100000.jsonl"]), ("HotpotQA", ["m3_a6/hp100000.jsonl"])]),
     (150_000, "150K", True, 4096, [("MS MARCO", ["m3_a6/ms150000.jsonl"]), ("NQ", ["m3_a6/nq150000.jsonl"]), ("HotpotQA", ["m3_a6/hp150000.jsonl"])]),
     (171_332, "171K", True, 8192, [("TREC-COVID", ["m3_a6/trec_covid.jsonl"])]),
     (200_000, "200K", True, 8192, [("MS MARCO", ["m3_a6/ms200000.jsonl"]), ("NQ", ["m3_a6/nq200000.jsonl"]), ("HotpotQA", ["m3_a6/hp200000.jsonl"])]),
     (500_000, "500K", True, 8192, [("MS MARCO", ["m3_a6/ms500000.jsonl"]), ("NQ", ["m3_a6/nq500000.jsonl"]), ("HotpotQA", ["m3_a6/hp500000.jsonl"])]),
     (1_000_000, "1M", True, 8192, [("MS MARCO", ["m3_1m/ms.jsonl"]), ("NQ", ["m3_1m/nq2k.jsonl"]), ("HotpotQA", ["m3_1m/hp.jsonl"])]),
+    (2_000_000, "2M", True, 8192, [("MS MARCO", ["closeout/b4_ms2000000.jsonl"]), ("HotpotQA", ["closeout/b4_hp2000000.jsonl"])]),
+    (4_000_000, "4M", True, 8192, [("MS MARCO", ["closeout/b4_ms4000000.jsonl"])]),
     (5_233_329, "5.23M", True, 8192, [("HotpotQA", ["m3_full/hp.jsonl"])]),
     (8_841_823, "8.84M", True, 8192, [("MS MARCO", ["m3_full/ms_t1.jsonl", "m3_full/ms_t3.jsonl"])]),
 ]
@@ -232,8 +235,8 @@ class Timing:
     GPU, sizes above 1M search on the CPU, since the GPU can't hold them."""
 
     def __init__(self):
-        self.records = read("m1_timing/timing.jsonl", "m2_timing/timing.jsonl", "m3_timing/timing.jsonl")
-        self.lexical_points = sorted((r["N"], r["stages_ms"]["lexical"]["p50"]) for r in self.records if r.get("lexical") and r["device"] == "cpu" and r["dataset"].startswith("msmarco"))
+        self.records = read("m1_timing/timing.jsonl", "m2_timing/timing.jsonl", "m3_timing/timing.jsonl", "closeout/timing.jsonl")  # oldest first: the latest reading of a size stands
+        self.lexical_points = sorted({r["N"]: r["stages_ms"]["lexical"]["p50"] for r in self.records if r.get("lexical") and r["device"] == "cpu" and r["dataset"].startswith("msmarco") and r["backend"] == "exact" or r.get("lexical") and r["device"] == "cpu" and r["N"] == 1_000_000}.items())
 
     def search_ms(self, device: str, size: int) -> float:
         if size > 1_000_000:
@@ -247,9 +250,11 @@ class Timing:
     def lexical_ms(self, size: int) -> float:
         return float(np.interp(size, *zip(*([(0, 0.0)] + self.lexical_points)))) if self.lexical_points else 0.0
 
-    def run(self, device: str, corpus: str, pool: int, lexical: bool):
-        """The latest record at this pool; a BM25 run may stand in for a plain one, since BM25's own time is taken off."""
+    def run(self, device: str, corpus: str, pool: int, lexical: bool, hnsw: bool = False):
+        """The latest record at this pool; a BM25 run may stand in for a plain one, since BM25's own time is taken off. At 8.84M, exact search unless ``hnsw``."""
         runs = [r for r in self.records if r["device"] == device and r["threads"] == 10 and r["rerank"] and r["dataset"] == corpus and r["pool"] == pool and not r.get("reranker", "").startswith("onnx") and r.get("reranker", "BAAI/bge-reranker-v2-m3") == "BAAI/bge-reranker-v2-m3"]
+        if corpus == "msmarco-full":
+            runs = [r for r in runs if r["ef"] == 500 and (r["backend"] != "exact") == hnsw]
         chosen = [r for r in runs if bool(r.get("lexical")) == lexical] or runs
         return chosen[-1] if chosen else None
 
@@ -301,6 +306,28 @@ def table1(budget_above_1m: int = 60) -> None:
                 stopped[kind] = over
             times[f"gpu_{kind}"] = f"{timing.query_s('cuda', source, size, budget, 'p50', lexical):.2f} ({timing.query_s('cuda', source, size, budget, 'p95', lexical):.2f})"
         print(f"| {label} | {'on' if lexical else 'off'} | {budget} | {K:,} | {cell['T1']} | {cell['T3']} | {times['cpu_short']} | {times['cpu_long']} | {times['gpu_short']} | {times['gpu_long']} |")
+    hnsw_row(timing)
+
+
+def hnsw_row(timing: Timing) -> None:
+    """The reference deployment at 8.84M: one index, ef 500, retention through it, one direction per tier. Long is TREC-COVID's rerank with this search."""
+    res = {r["key"]: r for r in read("closeout/b7_hnsw.jsonl")}
+    runs = {d: timing.run(d, "msmarco-full", 60, True, hnsw=True) for d in ("cpu", "cuda")}
+    if not res or None in runs.values():
+        return
+    cell = {}
+    for t, tgt in (("T1", "bge-base-en"), ("T3", "qwen3-0.6b")):
+        lex = [res[f"lexical|{tgt}|s{seed}|ef500|pool60"]["ndcg5_approx"] for seed in (0, 1, 2)]
+        v = st.mean(lex) / min(res["hnsw|native|ef500|pool60"]["ndcg5_exact"], res[f"oracle|{tgt}|pool60"]["ndcg5_exact"])
+        cell[t] = f"{v:.3f}{'' if v >= STRETCH[t] else ' **miss**'} (MS MARCO)"
+    times = {}
+    for d in ("cpu", "cuda"):
+        s_ = runs[d]["stages_ms"]
+        long_ = timing.run(d, "trec-covid", 60, True)["stages_ms"]
+        fmt = (lambda x: f"{x:.1f}") if d == "cpu" else (lambda x: f"{x:.2f}")
+        add = s_["search"]["p50"] + s_["lexical"]["p50"] - long_["search"]["p50"] - long_["lexical"]["p50"]
+        times[d] = f"{fmt(s_['total']['p50'] / 1e3)} ({fmt(s_['total']['p95'] / 1e3)}) | {fmt((long_['total']['p50'] + add) / 1e3)} ({fmt((long_['total']['p95'] + add) / 1e3)})"
+    print(f"| 8.84M, HNSW | on | 60 | 8,192 | {cell['T1']} | {cell['T3']} | {times['cpu']} | {times['cuda']} |")
 
 
 def break_even() -> None:
