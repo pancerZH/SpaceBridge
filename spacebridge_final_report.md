@@ -115,7 +115,9 @@ The score is **nDCG@5**, which rewards putting the right documents in the top 5,
 
 **It works with the old model gone.** A fit from stored vectors and the new model alone holds up, at a larger pool of 100, on one pair per family, 500 queries, at 1M.
 
-**The recheck held up.** Recomputing every published cell from the caches, with the corrected code, matched the published records. See [§7](#7-what-we-achieved).
+**The recheck held up.** Recomputing every published cell from the caches, with the corrected code, matched the published records: 19,836 values, all identical to six decimal places.
+
+**The fresh confirmation held up.** On data that chose nothing, no result missed a line, and eight of ten were confirmed outright ([§7](#7-what-we-achieved)).
 
 ## 6. What went badly, and what we did
 
@@ -172,6 +174,20 @@ Retention against the weaker of native search and re-index, after the reranker. 
 <!-- table:retention_short -->
 | Corpus | Documents | Queries | Same family | Low | High | Across families | Low | High |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| MS MARCO | 100K | 500 | 1.000 | 0.990 | 1.009 | 0.996 | 0.988 | 1.004 |
+| MS MARCO | 500K | 500 | 0.996 | 0.986 | 1.006 | 0.989 | 0.978 | 0.999 |
+| MS MARCO | 1M | 2000 | 0.995 | 0.989 | 1.002 | 0.982 | 0.976 | 0.989 |
+| MS MARCO | 2M | 2000 | 0.986 | 0.980 | 0.995 | 0.972 | 0.963 | 0.982 |
+| MS MARCO | 4M | 2000 | 0.985 | 0.975 | 0.995 | 0.962 | 0.950 | 0.975 |
+| MS MARCO | 8.84M | 2000 | 0.979 | 0.966 | 0.993 | 0.946 | 0.930 | 0.964 |
+| NQ | 100K | 500 | 0.996 | 0.987 | 1.006 | 0.999 | 0.992 | 1.008 |
+| NQ | 500K | 500 | 0.989 | 0.976 | 1.000 | 0.988 | 0.974 | 1.001 |
+| NQ | 1M | 2000 | 0.985 | 0.979 | 0.993 | 0.979 | 0.971 | 0.987 |
+| HotpotQA | 100K | 500 | 1.000 | 0.992 | 1.008 | 1.012 | 1.003 | 1.022 |
+| HotpotQA | 500K | 500 | 0.997 | 0.988 | 1.007 | 1.016 | 1.003 | 1.031 |
+| HotpotQA | 1M | 2000 | 0.995 | 0.990 | 1.000 | 1.020 | 1.012 | 1.029 |
+| HotpotQA | 2M | 2000 | 0.994 | 0.988 | 1.000 | 1.020 | 1.011 | 1.029 |
+| HotpotQA | 5.23M | 2000 | 0.985 | 0.977 | 0.993 | 1.009 | 0.999 | 1.021 |
 <!-- /table:retention_short -->
 
 ### Fresh confirmation: data that chose nothing
@@ -181,16 +197,26 @@ We froze the system, wrote down the rules before any result existed ([plan](docs
 <!-- table:fresh -->
 | Data | Documents | Queries | Models | Retention | Low | High | Line | Verdict | No bridge, retention | Bridge, absolute `nDCG@5` |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| MS MARCO, unused queries |  |  | not run |  |  |  |  | Not run |  |  |
-| HotpotQA, unused queries |  |  | not run |  |  |  |  | Not run |  |  |
-| LoTTE technology |  |  | not run |  |  |  |  | Not run |  |  |
-| FEVER |  |  | not run |  |  |  |  | Not run |  |  |
-| Touché 2020 |  |  | not run |  |  |  |  | Not run |  |  |
-| MS MARCO, unused queries, HNSW | 8.84M |  | Same family, one direction |  |  |  | 0.95 | Not run |  |  |
-| MS MARCO, unused queries, HNSW | 8.84M |  | Across families, one direction |  |  |  | 0.90 | Not run |  |  |
+| MS MARCO, unused queries | 8.84M | 2000 | Same family | 0.971 | 0.959 | 0.985 | 0.95 | Confirmed | 0.862 | 0.428 |
+| MS MARCO, unused queries | 8.84M | 2000 | Across families | 0.956 | 0.940 | 0.974 | 0.90 | Confirmed | 0.870 | 0.418 |
+| HotpotQA, unused queries | 5.23M | 2000 | Same family | 0.978 | 0.970 | 0.986 | 0.95 | Confirmed | 0.949 | 0.801 |
+| HotpotQA, unused queries | 5.23M | 2000 | Across families | 0.999 | 0.989 | 1.010 | 0.90 | Confirmed | 0.999 | 0.777 |
+| LoTTE technology | 638.5K | 2000 | Same family | 0.989 | 0.976 | 1.002 | 0.98 | Point pass | 0.838 | 0.302 |
+| LoTTE technology | 638.5K | 2000 | Across families | 0.964 | 0.951 | 0.977 | 0.94 | Confirmed | 0.818 | 0.301 |
+| FEVER | 1M | 2000 | Same family | 0.997 | 0.993 | 1.001 | 0.98 | Confirmed | 0.977 | 0.947 |
+| FEVER | 1M | 2000 | Across families | 0.994 | 0.991 | 0.999 | 0.94 | Confirmed | 0.977 | 0.944 |
+| Touché 2020 | 382.5K | 49 | Same family | 1.021 | 0.976 | 1.087 | 0.98 | Point pass | 1.096 | 0.380 |
+| Touché 2020 | 382.5K | 49 | Across families | 1.034 | 0.989 | 1.101 | 0.94 | Confirmed | 1.096 | 0.384 |
+| MS MARCO, unused queries, HNSW | 8.84M | 2000 | Same family, one direction | 0.973 |  |  | 0.95 | Point pass |  | 0.429 |
+| MS MARCO, unused queries, HNSW | 8.84M | 2000 | Across families, one direction | 0.961 |  |  | 0.90 | Point pass |  | 0.420 |
 <!-- /table:fresh -->
 
-<!-- value:fresh_reading -->
+**How to read it.** No fresh result missed a line. Eight of the ten verdicts with an interval are confirmed and two are point passes: LoTTE same family reads 0.989 with a low end of 0.976, against 0.98, and Touché same family reads 1.021 with a low end of 0.976, on only 49 queries. Through the HNSW index, MS MARCO reads 0.973 and 0.961 against 0.95 and 0.90. Those are point estimates only, because that script keeps means, not per-query scores. Four things qualify the result:
+
+- **New queries are not a new corpus.** The MS MARCO and HotpotQA rows are new queries on corpora that shaped the system. LoTTE, FEVER and Touché are the new corpora.
+- **On some corpora BM25 does the work.** On FEVER, BM25 and the reranker with no bridge read 0.977, close to the bridge's 0.997 and 0.994. On HotpotQA they read 0.949 and 0.999. **On Touché, no bridge reads 1.096, above the bridge's 1.021 and 1.034: there the bridge lowers quality against BM25 alone**, on 49 queries. Where the map earns its place: LoTTE, 0.838 and 0.818 with no bridge against 0.989 and 0.964, and MS MARCO, 0.862 and 0.870 against 0.971 and 0.956.
+- **Re-indexing still gains at the largest sizes.** Direct retention against a re-index with the same BM25 and reranker reads 0.968 and 0.945 on MS MARCO at 8.84M, 0.958 and 0.943 on HotpotQA at 5.23M, and 0.980 to 0.996 on the three new corpora.
+- **It's one confirmation, on four model pairs and three seeds.** It shows the frozen system reaching its lines on these data. It doesn't make the lines a guarantee for an unseen corpus.
 
 ### Against re-indexing directly
 
@@ -199,6 +225,16 @@ This is the tradeoff a user faces: what you'd gain by re-indexing, if the re-ind
 <!-- table:reindex_short -->
 | Corpus | Documents | Models | Bridge | Re-index with BM25 | Difference, absolute points | Low | High | Direct retention | Low | High |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| MS MARCO | 1M | Same family | 0.722 | 0.728 | -0.5 | -0.9 | -0.2 | 0.993 | 0.988 | 0.997 |
+| MS MARCO | 1M | Across families | 0.715 | 0.727 | -1.2 | -1.7 | -0.8 | 0.983 | 0.976 | 0.989 |
+| MS MARCO | 8.84M | Same family | 0.419 | 0.428 | -0.9 | -1.5 | -0.4 | 0.978 | 0.966 | 0.989 |
+| MS MARCO | 8.84M | Across families | 0.405 | 0.429 | -2.4 | -3.1 | -1.7 | 0.944 | 0.929 | 0.959 |
+| NQ | 1M | Same family | 0.772 | 0.785 | -1.2 | -1.7 | -0.8 | 0.985 | 0.979 | 0.990 |
+| NQ | 1M | Across families | 0.761 | 0.783 | -2.2 | -2.7 | -1.7 | 0.972 | 0.966 | 0.979 |
+| HotpotQA | 1M | Same family | 0.882 | 0.895 | -1.2 | -1.6 | -0.9 | 0.986 | 0.982 | 0.990 |
+| HotpotQA | 1M | Across families | 0.866 | 0.887 | -2.1 | -2.5 | -1.7 | 0.976 | 0.972 | 0.981 |
+| HotpotQA | 5.23M | Same family | 0.808 | 0.838 | -3.0 | -3.4 | -2.5 | 0.965 | 0.959 | 0.970 |
+| HotpotQA | 5.23M | Across families | 0.783 | 0.827 | -4.5 | -5.0 | -3.9 | 0.946 | 0.940 | 0.953 |
 <!-- /table:reindex_short -->
 
 ### What the bridge adds
@@ -208,6 +244,16 @@ Against BM25 and the reranker with no bridge and no old index:
 <!-- table:nobridge_short -->
 | Corpus | Documents | Models | No bridge, retention | Low | High | Bridge, retention | Bridge adds, absolute points | Low | High |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| MS MARCO | 1M | Same family | 0.905 | 0.888 | 0.922 | 0.995 | +6.5 | +5.4 | +7.7 |
+| MS MARCO | 1M | Across families | 0.903 | 0.887 | 0.920 | 0.982 | +5.7 | +4.6 | +6.9 |
+| MS MARCO | 8.84M | Same family | 0.874 | 0.849 | 0.900 | 0.979 | +4.5 | +3.4 | +5.6 |
+| MS MARCO | 8.84M | Across families | 0.873 | 0.848 | 0.899 | 0.946 | +3.1 | +2.1 | +4.2 |
+| NQ | 1M | Same family | 0.863 | 0.847 | 0.881 | 0.985 | +9.6 | +8.3 | +10.9 |
+| NQ | 1M | Across families | 0.870 | 0.853 | 0.888 | 0.979 | +8.5 | +7.2 | +9.7 |
+| HotpotQA | 1M | Same family | 0.958 | 0.950 | 0.966 | 0.995 | +3.3 | +2.7 | +3.9 |
+| HotpotQA | 1M | Across families | 1.001 | 0.991 | 1.011 | 1.020 | +1.6 | +1.1 | +2.1 |
+| HotpotQA | 5.23M | Same family | 0.945 | 0.935 | 0.955 | 0.985 | +3.3 | +2.6 | +4.0 |
+| HotpotQA | 5.23M | Across families | 1.000 | 0.988 | 1.013 | 1.009 | +0.7 | +0.0 | +1.4 |
 <!-- /table:nobridge_short -->
 
 ### Speed
@@ -217,13 +263,13 @@ One query, warm, on an idle machine, `bge-large-en-v1.5` index, `Qwen3-Embedding
 <!-- table:speed_short -->
 | Documents | Corpus | Documents' length | Search | CPU p50, s | CPU p95, s | CPU queries | GPU p50, s | GPU p95, s | GPU queries |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 100K | MS MARCO | Short | Exact | not run | not run |  | not run | not run |  |
-| 171.3K | TREC-COVID | Long | Exact | not run | not run |  | not run | not run |  |
-| 382.5K | Touché 2020 | Long | Exact | not run | not run |  | not run | not run |  |
-| 1M | MS MARCO | Short | HNSW | not run | not run |  | not run | not run |  |
-| 5.23M | HotpotQA | Short | Exact | not run | not run |  | not run | not run |  |
-| 8.84M | MS MARCO | Short | Exact | not run | not run |  | not run | not run |  |
-| 8.84M | MS MARCO | Short | HNSW | not run | not run |  | not run | not run |  |
+| 100K | MS MARCO | Short | Exact | 10.4 | 12.6 | 30 | 0.16 | 0.17 | 200 |
+| 171.3K | TREC-COVID | Long | Exact | 36.3 | 43.3 | 30 | 0.29 | 0.34 | 49 |
+| 382.5K | Touché 2020 | Long | Exact | 34.1 | 41.2 | 20 | 0.30 | 0.37 | 48 |
+| 1M | MS MARCO | Short | HNSW | 10.6 | 12.4 | 30 | 0.16 | 0.18 | 200 |
+| 5.23M | HotpotQA | Medium | Exact | 14.8 | 18.9 | 30 | 0.71 | 0.75 | 100 |
+| 8.84M | MS MARCO | Short | Exact | 11.3 | 14.0 | 30 | 1.07 | 1.11 | 100 |
+| 8.84M | MS MARCO | Short | HNSW | 10.5 | 13.1 | 30 | 0.19 | 0.21 | 200 |
 <!-- /table:speed_short -->
 
 Longer documents take longer in proportion. On this CPU, rerank seconds ≈ 1.91 ms × candidates × tokens per (query, document) pair. A larger pool of 100 candidates reaches the one-minute line on long documents on a CPU.
@@ -243,7 +289,7 @@ Longer documents take longer in proportion. On this CPU, rerank seconds ≈ 1.91
 - **You can't run a reranker,** or can't keep document text available. First-stage results lose far more, and BM25 needs the text too.
 - **High traffic on a CPU.** A query takes 10 to 40 seconds. Simultaneous requests weren't measured.
 - **An index not in English, above 100K documents.** There's no BM25 there, and the concern from English results at those sizes hasn't been measured there.
-- **Questions that name things, if you can drop the old index.** On HotpotQA, BM25 and a reranker alone do most of the work, so try that first.
+- **Questions that name things, or arguments, if you can drop the old index.** On HotpotQA, BM25 and a reranker alone do most of the work, and on Touché 2020 they did better than the bridge. Try that first.
 - **Corpora where relevance isn't lexical,** like citation links, unless you've compared with `lexical=None` on labeled queries.
 - **Other languages, other model kinds, or a corpus unlike these,** with no measurements of your own. The quality score won't reliably warn you.
 

@@ -126,7 +126,7 @@ def export_manifests() -> None:
 TIMED = [  # label, corpus, documents, search, kind, record file stem or None
     ("100k", "MS MARCO", 100_000, "Exact", "Short"), ("long171k", "TREC-COVID", 171_332, "Exact", "Long"), ("long382k", "Touché 2020", 382_545, "Exact", "Long"),
     ("1m_hnsw", "MS MARCO", 1_000_000, "HNSW", "Short"), ("2m", "MS MARCO", 2_000_000, "Exact", "Short"), ("4m", "MS MARCO", 4_000_000, "Exact", "Short"),
-    ("5m", "HotpotQA", 5_233_329, "Exact", "Short"), ("8m_exact", "MS MARCO", 8_841_823, "Exact", "Short"), ("8m_hnsw", "MS MARCO", 8_841_823, "HNSW", "Short"),
+    ("5m", "HotpotQA", 5_233_329, "Exact", "Medium"), ("8m_exact", "MS MARCO", 8_841_823, "Exact", "Short"), ("8m_hnsw", "MS MARCO", 8_841_823, "HNSW", "Short"),
 ]
 
 
@@ -218,14 +218,15 @@ def breakeven_rows() -> list[list]:
                     continue
                 encode = size * rate[m, device]["tokens_per_doc"] / rate[m, device]["tokens_per_s"]
                 reindex = encode + (hnsw_build_s[size] or 0)
-                bridge = (mount.get((m, device)) or 0) + lexical_s[size]
+                timed_mount = mount.get((m, device))
+                bridge = (timed_mount or 0) + lexical_s[size]  # an untimed mount counts as 0: minutes, against hours of re-encoding
                 s = rec["stages_ms"]
                 both = s["project"]["p50"] / 1e3  # both have BM25 and a reranker: only the projection differs
                 none = (s["total"]["p50"] - s["encode"]["p50"] - s["search"]["p50"]) / 1e3  # the other system does neither
                 gain = reindex - bridge
                 short = lambda n: f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.0f}K" if n >= 1e4 else f"{n / 1e3:.1f}K" if n >= 1e3 else f"{n:.0f}"
                 hours = lambda x: f"{x / 3600:.1f} h" if x >= 3600 else f"{x / 60:.0f} min"
-                out.append([f"`{name}`", docs_label(size), key.upper(), hours(reindex), hours(bridge) if bridge >= 60 else f"{bridge:.0f} s", f"{1e3 * both:.1f} ms", short(gain / both), f"{none:.2f} s", short(gain / none)])
+                out.append([f"`{name}`", docs_label(size), key.upper(), hours(reindex), (hours(bridge) if bridge >= 60 else f"{bridge:.0f} s") + ("" if timed_mount else ", BM25 only: mount not timed here"), f"{1e3 * both:.1f} ms", short(gain / both), f"{none:.2f} s", short(gain / none)])
     return out
 
 
