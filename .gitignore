@@ -8,7 +8,9 @@ venv/
 .ipynb_checkpoints/
 
 # Benchmark artifacts (embeddings, indexes, model/dataset caches, results)
-data/
+data/*
+!data/README.md
+!data/catalog.csv
 cache/
 outputs/
 runs/

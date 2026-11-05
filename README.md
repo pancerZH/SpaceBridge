@@ -202,7 +202,7 @@ uv run pytest      # synthetic-data tests, no downloads or GPU required
 - `scripts/`: studies, summary tables, and `steps.sh` for restartable experiment drivers.
 - `examples/`: the quickstart.
 
-Datasets and embeddings are downloaded at runtime and cached under `data/` (git-ignored); no dataset text is committed to this repository.
+Datasets and embeddings are downloaded at runtime and cached under `data/` (git-ignored); no dataset text is committed to this repository. [`data/README.md`](data/README.md) explains what each cached file is and how to reuse it.
 
 ## Long runs
 
