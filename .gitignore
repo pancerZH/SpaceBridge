@@ -16,6 +16,7 @@ outputs/
 runs/
 *.npy
 *.npz
+!results/**/*.npz
 *.faiss
 *.parquet
 *.safetensors

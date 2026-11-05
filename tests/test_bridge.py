@@ -32,7 +32,8 @@ def test_cross_model_alignment_recovers_most_native_retrieval(world):
     assert info["rho_val"] > 0.8
 
 
-def test_stage2_never_lowers_its_stopping_signal(world):
+def test_stage2_keeps_own_doc_mrr_on_this_fixture(world):
+    # The tail rule doesn't promise this in general: it selects on agreement. It's a check on one easy fixture.
     _, stage1 = _fit(world, world.Y_query, mode="stage1")
     _, auto = _fit(world, world.Y_query, mode="auto", refine_config=RefineConfig(steps=30))
     assert auto["val_metrics"]["owndoc_mrr"] >= stage1["val_metrics"]["owndoc_mrr"] - 1e-9
@@ -141,13 +142,15 @@ def test_quality_report_warns_above_its_calibrated_index_size(world):
         assert (report.rerank_pool >= LARGE_INDEX_RERANK_POOL) is warned
 
 
-def test_per_query_confidence_is_bounded_and_lower_off_distribution(world):
+def test_per_query_confidence_is_bounded_and_support_falls_off_distribution(world):
     bridge, _ = _fit(world, world.Y_query, mode="stage1")
     q_hat, conf = bridge.transform_query(world.Q_tgt, return_confidence=True)
     np.testing.assert_allclose(q_hat, bridge.transform_query(world.Q_tgt))
     assert conf.shape == (len(world.Q_tgt),) and np.all((conf >= 0) & (conf <= 1))
     off = l2(np.random.default_rng(5).standard_normal(world.Q_tgt.shape))
     assert bridge.query_support(off).mean() < bridge.query_support(world.Q_tgt).mean() - 0.1
+    _, conf_off = bridge.transform_query(off, return_confidence=True)
+    assert conf_off.mean() <= conf.mean()  # the calibrated value, not only the raw support
 
 
 def test_stage1_candidates_can_be_restricted(world):

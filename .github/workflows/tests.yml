@@ -1,0 +1,26 @@
+name: tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  synthetic:
+    # The synthetic tests and the three install paths of docs/usage.md. No model or dataset downloads, no GPU.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk for the CUDA wheels
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+      - uses: astral-sh/setup-uv@v5
+      - name: The library alone imports
+        run: |
+          uv sync --no-default-groups
+          uv run --no-sync python -c "import spacebridge"
+      - name: Tests, with HNSW
+        run: |
+          uv sync --extra hnsw
+          uv run --no-sync pytest -q
+      - name: Wheel holds both packages
+        run: |
+          uv build --wheel
+          python -m zipfile -l dist/*.whl | grep -E "spacebridge/(mount|quality_calibration)|spacebridge_bench/run"
