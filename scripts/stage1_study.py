@@ -19,9 +19,11 @@ import numpy as np
 from spacebridge import CalibrationBundle, SpaceBridge, make_query_proxies, make_split, sample_distractors
 from spacebridge.solvers import LAMBDAS_REL
 from spacebridge_bench.datasets import load_beir
-from spacebridge_bench.encode import Encoder
+from spacebridge_bench.encode import Encoder, MountEncoder
+from spacebridge import DOC_PAIR_TOKENS
 from spacebridge_bench.metrics import per_query
 from spacebridge_bench.models import MODELS
+from spacebridge_bench.metrics import spearman
 from spacebridge_bench.run import TIERS, cached_anchors
 from spacebridge_bench.search import search
 
@@ -60,6 +62,13 @@ def run(args) -> None:
             enc = Encoder(MODELS[tgt], args.device)
             Y = enc.queries(proxies, ds.task)
             enc.unload()
+            # The shipped mount's anchor docs, at its token limit; args.doc_pair_tokens = 0 gives the earlier full-length study.
+            if args.doc_pair_tokens:
+                mount_enc = MountEncoder(MODELS[tgt], ds.task, args.device)
+                Y_doc = mount_enc.encode_docs([ds.titles[i] for i in ids], [ds.texts[i] for i in ids], max_tokens=args.doc_pair_tokens)
+                mount_enc.unload()
+            else:
+                Y_doc = E_t[ids]
             tr, va = make_split(K, seed=seed)
             bundle = CalibrationBundle(ds.lang, ids, [], proxies, E[ids], Xq, tr, va, sample_distractors(ds.N, ids, seed=seed), E.mean(0))
             X_dis = E[bundle.distractor_ids]
@@ -72,7 +81,7 @@ def run(args) -> None:
                 rec = {"dataset": args.dataset, "src": src, "tgt": tgt, "K": K, "seed": seed, "op": op, "lambda_rel": lam}
                 for mode in ("stage1", "auto"):
                     bridge = SpaceBridge(**kw)
-                    fit = bridge.fit(bundle, Y, mode=mode, X_distractor=X_dis, Y_doc_raw=E_t[ids])
+                    fit = bridge.fit(bundle, Y, mode=mode, X_distractor=X_dis, Y_doc_raw=Y_doc)
                     r = ret(evaluate(bridge.transform_query(emb[tgt]["q_tgt"]), E))
                     sig = {**fit["val_metrics"], **{k: fit["quality"]["fit"][k] for k in ("val_r2", "val_resid_cos")}}
                     rec[mode] = {"rho_ceil": r, "signals": {k: sig[k] for k in SIGNALS}, "stage2_step": fit.get("stage2_best_step")}
@@ -120,7 +129,7 @@ def summarize(paths: list[Path], metric: str) -> None:
             y = np.array([x["stage1"]["rho_ceil"][metric] for x in c])
             for s in SIGNALS:
                 x = np.array([z["stage1"]["signals"][s] for z in c])
-                cors[s].append(_spearman(x, y))
+                cors[s].append(spearman(x, y))
         print(f"| {d} | " + " | ".join(f"{np.nanmean(cors[s]):+.2f}" for s in SIGNALS) + " |")
     print("\n## Which candidate the agree@10 signal picks vs. the best one (counts over fits)\n")
     for d, flist in sorted(by_ds.items()):
@@ -133,16 +142,10 @@ def summarize(paths: list[Path], metric: str) -> None:
         print(f"- {d}: agree@10 picks {dict(picked)}; best after Stage 2 {dict(best)}")
 
 
-def _spearman(a: np.ndarray, b: np.ndarray) -> float:
-    ra, rb = np.argsort(np.argsort(a)), np.argsort(np.argsort(b))
-    if ra.std() == 0 or rb.std() == 0:
-        return float("nan")
-    return float(np.corrcoef(ra, rb)[0, 1])
-
-
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", default="fiqa")
+    p.add_argument("--doc-pair-tokens", type=int, default=DOC_PAIR_TOKENS, help="anchor-doc length, as mount encodes them (default: the library's; 0: full length)")
     p.add_argument("--K", type=int, nargs="*", default=[2048])
     p.add_argument("--seeds", type=int, nargs="*", default=[0])
     p.add_argument("--tiers", nargs="*", default=["1", "3"])

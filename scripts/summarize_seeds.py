@@ -71,7 +71,7 @@ def main() -> None:
                     diffs += d
             if per_seed:
                 sd = np.std(per_seed, ddof=1) if len(per_seed) > 1 else 0.0
-                a = np.asarray(diffs)  # 95% bootstrap CI of the mean over (pair, seed) cells
+                a = np.asarray(diffs)  # bootstrap over this table's (pair, seed) cells, which share queries: it describes this table, not new queries or corpora
                 lo, hi = np.percentile(a[rng.integers(0, len(a), (2000, len(a)))].mean(1), [2.5, 97.5])
                 print(f"| {ds} | {K} | {new} − {base} | {' / '.join(f'{g:+.1f}' for g in per_seed)} | "
                       f"{np.mean(per_seed):+.1f} ± {sd:.1f} | [{lo:+.1f}, {hi:+.1f}] | {sum(x > 0 for x in diffs)}/{len(diffs)} |")

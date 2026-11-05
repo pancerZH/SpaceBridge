@@ -35,7 +35,7 @@ def live_encoder(key: str, task: str, device: str) -> SentenceTransformerEncoder
 
 def time_mount(args, ds) -> dict:
     store = Encoder(MODELS[args.index_model], args.device).docs_store(ds.titles, ds.texts).prefix(ds.N)
-    index = Index(store, ds.texts, ds.titles)
+    index = ds.index_over(store)
     exclude = np.union1d(sorted({d for rel in ds.qrels for d in rel}), ds.self_rows[ds.self_rows >= 0])
     src = MountEncoder(MODELS[args.index_model], ds.task, args.device)
     bundle = freeze(index, src, ds.lang, args.seed, args.K, anchor_select="random", exclude=exclude, device=args.device)
@@ -87,7 +87,7 @@ def main() -> None:
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
 
-    key = f"{args.mode}|{args.dataset}|{args.model}|{args.device}|t{args.threads}" + (f"|K{args.K}" if args.mode == "mount" else "")
+    key = f"{args.mode}|{args.dataset}|{args.model}|{args.device}|t{args.threads}" + (f"|K{args.K}" if args.mode == "mount" else "") + (f"|N{args.max_docs}" if args.max_docs else "")
     if args.out.exists() and key in {r["key"] for r in durable.read_jsonl(args.out)[0]}:
         durable.progress(f"{key}: already recorded")
         return

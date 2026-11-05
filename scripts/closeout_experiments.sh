@@ -1,5 +1,6 @@
 #!/bin/bash
-# Phase 0 close-out validation on MS MARCO passage (dev queries; never used for any decision).
+# Historical: the driver of the first MS MARCO validation, kept to show how those records were made. Current experiments use scripts/steps.sh.
+# Phase 0 close-out validation on MS MARCO passage (dev queries).
 #
 # Tests the shipped default engine where Phase 0 has no evidence yet: real short web queries, untitled passages
 # (lead proxies: the case where Stage 2 can hurt with no label-free signal noticing), and a 1M-passage index.
@@ -29,7 +30,9 @@ step() {  # name, then spacebridge-bench arguments
   local rc=$?
   [ $rc -eq 0 ] && touch "$OUT/$name.done"
   echo "end $name exit $rc $(date '+%F %T')"
+  [ $rc -eq 0 ] || failed="$failed $name"
 }
+failed=""
 
 SEEDS="0 1 2"
 
@@ -56,4 +59,8 @@ step ms1m_rerank --dataset msmarco-1m --tier 1 3 --rows 0a 0b 8b 9n 9 9w --K 204
 step ms1m_mount --dataset msmarco-1m --tier 1 3 --pair minilm:bge-large-en minilm:qwen3-0.6b --rows 8 8b --K 2048 \
   --seed 0 --time-mount
 
+if [ -n "$failed" ]; then
+  echo "FAILED:$failed $(date '+%F %T')"
+  exit 1
+fi
 echo "ALL DONE $(date '+%F %T')"

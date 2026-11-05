@@ -28,9 +28,7 @@ SETTINGS = [  # (mode, restore_source_mean)
 TARGET = "recall@30"
 
 
-def spearman(a, b) -> float:
-    ra, rb = np.argsort(np.argsort(a)), np.argsort(np.argsort(b))
-    return float(np.corrcoef(ra, rb)[0, 1])
+from spacebridge_bench.metrics import spearman  # noqa: E402  ties get average ranks; a constant side is undefined
 
 
 def main() -> None:

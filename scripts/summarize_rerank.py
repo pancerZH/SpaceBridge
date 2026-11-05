@@ -77,7 +77,7 @@ def main() -> None:
                 f"{min(r['rho_ceil']['ndcg@5'] for r in rs):.3f}",
                 f"{np.mean([r['rho_ceil']['recall@5'] for r in rs]):.3f}",
                 f"{np.mean([r['rho_ceil']['ndcg@10'] for r in rs]):.3f}",
-                f"{np.mean([r['rerank_ms_per_query'] for r in rs]):.0f}",
+                f"{np.mean([r.get('rerank_ms_first_query_min3', r.get('rerank_ms_per_query')) for r in rs]):.0f}",
             ])
     print(table(["reranker", "row", "depth", "mean ρceil nDCG@5", "worst pair", "mean ρceil R@5", "mean ρceil nDCG@10", "ms / query"], rows))
 

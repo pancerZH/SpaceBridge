@@ -4,7 +4,7 @@ import time
 import warnings
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Dict, Literal, Optional
+from typing import Any, Dict, Literal, Optional, get_args
 
 import numpy as np
 import torch
@@ -13,6 +13,7 @@ from sklearn.isotonic import IsotonicRegression
 
 from . import storage
 from .bundle import CalibrationBundle
+from .identity import CorpusFingerprint
 from .quality import RERANK_POOL_BY_GRADE, QualityReport, index_size_check, language_score, load_calibration, score_report, stage2_health
 from .refine import RefineConfig, refine
 from .solvers import LAMBDAS_REL, naive_procrustes, ridge_path, stiefel_procrustes
@@ -46,11 +47,12 @@ def topk_agreement(Q: torch.Tensor, pool: torch.Tensor, teacher_top: torch.Tenso
 
 
 def retrieval_stats(Q: torch.Tensor, pool: torch.Tensor, targets: torch.Tensor, k: int = VAL_K) -> dict:
-    """Recall@k and MRR@k when each query in Q has exactly one relevant row ``targets[i]`` in pool."""
+    """Recall@k and MRR@k when each query in Q has exactly one relevant row ``targets[i]`` in pool. A target tied with other rows
+    ranks after all of them: the pessimistic reading, since a top-k can't return every tied row, and collapsed scores read as a failure."""
     rank = []
     for s in range(0, Q.shape[0], SCORE_BLOCK):
         scores = Q[s : s + SCORE_BLOCK] @ pool.T
-        rank.append((scores > scores.gather(1, targets[s : s + SCORE_BLOCK, None])).sum(1))
+        rank.append((scores >= scores.gather(1, targets[s : s + SCORE_BLOCK, None])).sum(1) - 1)
     rank = torch.cat(rank)
     hit = rank < k
     return {
@@ -70,17 +72,19 @@ def validation_metrics(Q_student: torch.Tensor, Q_teacher: torch.Tensor, pool: t
     """
     out = {"agree@10": 0.0, "nbr_recall@10": 0.0, "nbr_recall@30": 0.0, "nbr_recall@100": 0.0}
     corr, gap, gap_sd, n = [], [], [], Q_student.shape[0]
+    val_k = min(VAL_K, pool.shape[0])
+    others = min(VAL_K, pool.shape[0] - 1)  # the teacher's neighbours, own doc excluded
     for s in range(0, n, SCORE_BLOCK):
         S, T = Q_student[s : s + SCORE_BLOCK] @ pool.T, Q_teacher[s : s + SCORE_BLOCK] @ pool.T
         rows = torch.arange(S.shape[0], device=own.device)
-        teacher_top = T.topk(VAL_K, dim=1).indices
+        teacher_top = T.topk(val_k, dim=1).indices
         student_top = S.topk(min(100, pool.shape[0]), dim=1).indices  # sorted, so prefixes are the top-10 and top-30
-        out["agree@10"] += (student_top[:, :VAL_K, None] == teacher_top[:, None, :]).any(-1).float().sum().item() / VAL_K
+        out["agree@10"] += (student_top[:, :val_k, None] == teacher_top[:, None, :]).any(-1).float().sum().item() / val_k
         T_other = T.clone()
         T_other[rows, own[s : s + SCORE_BLOCK]] = -torch.inf
-        nbrs = T_other.topk(VAL_K, dim=1).indices
+        nbrs = T_other.topk(others, dim=1).indices
         for k in (10, 30, 100):
-            out[f"nbr_recall@{k}"] += (nbrs[:, :, None] == student_top[:, None, : k]).any(-1).float().sum().item() / VAL_K
+            out[f"nbr_recall@{k}"] += (nbrs[:, :, None] == student_top[:, None, : k]).any(-1).float().sum().item() / others
         Sc, Tc = S - S.mean(1, keepdim=True), T - T.mean(1, keepdim=True)
         corr.append((Sc * Tc).sum(1) / (Sc.norm(dim=1) * Tc.norm(dim=1)))
         top30 = T_other.topk(min(30, pool.shape[0] - 1), dim=1).values
@@ -109,7 +113,7 @@ class SpaceBridge:
         if device.startswith("cuda") and not torch.cuda.is_available():
             device = "cpu"
         self.device = device
-        self.restore_source_mean = restore_source_mean  # False reproduces v2.3 behavior (Ablation Row 3b)
+        self.restore_source_mean = restore_source_mean  # False strips the source query mean (ablation Row 3b)
         # Least-squares maps shrink query residuals toward 0, so the restored mean dominates and
         # queries drift toward the average query; rescaling W to the native residual norm undoes it.
         self.match_residual_norm = match_residual_norm
@@ -133,6 +137,27 @@ class SpaceBridge:
         self._support_anchors: Optional[np.ndarray] = None  # (K_train, d_t) unit-norm centered target proxies
         self._conf_map: Optional[tuple[np.ndarray, np.ndarray]] = None  # isotonic support -> agreement knots
         self._val_pool: Optional[tuple] = None  # (anchor docs, distractors) as passed to fit(), for language validation
+        self.corpus: Optional[CorpusFingerprint] = None  # set by mount: the corpus and row order this map belongs to
+        self.src_encoder: Optional[dict] = None
+        self.tgt_encoder: Optional[dict] = None
+
+    def _reset_fit_state(self) -> None:
+        """Forgets every result of an earlier fit, so a fit that fails or differs in kind can't leave any of it behind."""
+        self.mu_x_query, self.W = None, None
+        self.mu_y_by_lang = {}
+        self.status, self.metrics, self.quality = "uninitialized", {}, None
+        self.stage2_checkpoints, self.stage2_signals = [], None
+        self._support_anchors, self._conf_map, self._val_pool = None, None, None
+        self.corpus, self.src_encoder, self.tgt_encoder = None, None, None
+
+    @staticmethod
+    def _check_calibration(**arrays: np.ndarray) -> None:
+        """Rejects calibration embeddings no map can be fitted on, before they reach a solver as NaNs."""
+        for name, a in arrays.items():
+            if not np.isfinite(a).all():
+                raise ValueError(f"calibration embeddings {name} aren't finite")
+            if not np.ptp(a, axis=0).any():
+                raise ValueError(f"calibration embeddings {name} are all the same vector: a collapsed or constant encoder?")
 
     def save(self, path: str | Path) -> None:
         """Writes what serving needs: the map, the means, the quality report and the confidence map (crash-safe)."""
@@ -147,7 +172,10 @@ class SpaceBridge:
         meta = {
             "src_lang": self.src_lang, "restore_source_mean": self.restore_source_mean, "status": self.status,
             "metrics": self.metrics, "quality": None if self.quality is None else asdict(self.quality),
+            "src_encoder": self.src_encoder, "tgt_encoder": self.tgt_encoder,
         }
+        if self.corpus is not None:
+            meta["corpus"], arrays["corpus_vectors"] = self.corpus.to_meta(), self.corpus.vectors
         storage.save_dir(path, "fitted-bridge", arrays, meta)
 
     @classmethod
@@ -158,6 +186,8 @@ class SpaceBridge:
         bridge.src_lang, bridge.status, bridge.metrics = meta["src_lang"], meta["status"], meta["metrics"]
         bridge.W, bridge.mu_x_query = arrays["W"], arrays["mu_x_query"]
         bridge.mu_y_by_lang = {name.split("/", 1)[1]: a for name, a in arrays.items() if name.startswith("mu_y/")}
+        bridge.corpus = CorpusFingerprint.from_saved(meta.get("corpus"), arrays.get("corpus_vectors"))
+        bridge.src_encoder, bridge.tgt_encoder = meta.get("src_encoder"), meta.get("tgt_encoder")
         bridge._support_anchors = arrays.get("support_anchors")
         if "conf_x" in arrays:
             bridge._conf_map = (arrays["conf_x"], arrays["conf_y"])
@@ -184,7 +214,7 @@ class SpaceBridge:
         pairs: Pairs = "query",
         X_distractor: Optional[np.ndarray] = None,
         Y_doc_raw: Optional[np.ndarray] = None,
-    ) -> Dict[str, float]:
+    ) -> Dict[str, Any]:
         """Fits the affine query map and computes rho_val / status.
 
         Args:
@@ -199,6 +229,10 @@ class SpaceBridge:
                 doc<->doc pairs (each centered on its own doc-cone mean) to Stage 1 and 2; validation stays on
                 query proxies.
         """
+        if mode not in get_args(Mode):
+            raise ValueError(f"unknown fit mode {mode!r}; choose from {get_args(Mode)}")
+        if pairs not in get_args(Pairs):
+            raise ValueError(f"unknown pair type {pairs!r}; choose from {get_args(Pairs)}")
         if bundle.X_query_raw is None:
             raise ValueError("this bundle has no source-model embeddings: use fit_source_free()")
         if mode == "auto" and pairs != "query":
@@ -210,6 +244,8 @@ class SpaceBridge:
                 "the default auto fit uses doc<->doc pairs: pass Y_doc_raw (anchor docs encoded with the "
                 "target doc prompt), or construct SpaceBridge(doc_pairs=False)"
             )
+        self._reset_fit_state()
+        self._check_calibration(Y_raw=Y_raw, X_query_raw=bundle.X_query_raw, X_doc_raw=bundle.X_doc_raw)
         Y = self._t(Y_raw)
         Xq, Xd = self._t(bundle.X_query_raw), self._t(bundle.X_doc_raw)
         X_pairs = Xq if pairs == "query" else Xd
@@ -243,7 +279,7 @@ class SpaceBridge:
                 out["doc_mrr"] = retrieval_stats(Qd, sel_pool, va)["mrr"]
             return out
 
-        info: Dict[str, float] = {"mode": mode, "pairs": pairs}
+        info: Dict[str, Any] = {"mode": mode, "pairs": pairs}
         self._sync()
         t0 = time.perf_counter()
         if mode == "naive":
@@ -270,7 +306,8 @@ class SpaceBridge:
             candidates = []
             ops = self.stage1_operators if mode in ("stage1", "auto") else (mode,)
             if "stiefel" in ops:
-                W_s, s_info = stiefel_procrustes(Y_fit, X_fit)
+                # Without residual norm matching the scale stays in W, so it has to be the right one for this map.
+                W_s, s_info = stiefel_procrustes(Y_fit, X_fit, objective_scale=not self.match_residual_norm)
                 W_s = rescale(W_s)
                 candidates.append((val_score(W_s), W_s, {"solver": "stiefel", "rank": s_info["rank"], "scale": s_info["scale"]}))
             if "ridge" in ops:
@@ -293,7 +330,7 @@ class SpaceBridge:
                 Y_rows, teacher_rows = torch.cat([Y_rows, Ydc]), torch.cat([teacher_rows, Xd[tr]])
                 labels = torch.cat([labels, labels])
             # Stopping signal: held-out own-doc MRR under the agreement floor. Stage 2 lowers teacher agreement even
-            # when it improves real retention, so stopping on agree@10 (the v2 signal) stopped it at step 0 (M2).
+            # when it improves real retention, so selecting on agree@10 alone would keep step 0.
             W, r_info = refine(W, mu_rows, Y_rows, teacher_rows, Xd[tr], stage2_signals, self.refine_config, labels)
             self._sync()
             info["stage2_ms"] = 1e3 * (time.perf_counter() - t0)
@@ -345,14 +382,22 @@ class SpaceBridge:
     def fit_source_free(
         self, bundle: CalibrationBundle, Y_query_raw: np.ndarray, Y_doc_raw: np.ndarray, X_distractor: Optional[np.ndarray] = None,
         stage2: bool = True, center: str = "doc", operator: str = "stiefel", stage2_rows: str = "both",
-    ) -> Dict[str, float]:
+    ) -> Dict[str, Any]:
         """Fits without the source model, for an index whose model is gone (design §4.5): only stored vectors and M_tgt.
 
         Queries stay in the target model's own geometry: they are centered on its *doc* mean and restored on the source
         doc mean, so a doc-pair map carries the target's query/doc relation across. With no teacher, Stage 2 uses the
         proxies' own-doc retrieval and has no KL term, and the quality report has no score. ``operator="select"`` also
-        tries ridge maps and picks by own-doc MRR, which picked worse maps on Tier 3 (FiQA, design §4.5).
+        tries ridge maps and picks by own-doc MRR, which picked worse maps across families (FiQA, design §4.5).
         """
+        if center not in ("doc", "query"):
+            raise ValueError(f"unknown centering {center!r}; choose 'doc' or 'query'")
+        if operator not in ("stiefel", "select"):
+            raise ValueError(f"unknown source-free operator {operator!r}; choose 'stiefel' or 'select'")
+        if stage2_rows not in ("both", "proxies", "docs"):
+            raise ValueError(f"unknown Stage-2 rows {stage2_rows!r}; choose 'both', 'proxies' or 'docs'")
+        self._reset_fit_state()
+        self._check_calibration(Y_query_raw=Y_query_raw, Y_doc_raw=Y_doc_raw, X_doc_raw=bundle.X_doc_raw)
         Yq, Yd, Xd = self._t(Y_query_raw), self._t(Y_doc_raw), self._t(bundle.X_doc_raw)
         tr = torch.as_tensor(bundle.train_idx, device=self.device)
         va = torch.as_tensor(bundle.val_idx, device=self.device)
@@ -373,10 +418,10 @@ class SpaceBridge:
         def mrr(W: torch.Tensor, pool_: torch.Tensor) -> float:
             return retrieval_stats(self._project(Yq[va], mu_y, mu_x, W), pool_, va)["mrr"]
 
-        info: Dict[str, float] = {"mode": "source_free", "pairs": "doc", "doc_pairs": len(tr)}
+        info: Dict[str, Any] = {"mode": "source_free", "pairs": "doc", "doc_pairs": len(tr)}
         t0 = time.perf_counter()
         candidates = []
-        W_s, s_info = stiefel_procrustes(Ydc[tr], Xdc[tr])
+        W_s, s_info = stiefel_procrustes(Ydc[tr], Xdc[tr], objective_scale=not self.match_residual_norm)
         W_s = rescale(W_s)
         candidates.append((mrr(W_s, sel_pool), W_s, {"solver": "stiefel", "rank": s_info["rank"], "scale": s_info["scale"]}))
         if operator == "select":
@@ -392,7 +437,8 @@ class SpaceBridge:
             t0 = time.perf_counter()
             n = len(tr)
             rows = {"both": [Yqc[tr], Ydc[tr]], "proxies": [Yqc[tr]], "docs": [Ydc[tr]]}[stage2_rows]
-            mu_rows = mu_x.expand(len(rows) * n, -1)
+            restore = 1.0 if self.restore_source_mean else 0.0  # the map trained is the map served
+            mu_rows = (restore * mu_x).expand(len(rows) * n, -1)
             Y_rows, labels = torch.cat(rows), torch.cat([torch.arange(n, device=self.device)] * len(rows))
             cfg = replace(self.refine_config, alpha=0.0, stop_rule="tail")
 
@@ -469,8 +515,9 @@ class SpaceBridge:
         anchors = F.normalize(Y[tr] - mu_y, dim=-1)
         self._support_anchors = anchors.cpu().numpy()
         support = self._support(Y[va] - mu_y, anchors)
-        teacher = _top_ids(Xq[va], pool, VAL_K)
-        student = _top_ids(self._project(Y[va], mu_y, mu_x, W), pool, VAL_K)
+        val_k = min(VAL_K, pool.shape[0])
+        teacher = _top_ids(Xq[va], pool, val_k)
+        student = _top_ids(self._project(Y[va], mu_y, mu_x, W), pool, val_k)
         agree = (student[:, :, None] == teacher[:, None, :]).any(-1).float().mean(1)
         iso = IsotonicRegression(out_of_bounds="clip").fit(support.cpu().numpy(), agree.cpu().numpy())
         self._conf_map = (iso.X_thresholds_, iso.y_thresholds_)
@@ -504,8 +551,8 @@ class SpaceBridge:
     def register_query_language(
         self, lang: str, Y_flores_src_lang: np.ndarray, Y_flores_query_lang: np.ndarray
     ) -> None:
-        """Registers the language-cone shift from M_tgt query-prompt embeddings of the same
-        256 FLORES dev sentences in src_lang and in lang (<80ms)."""
+        """Registers the language-cone shift from M_tgt query-prompt embeddings of the same parallel sentences in src_lang and
+        in lang. By default those are the Belebele-filtered FLORES dev sentences (94 for Chinese), else 256 Tatoeba pairs (Chinese only)."""
         if self.src_lang not in self.mu_y_by_lang:
             raise RuntimeError("fit() must be called before register_query_language()")
         shift = Y_flores_query_lang.mean(axis=0) - Y_flores_src_lang.mean(axis=0)

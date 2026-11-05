@@ -27,6 +27,9 @@ from spacebridge.quality import load_calibration
 CANDIDATES = ("en", "abs", "drop", "ratio", "rratio", "mratio")
 
 
+from spacebridge_bench.metrics import spearman as tie_aware_spearman  # noqa: E402
+
+
 def predictors(r: dict, cal: dict, tag: str) -> dict:
     lv = r["fit"]["lang_val"][tag]
     f = lambda a: 100.0 * (cal["intercept"] + cal["coef"][0] * (a - cal["mean"][0]) / cal["scale"][0])
@@ -43,10 +46,7 @@ def predictors(r: dict, cal: dict, tag: str) -> dict:
 
 
 def spearman(a, b) -> float:
-    if len(a) < 3:
-        return float("nan")
-    ra, rb = np.argsort(np.argsort(a)), np.argsort(np.argsort(b))
-    return float(np.corrcoef(ra, rb)[0, 1])
+    return float("nan") if len(a) < 3 else tie_aware_spearman(a, b)
 
 
 def main() -> None:

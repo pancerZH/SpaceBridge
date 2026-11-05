@@ -5,13 +5,15 @@ size, query proxies, the fixed split, 128-token anchor docs, doc pairs by the qu
 """
 
 import time
+import warnings
 from typing import Callable, Mapping, Optional, Protocol, Sequence
 
 import numpy as np
 
-from .anchors import default_anchor_count, make_query_proxies, make_split, random_anchors, resolve_anchor_method, sample_distractors, select_anchors
+from .anchors import MIN_ANCHORS, MIN_INDEX_DOCS, default_anchor_count, make_query_proxies, make_split, random_anchors, resolve_anchor_method, sample_distractors, select_anchors
 from .bridge import DOC_PAIR_TOKENS, SpaceBridge
 from .bundle import CalibrationBundle
+from .identity import CorpusFingerprint, encoder_identity, sample_rows
 from .language import load_flores, load_shift_bank
 from .refine import RefineConfig
 
@@ -19,7 +21,8 @@ from .refine import RefineConfig
 class QueryEncoder(Protocol):
     """An embedding model with its native prompts. Returns L2-normalized float32 rows.
 
-    ``size_class`` is ``"large"`` for ~4B models and above, whose doc-pair pass is skipped; anything else keeps it.
+    ``size_class`` is ``"large"`` for ~4B models and above, whose doc-pair pass is skipped; anything else keeps it. An optional
+    ``identity`` property, a JSON-ready dict of the model and its settings, lets artifacts detect a different encoder later.
     """
 
     size_class: str
@@ -45,6 +48,14 @@ class Index:
     """An ``IndexReader`` over an array-like of vectors (a numpy array, a memory map, ``EmbeddingStore``) and text lists."""
 
     def __init__(self, vectors, texts: Sequence[str], titles: Optional[Sequence[str]] = None):
+        shape = getattr(vectors, "shape", None)
+        if shape is not None and len(shape) != 2:
+            raise ValueError(f"vectors must have shape (documents, dimensions), got {tuple(shape)}")
+        n = len(vectors)
+        if len(texts) != n:
+            raise ValueError(f"{n:,} vectors and {len(texts):,} texts: they must be row-aligned")
+        if titles is not None and len(titles) != n:
+            raise ValueError(f"{n:,} vectors and {len(titles):,} titles: they must be row-aligned")
         self._vectors, self._texts, self._titles = vectors, texts, titles
 
     def __len__(self) -> int:
@@ -58,6 +69,18 @@ class Index:
 
     def titles(self, ids: np.ndarray) -> list[str]:
         return [self._titles[i] if self._titles is not None else "" for i in ids]
+
+
+def check_vectors(index: IndexReader) -> None:
+    """Spot-checks stored vectors, on a sample so it stays cheap on a large or lazy index: finite, and unit length, the case that was measured."""
+    sample = np.asarray(index.vectors(sample_rows(len(index))), dtype=np.float64)
+    if sample.ndim != 2 or sample.shape[1] == 0:
+        raise ValueError(f"index.vectors must return (rows, dimensions), got shape {sample.shape}")
+    if not np.isfinite(sample).all():
+        raise ValueError("the index holds vectors that aren't finite")
+    norms = np.linalg.norm(sample, axis=1)
+    if np.abs(norms - 1).max() > 0.01:
+        warnings.warn(f"stored vectors aren't unit length (sampled norms {norms.min():.3f} to {norms.max():.3f}). Search is by inner product, and every result reported used L2-normalized vectors, so results on this index are unmeasured")
 
 
 def freeze(
@@ -84,8 +107,20 @@ def freeze(
         parallel_bank: (source-language, target-language) parallel sentences replacing corpus anchors (Regime L2, for a
             query model that cannot read the corpus language). No anchor is then an index row.
         validate_langs: query languages to prepare per-language validation for (FLORES ``devtest``, English index).
+
+    Raises ``ValueError`` below ``MIN_INDEX_DOCS`` documents or ``MIN_ANCHORS`` anchors, for an unknown ``anchor_select``, and for an
+    index that fails :func:`check_vectors`. At 2,048 documents or fewer every document is an anchor and there are no distractors.
     """
     N = len(index)
+    if N < MIN_INDEX_DOCS:
+        raise ValueError(f"an index needs at least {MIN_INDEX_DOCS} documents to calibrate on, and this one has {N}. Re-embedding this few documents is the better choice")
+    if K is not None and K < MIN_ANCHORS:
+        raise ValueError(f"K must be at least {MIN_ANCHORS}, got {K}")
+    if validate_langs and src_lang != "en":
+        raise ValueError(f"per-language validation uses FLORES pairs with English on one side, and this index is in {src_lang!r}")
+    resolve_anchor_method(N, anchor_select)  # rejects an unknown method before any work
+    check_vectors(index)
+    corpus = CorpusFingerprint.of(index)
     allowed = np.arange(N) if exclude is None else np.setdiff1d(np.arange(N), exclude)
     tgt_anchor_texts, titles = None, None
     if parallel_bank is not None:
@@ -126,12 +161,14 @@ def freeze(
         train_idx=train_idx,
         val_idx=val_idx,
         distractor_ids=distractor_ids,
-        # Diagnostics only, so a uniform sample will do; the index stays unread.
-        mu_x_doc=index.vectors(distractor_ids).mean(0),
+        # Diagnostics only, so a uniform sample will do; the index stays unread. With no distractors (every document is an anchor), the anchors.
+        mu_x_doc=index.vectors(distractor_ids).mean(0) if len(distractor_ids) else X_doc.mean(0),
         index_size=N,
         anchor_doc_titles=titles,
         tgt_anchor_texts=tgt_anchor_texts,
         language_validation=language_validation,
+        corpus=corpus,
+        src_encoder=encoder_identity(src_encoder),
     )
 
 
@@ -156,6 +193,8 @@ def mount(
         shift_banks: ``{lang: (source-language sentences, lang sentences)}``; default ``load_shift_bank`` (FLORES when the
             gated repo is accessible).
     """
+    if bundle.corpus is not None:
+        bundle.corpus.check(index, "this calibration bundle")
     timing = {}
 
     def timed(name: str, call: Callable):
@@ -165,7 +204,10 @@ def mount(
         return out
 
     # Doc pairs are all a source-model-free fit has, whatever the model's size.
-    use_doc_pairs = bundle.X_query_raw is None or tgt_encoder.size_class != "large" if doc_pairs is None else doc_pairs
+    if doc_pairs is not None:
+        use_doc_pairs = doc_pairs
+    else:
+        use_doc_pairs = bundle.X_query_raw is None or tgt_encoder.size_class != "large"
     static = bundle.tgt_anchor_texts is not None
     Y_query = timed("encode_proxies", lambda: tgt_encoder.encode_queries(bundle.tgt_anchor_texts if static else bundle.anchor_query_texts))
     Y_doc = None
@@ -175,7 +217,7 @@ def mount(
         Y_doc = timed("encode_anchor_docs", lambda: tgt_encoder.encode_docs(titles, texts, max_tokens=doc_pair_tokens or None))
     shifts, validation = {}, {}
     for lang in query_langs:
-        src_side, lang_side = (shift_banks or {}).get(lang) or load_shift_bank(lang)[:2]
+        src_side, lang_side = (shift_banks or {}).get(lang) or load_shift_bank(lang, src_lang=bundle.src_lang)[:2]
         shifts[lang] = timed(f"encode_shift_{lang}", lambda: (tgt_encoder.encode_queries(src_side), tgt_encoder.encode_queries(lang_side)))
         val = bundle.language_validation.get(lang)
         if val is not None:
@@ -197,4 +239,5 @@ def mount(
         if lang in validation:
             bridge.validate_query_language(lang, *validation[lang])
     bridge.metrics["mount"] = timing
+    bridge.corpus, bridge.src_encoder, bridge.tgt_encoder = bundle.corpus, bundle.src_encoder, encoder_identity(tgt_encoder)
     return bridge

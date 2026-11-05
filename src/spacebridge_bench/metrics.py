@@ -1,13 +1,19 @@
 """Retrieval metrics and retention ratios (design §2.1, §7.4)."""
 
 import numpy as np
+from scipy.stats import rankdata
 
 RECALL_KS = (5, 10, 30, 100)
 DEEP_RECALL_KS = (300, 1000)  # recall at rerank depth, for rankings that reach it
 
 
 def evaluate(ranked: np.ndarray, qrels: list[dict[int, int]]) -> dict[str, float]:
-    """Recall@{5,10,30,100}, MRR@10 and NDCG@{5,10}; ``qrels[i]`` maps doc row -> graded relevance."""
+    """Recall@{5,10,30,100}, MRR@10 and NDCG@{5,10}; ``qrels[i]`` maps doc row -> graded relevance.
+
+    Per query, then averaged over queries with equal weight. Recall is the share of the query's positives (relevance > 0) in the top
+    k rows given: on a list shorter than k, such as a reranked pool, that is recall of the list. nDCG has linear gain, log2(rank + 1)
+    discount and an ideal order over the query's judged positives; unjudged documents count as not relevant. Every query kept by a
+    loader has at least one positive in the corpus."""
     return {name: float(v.mean()) for name, v in per_query(ranked, qrels).items()}
 
 
@@ -27,11 +33,38 @@ def per_query(ranked: np.ndarray, qrels: list[dict[int, int]]) -> dict[str, np.n
     return {name: np.asarray(v) for name, v in out.items()}
 
 
+def recall_at(ranked: np.ndarray, qrels: list[dict[int, int]], k: int) -> np.ndarray:
+    """Per-query Recall@k at any cutoff, over the whole of the first k rows given."""
+    return np.array([len({d for d, g in rel.items() if g > 0}.intersection(row[:k].tolist())) / len([g for g in rel.values() if g > 0]) for row, rel in zip(ranked, qrels)])
+
+
 def bootstrap_ratio_ci(num: np.ndarray, den: np.ndarray, n: int = 2000, seed: int = 0) -> tuple[float, float]:
-    """95% paired-bootstrap interval of mean(num) / mean(den) over queries."""
+    """95% paired-bootstrap interval of mean(num) / mean(den) over queries, for one fixed denominator."""
     idx = np.random.default_rng(seed).integers(0, len(num), size=(n, len(num)))
     ratios = num[idx].mean(1) / den[idx].mean(1)
     return float(np.percentile(ratios, 2.5)), float(np.percentile(ratios, 97.5))
+
+
+def bootstrap_retention_ci(bridge: np.ndarray, native: np.ndarray, oracle: np.ndarray, n: int = 2000, seed: int = 0) -> tuple[float, float]:
+    """95% percentile-bootstrap interval of retention over queries, resampling (bridge, native, re-index) triples together and taking
+    the weaker baseline again in every replicate: which baseline is weaker is itself part of the statistic. A replicate whose
+    denominator is zero has no defined ratio and is dropped, so the interval is conditional on a nonzero baseline."""
+    idx = np.random.default_rng(seed).integers(0, len(bridge), size=(n, len(bridge)))
+    den = np.minimum(native[idx].mean(1), oracle[idx].mean(1))
+    num = bridge[idx].mean(1)
+    ok = den > 0
+    if not ok.any():
+        return float("nan"), float("nan")
+    ratios = num[ok] / den[ok]
+    return float(np.percentile(ratios, 2.5)), float(np.percentile(ratios, 97.5))
+
+
+def spearman(a, b) -> float:
+    """Spearman correlation with average ranks for ties; undefined (NaN) when either side is constant or shorter than 2."""
+    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    if len(a) < 2 or np.ptp(a) == 0 or np.ptp(b) == 0:
+        return float("nan")
+    return float(np.corrcoef(rankdata(a), rankdata(b))[0, 1])
 
 
 def _ndcg(row: np.ndarray, rel: dict[int, int], k: int) -> float:

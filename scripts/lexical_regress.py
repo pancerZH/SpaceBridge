@@ -41,7 +41,7 @@ def main() -> None:
         rr.unload()
         c = Ctx(Path("outputs/phase1/hp_study"), args.corpus, tier, args.seed)
         ds, n = c.ds, min(args.queries, len(c.ds.queries))
-        lexical = cached_lexical(ds, Index(c.E_src, ds.texts, ds.titles))
+        lexical = cached_lexical(ds, ds.index_over(c.E_src))
         bridged = search(c.Q_hat[:n], c.E_src, 1000, DEV, exclude=ds.self_rows[:n])
         docs = _DocTexts(ds.titles, ds.texts)
         for budget in args.budgets:

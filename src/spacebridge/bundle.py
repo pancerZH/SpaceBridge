@@ -7,6 +7,7 @@ from typing import Optional
 import numpy as np
 
 from . import storage
+from .identity import CorpusFingerprint
 
 _ARRAYS = ("anchor_ids", "X_doc_raw", "train_idx", "val_idx", "distractor_ids")
 _OPTIONAL_ARRAYS = ("X_query_raw", "mu_x_doc")
@@ -31,6 +32,8 @@ class CalibrationBundle:
     # {lang: {"src": sentences, "lang": sentences, "X_query": (n, d_s), "X_doc": (n, d_s)}}: held-out parallel sentences
     # with the source model's embeddings, for per-language validation at mount.
     language_validation: dict[str, dict] = field(default_factory=dict)
+    corpus: Optional[CorpusFingerprint] = None  # the corpus and row order this bundle belongs to; None if saved before these existed
+    src_encoder: Optional[dict] = None          # what the source encoder says it is, if it says
 
     @property
     def K(self) -> int:
@@ -43,6 +46,9 @@ class CalibrationBundle:
             arrays[f"lang_val/{lang}/X_query"], arrays[f"lang_val/{lang}/X_doc"] = val["X_query"], val["X_doc"]
         meta = {name: getattr(self, name) for name in _META}
         meta["language_validation"] = {lang: {"src": v["src"], "lang": v["lang"]} for lang, v in self.language_validation.items()}
+        meta["src_encoder"] = self.src_encoder
+        if self.corpus is not None:
+            meta["corpus"], arrays["corpus_vectors"] = self.corpus.to_meta(), self.corpus.vectors
         storage.save_dir(path, "calibration-bundle", arrays, meta)
 
     @classmethod
@@ -54,4 +60,5 @@ class CalibrationBundle:
         }
         fixed = {name: arrays[name] for name in _ARRAYS}
         optional = {name: arrays.get(name) for name in _OPTIONAL_ARRAYS}
-        return cls(language_validation=language_validation, **meta, **fixed, **optional)
+        corpus = CorpusFingerprint.from_saved(meta.pop("corpus", None), arrays.get("corpus_vectors"))
+        return cls(language_validation=language_validation, corpus=corpus, **meta, **fixed, **optional)

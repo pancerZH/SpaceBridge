@@ -112,7 +112,7 @@ class Ctx:
         if not path.exists():
             ds = self.ds
             positives = np.array(sorted({d for rel in ds.qrels for d in rel}))
-            pool = Index(self.E_src, ds.texts, ds.titles)
+            pool = ds.index_over(self.E_src)
             src, tgt = MountEncoder(MODELS[self.src], ds.task, DEV), MountEncoder(MODELS[self.tgt], ds.task, DEV)
             select = "random" if self.K == 8192 else "auto"
             bundle = freeze(pool, src, ds.lang, self.seed, self.K, anchor_select=select, exclude=positives, device=DEV)

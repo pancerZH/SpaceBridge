@@ -94,7 +94,7 @@ def main() -> None:
         durable.progress(f"cell {n}/{len(cells)} {cell}: start")
         E_src, Q_src, native = ranked_for(src_key, ds, sizes, ds.index_lang_queries, args.device)
         E_tgt, Q_tgt, oracle = ranked_for(tgt_key, ds, sizes, ds.queries, args.device)
-        pool = Index(E_src.prefix(sizes[0]), ds.texts, ds.titles)
+        pool = Index(E_src.prefix(sizes[0]), ds.texts[: sizes[0]], ds.titles[: sizes[0]])
         src, tgt = MountEncoder(MODELS[src_key], ds.task, args.device), MountEncoder(MODELS[tgt_key], ds.task, args.device)
         bundle = freeze(pool, src, ds.lang, seed, K, anchor_select="random", exclude=exclude, device=args.device)
         src.unload()

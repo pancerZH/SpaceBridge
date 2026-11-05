@@ -24,5 +24,17 @@
     "trec-covid": 0.10272358616356776
   },
   "n_fits": 306,
-  "experimental": false
+  "experimental": false,
+  "experimental_means": "False only means the dataset-level error was within the band on at least 4 of the 6 datasets. It is not a reliability claim: the band is the leave-one-dataset-out RMSE used for model selection, not a prediction interval.",
+  "calibrated_on": [
+    "arguana",
+    "fiqa",
+    "nfcorpus",
+    "nq",
+    "scidocs",
+    "trec-covid"
+  ],
+  "calibrated": "2026-10-31",
+  "applies_to": "English queries, indexes up to about 171K documents",
+  "fitted_by": "scripts/calibrate_quality.py"
 }

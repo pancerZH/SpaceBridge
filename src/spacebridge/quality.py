@@ -3,7 +3,7 @@
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 
@@ -33,8 +33,8 @@ LANGUAGE_SCORE_SD = 0.051
 
 @dataclass
 class QualityReport:
-    details: dict[str, dict[str, float]]
-    score: Optional[float] = None               # predicted % ceiling Recall@30 retention
+    details: dict[str, dict[str, Any]]          # measurements by group; "language" nests one level further, per query language
+    score: Optional[float] = None               # predicted Recall@30 retention, in percent. Not clamped: retention can exceed 100
     band: Optional[tuple[float, float]] = None  # score ± one residual s.d. of the calibration fit
     grade: Optional[str] = None
     rerank_pool: int = DEFAULT_RERANK_POOL       # advisory routing: candidates to send to the cross-encoder

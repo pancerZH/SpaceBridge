@@ -50,7 +50,7 @@ def stat(rs: list[dict]) -> dict:
         "abs": float(np.mean([r["metrics"]["ndcg@5"] for r in rs])), "ceil": float(min(native, oracle)), "native": float(native), "oracle": float(oracle),
         "ret": float(np.mean([r["rho_ceil"]["ndcg@5"] for r in rs])),
         "lo": float(np.mean([r["ci_ceil"]["ndcg@5"][0] for r in rs])), "hi": float(np.mean([r["ci_ceil"]["ndcg@5"][1] for r in rs])),
-        "seeds": len(rs), "n_q": rs[0]["n_queries"], "ms": float(np.mean([r.get("rerank_ms_per_query", np.nan) for r in rs])),
+        "seeds": len(rs), "n_q": rs[0]["n_queries"], "ms": float(np.mean([r.get("rerank_ms_first_query_min3", r.get("rerank_ms_per_query", np.nan)) for r in rs])),
     }
 
 

@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 import spacebridge
+import spacebridge.identity
 from spacebridge import CalibrationBundle, Index, SpaceBridge, freeze, mount
 from spacebridge.anchors import make_query_proxies
 
@@ -69,7 +70,7 @@ def test_freeze_chooses_random_anchors_above_the_size_switch_without_reading_the
 
         def vectors(self, ids):
             self.rows_read += len(ids)
-            return np.ones((len(ids), 4), dtype=np.float32)
+            return np.full((len(ids), 4), 0.5, dtype=np.float32)
 
         def texts(self, ids):
             return [f"text {i}." for i in ids]
@@ -85,7 +86,7 @@ def test_freeze_chooses_random_anchors_above_the_size_switch_without_reading_the
     bundle = freeze(index, Encoder(), seed=3)
     assert bundle.K == spacebridge.default_anchor_count(len(index)) == 8192
     np.testing.assert_array_equal(bundle.anchor_ids, spacebridge.random_anchors(len(index), 8192, 3))
-    assert index.rows_read <= 8192 + 50_000
+    assert index.rows_read <= 8192 + 50_000 + 2 * spacebridge.identity.SAMPLE_ROWS  # plus the sample freeze checks and fingerprints
 
 
 def test_freeze_keeps_excluded_rows_out_of_the_anchors():

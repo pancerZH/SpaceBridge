@@ -21,7 +21,7 @@ def load_flores(lang: str, belebele_filter: bool = True) -> dict[str, dict]:
     Rule 6 of §7.1: sentences whose English text occurs inside a Belebele passage are dropped
     (``belebele_filter``; Belebele evaluates on FLORES text), and so are sentences that occur in both
     ``dev`` and ``devtest``. Returns ``{split: {"en": [...], lang: [...], "ids": [...]}}`` plus
-    ``"counts"`` (sentences before / after each filter). Downloads at runtime and caches only the filtered
+    ``"counts"`` (raw and kept totals per split, not per filter). Downloads at runtime and caches only the filtered
     pairs under the git-ignored ``data/flores/``; raises if the gated repo is not accessible.
     """
     tag = "belebele-filtered" if belebele_filter else "unfiltered"
@@ -67,29 +67,55 @@ def flores_available(lang: str) -> bool:
         return False
     try:
         load_flores(lang)
-    except Exception:  # no token, terms not accepted, offline
+    except OSError:  # no token, terms not accepted or offline; huggingface_hub's errors derive from OSError. Other errors are bugs and surface.
         return False
     return True
 
 
 SHIFT_BANKS = ("auto", "flores", "flores-unfiltered", "tatoeba")
+TATOEBA_CONFIGS = {"zh": "cmn-eng"}  # the only fallback implemented when FLORES is out of reach
 
 
-def load_shift_bank(query_lang: str, n: int = 256, bank: str = "auto") -> tuple[list[str], list[str], str]:
+def load_shift_bank(query_lang: str, n: int = 256, bank: str = "auto", src_lang: str = "en") -> tuple[list[str], list[str], str]:
     """Parallel (English, query-language) sentences for the language-cone shift (design §4.4), and the bank's name.
 
     ``auto``: the Belebele-filtered FLORES ``dev`` split when the gated repo is accessible (at most ``n`` pairs;
     the filter leaves 94 of 997 for zh, all of them used), else the first ``n`` human-translated Tatoeba pairs
-    from ``mteb/tatoeba-bitext-mining``. ``flores-unfiltered`` (ablation) skips the Belebele filter.
+    from ``mteb/tatoeba-bitext-mining``, which exists for Chinese only. ``flores-unfiltered`` (ablation) skips the Belebele filter.
+
+    Every default bank has English on its first side, so an index in another language needs its own: pass ``shift_banks`` to ``mount``.
     """
+    if src_lang != "en":
+        raise ValueError(
+            f"the default language banks pair English with the query language, and this index is in {src_lang!r}: "
+            f"pass mount(shift_banks={{{query_lang!r}: ({src_lang} sentences, {query_lang} sentences)}})"
+        )
+    if bank not in SHIFT_BANKS:
+        raise ValueError(f"unknown language bank {bank!r}; choose from {SHIFT_BANKS}")
     if bank == "auto":
-        bank = "flores" if flores_available(query_lang) else "tatoeba"
+        if query_lang in FLORES_CODES:
+            try:
+                load_flores(query_lang)
+                bank = "flores"
+            except OSError as e:
+                if query_lang not in TATOEBA_CONFIGS:
+                    raise ValueError(
+                        f"no language bank for {query_lang!r}: FLORES is out of reach ({e}), and the Tatoeba fallback covers only "
+                        f"{sorted(TATOEBA_CONFIGS)}. Accept the FLORES terms and log in to Hugging Face, or pass mount(shift_banks=...)."
+                    ) from e
+                bank = "tatoeba"
+        elif query_lang in TATOEBA_CONFIGS:
+            bank = "tatoeba"
+        else:
+            raise ValueError(f"no default language bank for {query_lang!r}: pass mount(shift_banks={{{query_lang!r}: (en sentences, {query_lang} sentences)}})")
     if bank in ("flores", "flores-unfiltered"):
         dev = load_flores(query_lang, belebele_filter=bank == "flores")["dev"]
         return dev["en"][:n], dev[query_lang][:n], bank
+    if query_lang not in TATOEBA_CONFIGS:
+        raise ValueError(f"the Tatoeba bank covers only {sorted(TATOEBA_CONFIGS)}, not {query_lang!r}")
     from datasets import load_dataset
 
-    config = {"zh": "cmn-eng"}[query_lang]
+    config = TATOEBA_CONFIGS[query_lang]
     ds = load_dataset("mteb/tatoeba-bitext-mining", config, split="test")
     pairs = [(e.strip(), q.strip()) for q, e in zip(ds["sentence1"], ds["sentence2"])][:n]
     return [e for e, _ in pairs], [q for _, q in pairs], "tatoeba"

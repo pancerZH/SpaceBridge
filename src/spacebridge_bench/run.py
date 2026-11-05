@@ -22,10 +22,10 @@ from spacebridge import (
 )
 from spacebridge.lexical import LEXICAL_SHARE
 
-from . import durable
+from . import durable, provenance
 from .datasets import DATASETS, FLORES_SPLITS, SHIFT_BANKS, RetrievalDataset, flores_available, load_beir, load_flores, load_shift_bank
 from .encode import Encoder, MountEncoder
-from .metrics import bootstrap_ratio_ci, per_query, retention
+from .metrics import bootstrap_retention_ci, per_query, retention, spearman
 from .models import MODELS
 from .rerank import RERANKERS, Reranker, rerank, rerank_pools, topk_jaccard
 from .search import cached_search, search
@@ -111,6 +111,7 @@ RERANK_DEPTH = {"9t": 10, "9u": 20, "9n": 30, "9": 60, "9w": 100, "9p": 150, "9q
 LEXICAL_CACHE = Path("data/cache/lexical")
 _LEXICAL: dict[Path, LexicalIndex] = {}  # one copy per process: 2.2 GB at 8.84M, and every seed and pair reads it
 CI_METRICS = ("recall@30", "ndcg@5", "ndcg@10")
+PER_QUERY_METRICS = ("ndcg@5", "recall@5", "recall@30", "recall@100")
 PROXY_STYLES = ("title", "title-any", "lead", "short")
 
 
@@ -172,6 +173,7 @@ def run_pair(
     doc_pair_tokens: int = DOC_PAIR_TOKENS, time_mount: bool = False, stage2_tau_scale: Optional[float] = None,
     stage2_curves: bool = False, stage2_rule: Optional[str] = None, shift_bank: str = "auto", anchor_bank: str = "corpus",
     anchor_select: str = "auto", full_index_diagnostics: bool = False, rerank_row: Optional[str] = None,
+    no_bridge: bool = False, per_query_path: Optional[Path] = None,
 ) -> list[dict]:
     src, tgt = MODELS[src_key], MODELS[tgt_key]
     K = min(K or default_anchor_count(ds.N), ds.N - int((ds.self_rows >= 0).sum()))
@@ -196,7 +198,7 @@ def run_pair(
                              "X_query": enc.queries(dt["en"], ds.task), "X_doc": enc.docs([""] * len(dt["en"]), dt["en"])}
     enc.unload()
     allowed = anchor_candidates(ds)
-    index = Index(E_src, ds.texts, ds.titles)
+    index = ds.index_over(E_src)
     bundle = freeze(
         index, MountEncoder(src, ds.task, device), ds.lang, seed, K,
         anchor_ids=None if static else cached_anchors(ds, src_key, E_src, allowed, K, seed, anchor_select),
@@ -352,6 +354,14 @@ def run_pair(
                     rec["confidence"] = _confidence_study(bridge, Q_tgt, ranked, native_ranked, pq, native_pq, oracle_pq)
         records.append(_score_record(rec, pq, native_pq, oracle_pq))
 
+    # What the records can't hold, per query, for intervals over aligned queries: "<row>/<system>/<metric>".
+    per_query_scores: dict[str, np.ndarray] = {}
+
+    def keep_per_query(row: str, system: str, pq: dict) -> None:
+        for m in PER_QUERY_METRICS:
+            if m in pq:
+                per_query_scores[f"{row}/{system}/{m}"] = np.asarray(pq[m], dtype=np.float32)
+
     # Same-language only: BM25 can't match a query against an index in another language.
     rerank_rows = [r for r in rows if r in RERANK_DEPTH and not (r in LEXICAL_ROWS and ds.query_lang)]
     if rerank_rows and rerankers:
@@ -361,7 +371,7 @@ def run_pair(
         if set(rerank_rows) & set(LEXICAL_ROWS):
             lexical = cached_lexical(ds, index)
             deepest = max(LEXICAL_ROWS[r] for r in rerank_rows if r in LEXICAL_ROWS) // LEXICAL_SHARE
-            lexical_top = [lexical.top(q, deepest, exclude=s) for q, s in zip(ds.queries, ds.self_rows.tolist())]
+            lexical_top = [lexical.top(q, deepest if not no_bridge else deepest * LEXICAL_SHARE, exclude=s) for q, s in zip(ds.queries, ds.self_rows.tolist())]
         for rr_key in rerankers:
             rr = Reranker(RERANKERS[rr_key], device)
             for row in rerank_rows:
@@ -392,11 +402,26 @@ def run_pair(
                     "bridge_vs_native": float(topk_jaccard(out["bridge"], out["native"]).mean()),
                     "native_vs_oracle": float(topk_jaccard(out["native"], out["oracle"]).mean()),
                 }
-                rec["rerank_ms_per_query"] = rr.timed_ms_per_query(ds.queries[0], [docs[j] for j in candidates], ds.task)
+                # A warm microbenchmark of one query, the fastest of three repeats: not typical latency. scripts/query_timing.py measures that.
+                rec["rerank_ms_first_query_min3"] = rr.timed_ms_per_query(ds.queries[0], [docs[j] for j in candidates], ds.task)
+                for name in ("native", "oracle"):
+                    keep_per_query(row, name, pqs[name])
+                keep_per_query(row, "bridge", pqs["bridge"])
                 if row in LEXICAL_ROWS:
-                    rec["baselines_lexical"] = _strict_retention({name: per_query(fixed[name], ds.qrels) for name in fixed})
+                    fixed_pqs = {name: per_query(fixed[name], ds.qrels) for name in fixed}
+                    rec["baselines_lexical"] = _strict_retention(fixed_pqs)
+                    keep_per_query(row, "native_bm25", fixed_pqs["native"])
+                    keep_per_query(row, "oracle_bm25", fixed_pqs["oracle"])
+                    if no_bridge:  # BM25's top of the whole budget and the reranker: the old index isn't used at all
+                        alone = rerank_pools(rr, [b[:depth] for b in lexical_top], ds.queries, docs, ds.task)
+                        pq_alone = per_query(alone, ds.qrels)
+                        rec["baseline_no_bridge"] = {m: float(v.mean()) for m, v in pq_alone.items()}
+                        keep_per_query(row, "no_bridge", pq_alone)
                 records.append(_score_record(rec, pqs["bridge"], pqs["native"], pqs["oracle"]))
             rr.unload()
+    if per_query_path is not None:
+        with durable.atomic_file(per_query_path) as f:
+            np.savez_compressed(f, **per_query_scores)
     return records
 
 
@@ -405,7 +430,7 @@ def _strict_retention(pqs: dict[str, dict]) -> dict:
     bridge, native, oracle = ({m: float(v.mean()) for m, v in pqs[name].items()} for name in ("bridge", "native", "oracle"))
     return {
         "native": native, "oracle": oracle, "rho_ceil": retention(bridge, native, oracle)[1],
-        "ci_ceil": {m: bootstrap_ratio_ci(pqs["bridge"][m], pqs["native"][m] if native[m] <= oracle[m] else pqs["oracle"][m]) for m in CI_METRICS},
+        "ci_ceil": {m: bootstrap_retention_ci(pqs["bridge"][m], pqs["native"][m], pqs["oracle"][m]) for m in CI_METRICS},
     }
 
 
@@ -434,12 +459,19 @@ def _first_queries(ds: RetrievalDataset, n: int) -> RetrievalDataset:
     )
 
 
-def finished_cells(path: Path) -> set[str]:
-    """Cells (seed, pair, K) fully recorded in a results file. A crash can tear the last line or leave a cell's records
-    incomplete; those are removed from the file, so the rerun repeats that cell and nothing else."""
+def finished_cells(path: Path, config: str) -> set[str]:
+    """Cells (seed, pair, K) fully recorded in a results file by a run of this exact configuration. A crash can tear the last line or
+    leave a cell's records incomplete; those are removed from the file, so the rerun repeats that cell and nothing else. A file holding
+    records of another configuration, or with none recorded, raises: a screening run must never count as the full run asked for now."""
     if not path.exists():
         return set()
     records, clean = durable.read_jsonl(path)
+    other = {r.get("config_id") for r in records if "cell" in r} - {config}
+    if other:
+        raise ValueError(
+            f"{path} holds records of another configuration ({sorted(map(str, other))}), not {config}. Use another --out, "
+            "or --no-resume to add to it knowing that one file then holds two experiments"
+        )
     counts = Counter(r["cell"] for r in records if "cell" in r)
     done = {r["cell"] for r in records if "cell" in r and counts[r["cell"]] == r["cell_records"]}
     kept = [r for r in records if "cell" not in r or r["cell"] in done]
@@ -454,9 +486,7 @@ def _score_record(rec: dict, pq: dict, native_pq: dict, oracle_pq: dict) -> dict
     native = {m: float(v.mean()) for m, v in native_pq.items()}
     oracle = {m: float(v.mean()) for m, v in oracle_pq.items()}
     rec["metrics"] = {m: float(v.mean()) for m, v in pq.items()}
-    rec["ci_ceil"] = {
-        m: bootstrap_ratio_ci(pq[m], native_pq[m] if native[m] <= oracle[m] else oracle_pq[m]) for m in CI_METRICS
-    }
+    rec["ci_ceil"] = {m: bootstrap_retention_ci(pq[m], native_pq[m], oracle_pq[m]) for m in CI_METRICS}
     rec["ci_ceil_recall@30"] = rec["ci_ceil"]["recall@30"]
     rec["rho_oracle"], rec["rho_ceil"] = retention(rec["metrics"], native, oracle)
     rec["rho_native"] = {m: v / native[m] if native[m] > 0 else float("nan") for m, v in rec["metrics"].items()}
@@ -501,7 +531,7 @@ def _confidence_study(
     ceil = native_pq["recall@30"] if native_pq["recall@30"].mean() <= oracle_pq["recall@30"].mean() else oracle_pq["recall@30"]
     bins = np.array_split(np.argsort(support, kind="stable"), n_bins)
     return {
-        "spearman_support_overlap30": _spearman(support, overlap),
+        "spearman_support_overlap30": spearman(support, overlap),
         "support_mean": float(support.mean()),
         "conf_mean": float(conf.mean()),
         "quintiles": [
@@ -514,11 +544,6 @@ def _confidence_study(
             for b in bins
         ],
     }
-
-
-def _spearman(a: np.ndarray, b: np.ndarray) -> float:
-    ra, rb = np.argsort(np.argsort(a)), np.argsort(np.argsort(b))
-    return float(np.corrcoef(ra, rb)[0, 1])
 
 
 def _projection_latency_us(bridge: SpaceBridge, q: np.ndarray, n: int = 1000) -> float:
@@ -559,7 +584,7 @@ def print_table(records: list[dict]) -> None:
             print(
                 f"{r['row']:>4} {r['reranker']:<20} {r['depth']:>5}  {b['native']['ndcg@5']:.3f}/{b['oracle']['ndcg@5']:.3f}/{m['ndcg@5']:.3f}  "
                 f"{r['rho_ceil']['ndcg@5']:12.3f} [{lo:.3f},{hi:.3f}]  {r['rho_ceil']['recall@5']:9.3f}  "
-                f"{r['jaccard@5']['bridge_vs_oracle']:7.3f}  {r['rerank_ms_per_query']:6.0f}"
+                f"{r['jaccard@5']['bridge_vs_oracle']:7.3f}  {r['rerank_ms_first_query_min3']:6.0f}"
             )
     timing = next((r["mount"] for r in records if "mount" in r), None)
     if timing:
@@ -606,8 +631,10 @@ def main() -> None:
                    help="first stage the rerank rows reorder (default: the default engine)")
     p.add_argument("--max-docs", type=int, default=None,
                    help="index only the first N rows of a nested corpus (msmarco-full, nq-full), sharing its embeddings")
+    p.add_argument("--no-bridge", action="store_true", help="BM25 rows also rerank BM25's top of the whole budget alone: no bridge, no old index")
+    p.add_argument("--per-query-dir", type=Path, default=None, help="save per-query scores of each cell here, for scripts/retention_ci.py")
     p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
-                   help="skip cells already complete in --out, so rerunning a crashed command continues it (default: on)")
+                   help="skip cells already complete in --out by a run of this exact configuration, so rerunning a crashed command continues it (default: on)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", type=Path, default=Path("outputs/results.jsonl"))
     args = p.parse_args()
@@ -625,7 +652,24 @@ def main() -> None:
         ds = _first_docs(ds, args.max_docs)
     if args.max_queries is not None:
         ds = _first_queries(ds, args.max_queries)
-    done = finished_cells(args.out) if args.resume else set()
+    # Everything that can change a number; seed, pair and K are in the cell.
+    config = {
+        "dataset": ds.name, "n_docs": ds.N, "queries_sha256": provenance.query_digest(ds.queries), "rows": sorted(args.rows), "rerankers": sorted(args.rerankers),
+        "proxy": args.proxy, "doc_pair_tokens": args.doc_pair_tokens, "stage2_batch": args.stage2_batch, "stage2_tau_scale": args.stage2_tau_scale,
+        "stage2_rule": args.stage2_rule, "stage2_curves": args.stage2_curves, "shift_bank": args.shift_bank, "anchor_bank": args.anchor_bank,
+        "anchor_select": args.anchor_select, "rerank_row": args.rerank_row, "full_index_diagnostics": args.full_index_diagnostics,
+        "time_mount": args.time_mount, "no_bridge": args.no_bridge,
+    }
+    run_id = provenance.config_id(config)
+    done = finished_cells(args.out, run_id) if args.resume else set()
+    # Beside the results: what this run was, what it ran on, and when. One line per start, so a resumed run shows every commit it used.
+    durable.append_lines(args.out.with_name(f"{args.out.name}.manifest.jsonl"), [json.dumps({
+        "config_id": run_id, "config": config, "started": time.strftime("%F %T"), "device": args.device,
+        **provenance.collect(
+            [MODELS[k].hf_id for pr in pairs for k in pr] + [RERANKERS[r].hf_id for r in args.rerankers],
+            [DATASETS[ds.name.split("@")[0]].repo],
+        ),
+    }, default=str)])
     cells = [(s, pr, K) for s in args.seed for pr in pairs for K in args.K]
     for n, (seed, (src, tgt), K) in enumerate(cells, 1):
         cell = f"{ds.name}|{src}|{tgt}|K{K}|s{seed}"
@@ -636,9 +680,10 @@ def main() -> None:
         durable.progress(f"cell {n}/{len(cells)} {cell}: start")
         records = run_pair(ds, src, tgt, K, seed, args.rows, args.device, tuple(args.rerankers), args.proxy, args.stage2_batch,
                            args.doc_pair_tokens, args.time_mount, args.stage2_tau_scale, args.stage2_curves, args.stage2_rule,
-                           args.shift_bank, args.anchor_bank, args.anchor_select, args.full_index_diagnostics, args.rerank_row)
+                           args.shift_bank, args.anchor_bank, args.anchor_select, args.full_index_diagnostics, args.rerank_row,
+                           args.no_bridge, args.per_query_dir / f"{cell.replace('|', '__')}.npz" if args.per_query_dir else None)
         durable.append_lines(args.out, [
-            json.dumps({**rec, "cell": cell, "cell_records": len(records)}, default=_json_default) for rec in records
+            json.dumps({**rec, "cell": cell, "cell_records": len(records), "config_id": run_id}, default=_json_default) for rec in records
         ])
         durable.progress(f"cell {n}/{len(cells)} {cell}: done in {time.perf_counter() - t0:.0f} s")
         print_table(records)

@@ -28,6 +28,7 @@ def main() -> None:
     p.add_argument("--pool", action="store_true", help="also pool each dataset and row over tiers and K")
     p.add_argument("--ignore-dataset", action="store_true",
                    help="pair configurations across datasets (e.g. one corpus subsampled at two sizes)")
+    p.add_argument("--allow-duplicates", action="store_true", help="when a file repeats a cell, keep the last record instead of refusing")
     args = p.parse_args()
     tier = {}
     for t, prs in TIERS.items():  # first tier wins: Tier 5a reuses Tier 3 pairs
@@ -40,11 +41,16 @@ def main() -> None:
             r = json.loads(line)
             if "reranker" not in r and r["row"] in args.rows:
                 key = ("*" if args.ignore_dataset else r["dataset"], tier.get((r["src"], r["tgt"]), "?"), r["K"], r["row"], r["src"], r["tgt"], r.get("seed", 0))
-                out[key] = r  # last run wins
+                if key in out and not args.allow_duplicates:
+                    raise ValueError(f"{path}: two records for {key}; pass --allow-duplicates to keep the last")
+                out[key] = r
         return out
 
     ret = lambda r: (r["rho_native"] if r["row"] == "1" else r["rho_ceil"])[args.metric]
     base, new = load(args.base), load(args.new)
+    unmatched = len(set(base) ^ set(new))
+    if unmatched:
+        print(f"Compared on cells in both files only: {unmatched} cells are in just one of them.\n")
     groups = defaultdict(lambda: defaultdict(list))
     for k, r in new.items():
         if k in base:
@@ -67,7 +73,7 @@ def main() -> None:
               f"{np.median(cells):+.1f} | [{lo:+.1f}, {hi:+.1f}] | {sum(c > 0 for c in cells)}/{len(cells)} |")
 
     print(f"| dataset | tier | K | row | base mean | new mean ± s.d. (seeds) | new − base, points | median cell | "
-          f"95% CI (cells) | (pair, seed) cells + |")
+          f"bootstrap over this table's cells (not a CI for new queries or corpora) | (pair, seed) cells + |")
     print("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for g, seeds in sorted(groups.items()):
         row(f"{g[0]} | {g[1]} | {g[2]} | {g[3]}", seeds)

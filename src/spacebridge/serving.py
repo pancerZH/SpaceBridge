@@ -6,12 +6,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Protocol
 
+try:
+    import fcntl
+except ImportError:  # not POSIX: no writer lock
+    fcntl = None
+
 import numpy as np
 import torch
 
 from . import durable
 from .anchors import LARGE_INDEX_DOCS
 from .bridge import SpaceBridge
+from .identity import check_encoder, sample_rows, vectors_match
 from .lexical import LEXICAL_SHARE, LexicalIndex, merge_pool, timed_build
 from .mount import IndexReader, QueryEncoder
 from .quality import lexical_rerank_pool, size_rerank_pool
@@ -47,6 +53,14 @@ class ExactBackend:
                 )
         self.vectors = torch.as_tensor(np.asarray(vectors, dtype=np.float32), device=self.device)
 
+    def check_index(self, index: IndexReader) -> None:
+        """Raises unless these are the index's vectors, in its row order, on a sample of rows."""
+        if self.vectors.shape[0] != len(index):
+            raise ValueError(f"the backend holds {self.vectors.shape[0]:,} vectors and the index {len(index):,}")
+        rows = sample_rows(len(index))
+        if not vectors_match(self.vectors[torch.as_tensor(rows, device=self.device)].cpu().numpy(), index.vectors(rows)):
+            raise ValueError("the backend's vectors aren't the index's: another corpus or row order")
+
     def search(self, q: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
         scores = torch.as_tensor(q, dtype=torch.float32, device=self.device) @ self.vectors.T
         top = scores.topk(min(k, self.vectors.shape[0]), dim=1)
@@ -61,6 +75,15 @@ class HnswBackend:
 
         self.index, self.ef_search = faiss.read_index(str(path)), ef_search
 
+    def check_index(self, index: IndexReader) -> None:
+        """Raises unless this graph was built on the index's vectors, in its row order, on a sample of rows: the graph holds its own copy."""
+        if self.index.ntotal != len(index):
+            raise ValueError(f"the HNSW graph holds {self.index.ntotal:,} vectors and the index {len(index):,}")
+        rows = sample_rows(len(index))
+        graph = np.stack([self.index.reconstruct(int(i)) for i in rows]) if len(rows) else np.empty((0, self.index.d), dtype=np.float32)
+        if not vectors_match(graph, index.vectors(rows)):
+            raise ValueError("the HNSW graph was built on other vectors: another corpus or row order. Build a new one, at another path")
+
     def search(self, q: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
         self.index.hnsw.efSearch = max(self.ef_search, k)
         scores, ids = self.index.search(np.asarray(q, dtype=np.float32), k)
@@ -74,7 +97,7 @@ def save_faiss_index(index, path: Path) -> None:
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
+    tmp = durable.temp_name(path)
     try:
         faiss.write_index(index, str(tmp))
         fd = os.open(tmp, os.O_RDONLY)
@@ -93,43 +116,99 @@ def build_hnsw(
     save_seconds: float = HNSW_SAVE_SECONDS, on_batch: Optional[Callable[[int, int], None]] = None,
 ):
     """Builds an inner-product HNSW index over an array-like of normalized vectors, in batches, saving it atomically as
-    it grows. A rerun continues from the saved index. Returns the finished index."""
+    it grows. A rerun with the same vectors continues from the saved index and returns the finished index.
+
+    An index already at ``path`` must have been built on these vectors with these settings, or ``ValueError`` says what differs: a
+    filename isn't an identity, and a graph over other vectors returns plausible, wrong results. Only one process may build at a path,
+    enforced by a lock file on POSIX systems."""
     import faiss
 
     path = Path(path)
-    for stale in path.parent.glob(f"{path.name}.tmp*"):  # a crash during a save leaves its copy behind, as large as the index
-        stale.unlink()
-    if path.exists():
-        index = faiss.read_index(str(path))
-    else:
-        index = faiss.IndexHNSWFlat(vectors.shape[1], M, faiss.METRIC_INNER_PRODUCT)
-        index.hnsw.efConstruction = ef_construction
-    n, last_save = vectors.shape[0], time.perf_counter()
-    for start in range(index.ntotal, n, batch_rows):
-        index.add(np.asarray(vectors[start : start + batch_rows], dtype=np.float32))
-        if on_batch is not None:
-            on_batch(index.ntotal, n)
-        if time.perf_counter() - last_save >= save_seconds and index.ntotal < n:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _writer_lock(path):
+        for stale in path.parent.glob(f"{path.name}.tmp*"):  # a crash during a save leaves its copy behind, as large as the index
+            stale.unlink()
+        if path.exists():
+            index = faiss.read_index(str(path))
+            _check_resume(index, vectors, M, ef_construction, path)
+        else:
+            index = faiss.IndexHNSWFlat(vectors.shape[1], M, faiss.METRIC_INNER_PRODUCT)
+            index.hnsw.efConstruction = ef_construction
+        n, last_save = vectors.shape[0], time.perf_counter()
+        saved = index.ntotal if path.exists() else -1
+        for start in range(index.ntotal, n, batch_rows):
+            index.add(np.asarray(vectors[start : start + batch_rows], dtype=np.float32))
+            if on_batch is not None:
+                on_batch(index.ntotal, n)
+            if time.perf_counter() - last_save >= save_seconds and index.ntotal < n:
+                save_faiss_index(index, path)
+                saved, last_save = index.ntotal, time.perf_counter()
+        if saved < n:
             save_faiss_index(index, path)
-            last_save = time.perf_counter()
-    if not path.exists() or faiss.read_index(str(path), faiss.IO_FLAG_MMAP | faiss.IO_FLAG_READ_ONLY).ntotal < n:
-        save_faiss_index(index, path)
     return index
+
+
+def _writer_lock(path: Path):
+    """Held for a whole build: a second builder at this path fails at once, rather than deleting the first one's temporary files."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def lock():
+        if fcntl is None:
+            yield
+            return
+        with path.with_name(f"{path.name}.lock").open("w") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as e:
+                raise ValueError(f"another process is building {path}") from e
+            try:
+                yield
+            finally:
+                path.with_name(f"{path.name}.lock").unlink(missing_ok=True)
+
+    return lock()
+
+
+def _check_resume(index, vectors, M: int, ef_construction: int, path: Path) -> None:
+    """An existing graph may continue only if it matches the vectors and settings of this call."""
+    import faiss
+
+    n, d = vectors.shape
+    problems = []
+    if index.d != d:
+        problems.append(f"dimension {index.d}, not {d}")
+    if index.metric_type != faiss.METRIC_INNER_PRODUCT:
+        problems.append("a metric other than inner product")
+    if index.hnsw.nb_neighbors(1) != M:
+        problems.append(f"M = {index.hnsw.nb_neighbors(1)}, not {M}")
+    if index.hnsw.efConstruction != ef_construction:
+        problems.append(f"efConstruction = {index.hnsw.efConstruction}, not {ef_construction}")
+    if index.ntotal > n:
+        problems.append(f"{index.ntotal:,} rows, more than the {n:,} given")
+    if not problems and index.ntotal:
+        rows = sample_rows(index.ntotal)
+        graph = np.stack([index.reconstruct(int(i)) for i in rows])
+        if not vectors_match(graph, np.asarray(vectors[rows], dtype=np.float32)):
+            problems.append("other vectors in its sampled rows")
+    if problems:
+        raise ValueError(f"{path} can't continue with these vectors: it has {', '.join(problems)}. Build at another path, or delete it")
 
 
 def real_query_overlap(
     bridge: SpaceBridge, queries: list[str], src_encoder: QueryEncoder, tgt_encoder: QueryEncoder, backend: SearchBackend,
     k: int = 30, query_lang: Optional[str] = None, src_queries: Optional[list[str]] = None,
 ) -> np.ndarray:
-    """Per query, the share of the native top-k that the bridged query also returns. Needs unlabeled real queries and the
-    source model. ``src_queries`` are the parallel queries in the index language when ``queries`` are not."""
+    """Per query, the share of the native results that the bridged query also returns, out of the native results there are (at most
+    k). Needs unlabeled real queries and the source model. ``src_queries`` are the parallel queries in the index language when
+    ``queries`` are not."""
     q_tgt = bridge.transform_query(tgt_encoder.encode_queries(queries), query_lang=query_lang)
     q_src = src_encoder.encode_queries(src_queries if src_queries is not None else queries)
     out = np.empty(len(queries))
     for i in range(len(queries)):
         native, _ = backend.search(q_src[i : i + 1], k)
         bridged, _ = backend.search(q_tgt[i : i + 1], k)
-        out[i] = len(set(native.tolist()) & set(bridged.tolist())) / k
+        out[i] = len(set(native.tolist()) & set(bridged.tolist())) / max(len(native), 1)
     return out
 
 
@@ -138,14 +217,22 @@ class SearchResult:
     ids: np.ndarray                 # row ids, best first
     scores: np.ndarray              # reranker scores, or first-stage scores without a reranker
     texts: list[str]
-    confidence: float               # predicted top-10 agreement with native retrieval (design §5.1); NaN for a
-                                    # source-model-free bridge, which has no teacher to calibrate it on
-    pool: int                       # candidates actually sent to the reranker
+    confidence: float               # predicted top-10 agreement with native retrieval (design §5.1), not a probability that the answer
+                                    # is relevant; NaN for a source-model-free bridge, which has no teacher to calibrate it on
+    pool: int                       # candidates retrieved: sent to the reranker if there is one, and at most the requested pool
     timing_ms: dict[str, float] = field(default_factory=dict)  # encode, project, search, lexical, fetch, rerank, total, and translate if one ran
 
 
 class Searcher:
-    """One call per query. ``pool`` defaults to the report's advisory pool, or the index size's if the bridge has no report.
+    """One call per query. With BM25 on, the pool is 60, or 100 for a source-free fit or a Stage-2 health flag. With BM25 off it is the
+    report's advisory pool, or the index size's if the bridge has no report, or a registered query language's own, if it has one.
+    ``pool=`` here or in ``search`` overrides all of these. The design's §5 has the table.
+
+    The language comes from the caller: nothing detects it. ``query_lang=None`` means the index's language, so a Chinese query sent
+    without ``query_lang="zh"`` is centered as if it were English and goes to BM25 as is.
+
+    Artifacts are checked against the index at construction, on a sample of rows: the bridge, the lexical index and, if it can tell, the
+    backend. A mismatch raises ``ValueError``. Those saved before these checks existed are checked only by size.
 
     Above ``LARGE_INDEX_DOCS`` documents a reranker is required: first-stage results lose far more there (MS MARCO 1M, nDCG@5
     0.33-0.44 instead of 0.66-0.69). ``allow_no_reranker=True`` opts out, to time search alone.
@@ -170,11 +257,21 @@ class Searcher:
                 f"an index of {len(index):,} documents needs a reranker (required above {LARGE_INDEX_DOCS:,} documents, "
                 "design §2.1); pass one, or allow_no_reranker=True to serve first-stage results anyway"
             )
+        if pool is not None and (not isinstance(pool, (int, np.integer)) or pool < 1):
+            raise ValueError(f"pool must be a positive integer, got {pool!r}")
+        corpus = getattr(bridge, "corpus", None)
+        if corpus is not None:
+            corpus.check(index, "this bridge")
+        check_encoder(getattr(bridge, "tgt_encoder", None), encoder, "this bridge")
+        check_backend = getattr(backend, "check_index", None)
+        if check_backend is not None:
+            check_backend(index)
         self.bridge, self.encoder, self.backend, self.index, self.reranker = bridge, encoder, backend, index, reranker
         self.lexical, self.translate = self._resolve_lexical(lexical), translate
         if translate is not None and self.lexical is None:
             raise ValueError("translate feeds BM25, so it needs a reranker and a lexical index: pass lexical=LexicalIndex.build(index)")
-        self.plain_pool = pool or (bridge.quality.rerank_pool if bridge.quality is not None else size_rerank_pool(len(index)))
+        self.explicit_pool = pool
+        self.plain_pool = pool if pool is not None else (bridge.quality.rerank_pool if bridge.quality is not None else size_rerank_pool(len(index)))
         self.pool = self.plain_pool
         if self.lexical is not None and pool is None:
             self.pool = lexical_rerank_pool(bridge.quality, source_free=bridge.status == "NO_TEACHER")
@@ -183,11 +280,10 @@ class Searcher:
     def _resolve_lexical(self, lexical: LexicalIndex | str | None) -> Optional[LexicalIndex]:
         if isinstance(lexical, str) and lexical != "auto":
             raise ValueError(f"lexical must be a LexicalIndex, 'auto' or None, not {lexical!r}")
-        if lexical is None or self.reranker is None:  # only a reranker can merge the two lists
+        if lexical is None or self.reranker is None:  # there's no score fusion: this implementation leaves comparing the two lists to a reranker
             return None
         if lexical != "auto":
-            if len(lexical) != len(self.index):
-                raise ValueError(f"the lexical index has {len(lexical):,} documents and the index {len(self.index):,}")
+            lexical.check_corpus(self.index)
             return lexical
         if self.bridge.src_lang != "en":  # the tokenizer keeps only [a-z0-9]+
             return None
@@ -198,10 +294,22 @@ class Searcher:
             torch.cuda.synchronize()
         return time.perf_counter()
 
+    def _default_pool(self, lexical: Optional[LexicalIndex], foreign: bool, query_lang: Optional[str]) -> int:
+        if lexical is not None:
+            return self.pool
+        if foreign and self.explicit_pool is None and self.bridge.quality is not None:  # a registered language's own advice
+            return self.bridge.quality.by_language.get(query_lang, {}).get("rerank_pool", self.plain_pool)
+        return self.plain_pool
+
     def search(self, query: str, k: int = 5, query_lang: Optional[str] = None, pool: Optional[int] = None) -> SearchResult:
+        """The top ``k`` of a pool of candidates. The pool grows to ``k`` if ``k`` is larger, so asking for 100 returns up to 100."""
+        if not isinstance(k, (int, np.integer)) or k < 1:
+            raise ValueError(f"k must be a positive integer, got {k!r}")
+        if pool is not None and (not isinstance(pool, (int, np.integer)) or pool < 1):
+            raise ValueError(f"pool must be a positive integer, got {pool!r}")
         foreign = query_lang not in (None, self.bridge.src_lang)
         lexical = self.lexical if not foreign or self.translate is not None else None
-        pool = pool or (self.pool if lexical is not None else self.plain_pool)
+        pool = max(k, pool if pool is not None else self._default_pool(lexical, foreign, query_lang))
         timing = {}
         t0 = t = self._now()
 

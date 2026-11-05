@@ -81,7 +81,7 @@ def run(name: str, tgt_key: str, seed: int, budgets: list[int], K: int, candidat
     E_tgt = enc.docs_store(ds.titles, ds.texts).prefix(ds.N)
     Q_tgt = np.asarray(enc.queries(ds.queries, ds.task), dtype=np.float32)
     enc.unload()
-    index = Index(E_src, ds.texts, ds.titles)
+    index = ds.index_over(E_src)
     allowed = np.setdiff1d(np.arange(ds.N), ds.self_rows)
     src_mount, tgt_mount = MountEncoder(src, ds.task, device), MountEncoder(tgt, ds.task, device)
     bundle = freeze(index, src_mount, ds.lang, seed, K, anchor_ids=cached_anchors(ds, src.key, E_src, allowed, K, seed), device=device)

@@ -325,15 +325,15 @@ def test_finished_cells_drops_a_torn_line_and_an_incomplete_cell(tmp_path):
 
     path = tmp_path / "results.jsonl"
     lines = [
-        {"cell": "a", "cell_records": 2, "row": "0a"}, {"cell": "a", "cell_records": 2, "row": "8b"},
-        {"cell": "b", "cell_records": 2, "row": "0a"},
+        {"cell": "a", "cell_records": 2, "row": "0a", "config_id": "x"}, {"cell": "a", "cell_records": 2, "row": "8b", "config_id": "x"},
+        {"cell": "b", "cell_records": 2, "row": "0a", "config_id": "x"},
         {"row": "old format, kept"},
     ]
     path.write_text("".join(json.dumps(r) + "\n" for r in lines) + '{"cell": "c", "cell_rec')
-    assert finished_cells(path) == {"a"}
+    assert finished_cells(path, "x") == {"a"}
     kept = [json.loads(line) for line in path.read_text().splitlines()]
     assert [r.get("cell") for r in kept] == ["a", "a", None]
-    assert finished_cells(tmp_path / "missing.jsonl") == set()
+    assert finished_cells(tmp_path / "missing.jsonl", "x") == set()
 
 
 def test_atomic_file_keeps_the_old_file_when_a_write_fails(tmp_path):
@@ -462,7 +462,7 @@ def test_the_lexical_cache_is_keyed_by_the_corpus_rows(tmp_path, monkeypatch):
     monkeypatch.setattr(run, "LEXICAL_CACHE", tmp_path)
     monkeypatch.setattr(run, "_LEXICAL", {})
     prefix = replace(ds, doc_ids=ds.doc_ids[:4])
-    assert len(run.cached_lexical(prefix, Index(np.zeros((4, 2)), texts, titles))) == 4  # other rows, another index
+    assert len(run.cached_lexical(prefix, Index(np.zeros((4, 2)), texts[:4], titles[:4]))) == 4  # other rows, another index
     assert len(list(tmp_path.iterdir())) == 2
 
 

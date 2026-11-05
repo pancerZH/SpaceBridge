@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 
 from difficulty_features import feature_key
+from spacebridge_bench.provenance import unique_records
 from spacebridge.quality import CALIBRATION_PATH
 
 TARGET = "recall@30"
@@ -45,8 +46,9 @@ def load(paths: list[Path], extra: dict | None = None) -> list[dict]:
                         continue
                     r["fit"]["quality"]["corpus"] = f
                 recs.append(r)
-    # One record per configuration (last run wins).
-    return list({(r["dataset"], r["src"], r["tgt"], r["K"], r["row"], r.get("seed", 0)): r for r in recs}.values())
+    # One record per configuration. Reruns under other protocols are expected in these files, so the last wins, and the count of those replaced is printed.
+    key = lambda r: (r["dataset"], r["src"], r["tgt"], r["K"], r["row"], r.get("seed", 0))
+    return unique_records(recs, key, allow_duplicates=True)
 
 
 def features(r: dict, names: list[str]) -> list[float]:
@@ -121,6 +123,21 @@ def main() -> None:
             )
         print()
 
+    # The errors above help pick the alpha and feature set, so they are model-selection errors, optimistic about a procedure that
+    # selects. Nested: for each held-out dataset, the alpha and features are chosen on the other datasets alone.
+    nested = np.empty_like(y)
+    for d in np.unique(datasets):
+        out_ = datasets == d
+        rest = ~out_
+        def inner(feats_, a):
+            X_ = np.array([features(r, feats_) for r in recs])[rest]
+            return np.average((lodo(X_, y[rest], w[rest], datasets[rest], a) - y[rest]) ** 2, weights=w[rest])
+        feats_, a_ = min(((feats_, a) for _, feats_ in candidates for a in ALPHAS), key=lambda c: inner(*c))
+        X_all = np.array([features(r, feats_) for r in recs])
+        m_ = fit_ridge(X_all[rest], y[rest], w[rest], a_)
+        nested[out_] = m_["intercept"] + ((X_all[out_] - m_["mean"]) / m_["scale"]) @ m_["coef"]
+    print(f"## Nested leave-one-dataset-out, selection inside each fold: weighted RMSE {100 * np.sqrt(np.average((nested - y) ** 2, weights=w)):.1f} points\n")
+
     # Ship whichever feature set transfers better to unseen datasets (lower LODO error).
     chosen = min(results, key=lambda k: np.average((results[k][3] - y) ** 2, weights=w))
     feats, X, alpha, pred = results[chosen]
@@ -148,6 +165,10 @@ def main() -> None:
             "n_fits": len(recs),
             # Design §5.1: experimental until LODO error is within the band on >= 4 datasets.
             "experimental": transfers < 4 or len(per_ds) < 4,
+            "experimental_means": "False only means the dataset-level error was within the band on at least 4 datasets. Not a reliability claim: the band is not a prediction interval.",
+            "calibrated_on": sorted(per_ds),
+            "applies_to": "English queries, indexes up to about 171K documents",
+            "fitted_by": "scripts/calibrate_quality.py",
         }
         CALIBRATION_PATH.write_text(json.dumps(out, indent=2) + "\n")
         print(f"\nwrote {CALIBRATION_PATH}")

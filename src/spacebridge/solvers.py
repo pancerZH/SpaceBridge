@@ -11,8 +11,8 @@ LAMBDAS_REL = (0.01, 0.1, 1.0, 5.0, 20.0)
 
 
 def _svd(M: torch.Tensor):
-    # The default cuSOLVER driver can fail to converge on these cross-covariances and silently
-    # fall back to a ~10x slower path; gesvd is slower per call but always converges.
+    # The default cuSOLVER driver failed to converge on some of these cross-covariances and silently fell back to a ~10x
+    # slower path. gesvd is slower per call and avoided that in these studies; a failure raises torch.linalg.LinAlgError.
     return torch.linalg.svd(M, full_matrices=False, driver="gesvd" if M.is_cuda else None)
 
 
@@ -22,8 +22,13 @@ def naive_procrustes(Y: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
     return U @ Vh
 
 
-def stiefel_procrustes(Yc: torch.Tensor, Xc: torch.Tensor, rel_tol: float = 1e-3) -> tuple[torch.Tensor, dict]:
-    """Operator A: scaled, spectrally truncated semi-orthogonal map ``s * U_r V_r^T``.
+def stiefel_procrustes(Yc: torch.Tensor, Xc: torch.Tensor, rel_tol: float = 1e-3, objective_scale: bool = False) -> tuple[torch.Tensor, dict]:
+    """Operator A: scaled, spectrally truncated partial isometry ``s * U_r V_r^T``.
+
+    The default scale, ``sum(sigma_r) / ||Yc||^2``, is a heuristic: it is the least-squares scale only when the retained
+    modes span the target space. ``objective_scale`` gives the scale that minimizes ``||s Yc U_r V_r^T - Xc||_F`` for this
+    map, ``sum(sigma_r) / ||Yc U_r||^2``. The default pipeline rescales W to the native residual norm afterwards, which cancels
+    either scalar, so this only matters with ``match_residual_norm=False``.
 
     Computed as a polar decomposition from a float64 eigendecomposition of the smaller Gram matrix
     of ``M = Yc^T Xc``: identical to the SVD form (to ~1e-5) but several times faster than gesvd on
@@ -33,18 +38,21 @@ def stiefel_procrustes(Yc: torch.Tensor, Xc: torch.Tensor, rel_tol: float = 1e-3
     left = M.shape[0] < M.shape[1]  # eigendecompose M M^T (d_t x d_t) when d_t < d_s
     evals, Q = torch.linalg.eigh(M @ M.T if left else M.T @ M)
     S, Q = evals.flip(0).clamp_min(0).sqrt(), Q.flip(1)
+    if not (torch.isfinite(S).all() and S[0] > 0):
+        raise ValueError("the calibration pairs have no usable cross-covariance: the embeddings are constant, identical or not finite")
     r = int((S >= rel_tol * S[0]).sum())
     if left:
         U, V = Q[:, :r], (M.T @ Q[:, :r]) / S[:r]
     else:
         U, V = (M @ Q[:, :r]) / S[:r], Q[:, :r]
-    s = S[:r].sum() / Yc.double().pow(2).sum()
+    s = S[:r].sum() / ((Yc.double() @ U).pow(2).sum() if objective_scale else Yc.double().pow(2).sum())
     W = (s * (U @ V.T)).to(Yc.dtype)
     return W, {"rank": r, "scale": float(s), "singular_values": S.float().cpu()}
 
 
 def ridge_lambda(Yc: torch.Tensor, lam_rel: float) -> float:
-    """Absolute ridge penalty: ``lam_rel`` times the mean nonzero eigenvalue of the Gram matrix."""
+    """Absolute ridge penalty: ``lam_rel`` times a nominal mean eigenvalue, the trace over min(d_t, K). That is a chosen
+    normalization, not the mean nonzero eigenvalue: centering and duplicate anchors can leave the numerical rank lower."""
     K, d_t = Yc.shape
     return lam_rel * float(Yc.pow(2).sum()) / min(d_t, K)
 

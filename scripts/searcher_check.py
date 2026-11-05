@@ -60,7 +60,7 @@ def main() -> None:
     enc = Encoder(MODELS[args.index_model], args.device)
     store = enc.docs_store(ds.titles, ds.texts).prefix(ds.N)
     enc.unload()
-    index = Index(store, ds.texts, ds.titles)
+    index = ds.index_over(store)
     t0 = time.perf_counter()
     src = MountEncoder(MODELS[args.index_model], ds.task, args.device) if args.bench_fit else adapter(args.index_model, ds.task, args.device)
     anchor_ids = None

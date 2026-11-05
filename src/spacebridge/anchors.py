@@ -23,6 +23,10 @@ LARGE_INDEX_DOCS = 200_000
 DEFAULT_ANCHORS = 2_048
 LARGE_INDEX_ANCHORS = 8_192
 MAX_DISTRACTORS = 50_000
+# freeze refuses less than this: the validation split and top-10 agreement need room. Nothing below 5,183 documents was measured.
+MIN_INDEX_DOCS = 50
+MIN_ANCHORS = 20
+ANCHOR_METHODS = ("auto", "kmeans", "random")
 
 # One token per CJK character, word, or punctuation mark: a tokenizer-free length proxy.
 _TOKEN = re.compile(r"[㐀-鿿豈-﫿]|[^\W_]+|[^\w\s]")
@@ -40,6 +44,8 @@ def default_anchor_count(N: int) -> int:
 
 def resolve_anchor_method(N: int, method: str = "auto") -> str:
     """``auto``: ``random`` above ``LARGE_PROFILE_DOCS``, else ``kmeans``."""
+    if method not in ANCHOR_METHODS:
+        raise ValueError(f"unknown anchor selection {method!r}; choose from {ANCHOR_METHODS}")
     if method == "auto":
         return "random" if N > LARGE_PROFILE_DOCS else "kmeans"
     return method
@@ -61,8 +67,6 @@ def select_anchors(E: np.ndarray, K: int, seed: int = 0, device: str = "cuda", m
     method = resolve_anchor_method(N, method)
     if method == "random":
         return random_anchors(N, K, seed)
-    if method != "kmeans":
-        raise ValueError(f"unknown anchor selection {method!r}")
     E = _l2(np.asarray(E, dtype=np.float32))
     if N < FPS_THRESHOLD:
         return _farthest_point(E, K, seed)
@@ -84,6 +88,8 @@ def _spherical_kmeans(E: np.ndarray, K: int, seed: int, device: str, iters: int 
     ids[0] = torch.randint(N, (1,), generator=gen, device=device)
     dist = (1 - X @ X[ids[0]]).clamp_min_(0)  # squared Euclidean / 2 for unit vectors
     for k in range(1, K):
+        if not dist.sum() > 0:  # every remaining vector repeats a chosen one
+            raise ValueError(f"the index has only {k} distinct directions, fewer than the {K} anchors asked for: check for duplicate or empty documents, or pass a smaller K")
         ids[k] = torch.multinomial(dist, 1, generator=gen)[0]
         dist = torch.minimum(dist, (1 - X @ X[ids[k]]).clamp_min_(0))
     C = X[ids].clone()

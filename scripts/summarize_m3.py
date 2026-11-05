@@ -31,11 +31,14 @@ def short(r: dict) -> str:
     return f"{r['src']} ← {r['tgt']}"
 
 
-def read(*paths: str) -> list[dict]:
+def read(*paths: str, required: bool = False) -> list[dict]:
+    """Records of these files, skipping files not there, unless ``required``: a decision must not read missing evidence as nothing to say."""
     out = []
     for path in paths:
         if (ROOT / path).exists():
             out += durable.read_jsonl(ROOT / path)[0]
+        elif required:
+            raise FileNotFoundError(ROOT / path)
     return out
 
 
@@ -71,7 +74,8 @@ def seed_sd(recs: list[dict], f=rho) -> float:
 
 
 def ci(recs: list[dict]) -> tuple[float, float]:
-    """The query-bootstrap bounds, averaged over cells, as M2's tables give them."""
+    """The cells' query-bootstrap bounds, averaged. This describes a typical cell: it is not a confidence interval for the mean over pairs
+    and seeds, whose cells share queries. scripts/retention_ci.py computes that one from aligned per-query scores."""
     return st.mean(r["ci_ceil"]["ndcg@5"][0] for r in recs), st.mean(r["ci_ceil"]["ndcg@5"][1] for r in recs)
 
 
@@ -244,7 +248,7 @@ class Timing:
     def search_ms(self, device: str, size: int) -> float:
         if size > 1_000_000:
             device = "cpu"
-        hnsw = [r for r in self.records if r["device"] == device and not r["rerank"] and r["backend"] != "exact" and r["threads"] == 10 and r["ef"] == 500]
+        hnsw = [r for r in self.records if r["device"] == device and not r["rerank"] and r["backend"] != "exact" and r["threads"] == 10 and r["ef"] == 500 and r["N"] == size]
         if size == 1_000_000 and hnsw:
             return hnsw[-1]["stages_ms"]["search"]["p50"]
         pts = sorted({r["N"]: r["stages_ms"]["search"]["p50"] for r in self.records if r["device"] == device and r["backend"] == "exact" and r.get("search_device", device) == device and (not r["rerank"] or r["N"] > 1_000_000)}.items())
@@ -261,6 +265,12 @@ class Timing:
         chosen = [r for r in runs if bool(r.get("lexical")) == lexical] or runs
         return chosen[-1] if chosen else None
 
+    def is_measured(self, device: str, corpus: str, size: int, pool: int, lexical: bool) -> bool:
+        """Whether a run of this device, corpus, size, pool and BM25 setting exists. Otherwise ``query_s`` is a model, and its p95 especially:
+        percentiles don't add, so swapping medians into a measured total estimates a tail, it doesn't observe one."""
+        r = self.run(device, corpus, pool, lexical)
+        return r is not None and r["N"] == size and bool(r.get("lexical")) == lexical
+
     def query_s(self, device: str, corpus: str, size: int, pool: int, q: str, lexical: bool) -> float:
         r = self.run(device, corpus, pool, lexical)
         if r is None:
@@ -274,7 +284,7 @@ class Timing:
 
 def table1(budget_above_1m: int = 60) -> None:
     timing = Timing()
-    print(f"**Table 1: what the library does.** Seconds for one query, p50 (p95), through `Searcher`, and retention on the hardest corpus measured at each size. The CPU columns stop at the first size over 60 s. Budget above 1M: {budget_above_1m}.\n")
+    print(f"**Table 1: what the library does.** Seconds for one query, p50 (p95), through `Searcher`, and retention on the hardest corpus measured at each size. A cell starting with ≈ is modeled, not measured: another size's run with its search and BM25 medians replaced. The CPU columns stop at the first size over 60 s. Budget above 1M: {budget_above_1m}.\n")
     print("| Size | BM25 | Budget | K | Tier 1 (corpus) | Tier 3 (corpus) | CPU, short | CPU, long | GPU, short | GPU, long |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     stopped = {"short": False, "long": False}
     for size, label, lexical, K, corpora in TABLE1:
@@ -304,10 +314,10 @@ def table1(budget_above_1m: int = 60) -> None:
                 times[f"cpu_{kind}"] = "stop"
             else:
                 over = p50 > 60
-                text = f"{p50:.1f} ({timing.query_s('cpu', source, size, budget, 'p95', lexical):.1f})"
+                text = f"{'' if timing.is_measured('cpu', source, size, budget, lexical) else '≈'}{p50:.1f} ({timing.query_s('cpu', source, size, budget, 'p95', lexical):.1f})"
                 times[f"cpu_{kind}"] = f"**{text}**" if over else text
                 stopped[kind] = over
-            times[f"gpu_{kind}"] = f"{timing.query_s('cuda', source, size, budget, 'p50', lexical):.2f} ({timing.query_s('cuda', source, size, budget, 'p95', lexical):.2f})"
+            times[f"gpu_{kind}"] = f"{'' if timing.is_measured('cuda', source, size, budget, lexical) else '≈'}{timing.query_s('cuda', source, size, budget, 'p50', lexical):.2f} ({timing.query_s('cuda', source, size, budget, 'p95', lexical):.2f})"
         print(f"| {label} | {'on' if lexical else 'off'} | {budget} | {K:,} | {cell['T1']} | {cell['T3']} | {times['cpu_short']} | {times['cpu_long']} | {times['gpu_short']} | {times['gpu_long']} |")
     hnsw_row(timing)
 
@@ -334,8 +344,9 @@ def hnsw_row(timing: Timing) -> None:
 
 
 def break_even() -> None:
-    """Queries until re-indexing would have been cheaper in compute: re-index seconds / what the bridge adds per query. It depends on what the
-    re-indexed system does. If it also reranks about 60, the bridge adds BM25 and the projection. If it doesn't rerank, it adds the reranking too."""
+    """A scenario estimate, not a measured saving: encoding seconds of a re-index (token rate, extrapolated) / what the bridge adds per query. It leaves out
+    index construction and the bridge's own setup; scripts/review_tables.py gives the fuller equation. It depends on what the re-indexed system does. If it also
+    reranks about 60, the bridge adds BM25 and the projection. If it doesn't rerank, it adds the reranking too."""
     timing = Timing()
     rate = {(r["model"], r["device"]): r for r in read("m1_timing/mount.jsonl") if r.get("mode") == "rate"}
     sizes = {1_000_000: "msmarco-1m", 8_841_823: "msmarco-full"}

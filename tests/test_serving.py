@@ -47,7 +47,8 @@ def test_searcher_without_a_reranker_keeps_the_first_stage_order():
 
 
 class SizedIndex(Index):
-    """An index that reports a size other than its rows, to test the rules that depend on size."""
+    """An index that reports a size other than its rows, to test the rules that depend on size. The bridge's corpus check would
+    rightly refuse it, so these tests clear the bridge's fingerprint and use a backend that doesn't check."""
 
     def __init__(self, inner: Index, size: int):
         super().__init__(inner._vectors, inner._texts, inner._titles)
@@ -57,10 +58,19 @@ class SizedIndex(Index):
         return self.size
 
 
+class UncheckedBackend(ExactBackend):
+    check_index = None
+
+
+def any_size(bridge):
+    bridge.corpus = None
+    return bridge
+
+
 def test_searcher_requires_a_reranker_above_the_large_index_size():
     vectors, index, src, tgt = make_mount_world(n_docs=800)
-    bridge = mount(freeze(index, src, K=300, device="cpu"), index, tgt, device="cpu")
-    backend = ExactBackend(vectors)
+    bridge = any_size(mount(freeze(index, src, K=300, device="cpu"), index, tgt, device="cpu"))
+    backend = UncheckedBackend(vectors)
     assert Searcher(bridge, tgt, backend, SizedIndex(index, LARGE_INDEX_DOCS)).reranker is None
     large = SizedIndex(index, LARGE_INDEX_DOCS + 1)
     with pytest.raises(ValueError, match="needs a reranker"):
@@ -73,9 +83,9 @@ def test_searcher_requires_a_reranker_above_the_large_index_size():
 
 def test_searcher_without_a_report_follows_the_index_size():
     vectors, index, src, tgt = make_mount_world(n_docs=800)
-    bridge = mount(freeze(index, src, K=300, device="cpu"), index, tgt, device="cpu")
+    bridge = any_size(mount(freeze(index, src, K=300, device="cpu"), index, tgt, device="cpu"))
     bridge.quality = None
-    backend, rr = ExactBackend(vectors), ReverseAlphabetReranker()
+    backend, rr = UncheckedBackend(vectors), ReverseAlphabetReranker()
     for size in (800, LARGE_INDEX_DOCS, LARGE_INDEX_DOCS + 1, 1_000_000, 1_000_001, 8_841_823):
         assert Searcher(bridge, tgt, backend, SizedIndex(index, size), rr, lexical=None).pool == size_rerank_pool(size)
     assert Searcher(bridge, tgt, backend, index, rr, pool=17, lexical=None).pool == 17
@@ -84,7 +94,7 @@ def test_searcher_without_a_report_follows_the_index_size():
 @pytest.fixture(scope="module")
 def world():
     vectors, index, src, tgt = make_mount_world(n_docs=800)
-    return vectors, index, tgt, mount(freeze(index, src, K=300, device="cpu"), index, tgt, device="cpu")
+    return vectors, index, tgt, any_size(mount(freeze(index, src, K=300, device="cpu"), index, tgt, device="cpu"))
 
 
 def counting_builds(monkeypatch, lexical):
@@ -96,7 +106,7 @@ def counting_builds(monkeypatch, lexical):
 
 def test_auto_builds_at_any_size_for_an_english_index_with_a_reranker(world, monkeypatch):
     vectors, index, tgt, bridge = world
-    backend, rr, lex = ExactBackend(vectors), ReverseAlphabetReranker(), LexicalIndex.build(index)
+    backend, rr, lex = UncheckedBackend(vectors), ReverseAlphabetReranker(), LexicalIndex.build(index)
     built = counting_builds(monkeypatch, lex)
     assert Searcher(bridge, tgt, backend, index, rr).lexical is lex
     assert Searcher(bridge, tgt, backend, SizedIndex(index, 5_000), rr).lexical is lex
@@ -106,7 +116,7 @@ def test_auto_builds_at_any_size_for_an_english_index_with_a_reranker(world, mon
 
 def test_auto_stays_off_for_another_language_and_with_no_reranker(world, monkeypatch):
     vectors, index, tgt, bridge = world
-    backend, large = ExactBackend(vectors), SizedIndex(index, 100_000)
+    backend, large = UncheckedBackend(vectors), SizedIndex(index, 100_000)
     built = counting_builds(monkeypatch, LexicalIndex.build(index))
     assert Searcher(bridge, tgt, backend, large).lexical is None
     bridge.src_lang = "zh"
@@ -129,7 +139,7 @@ def test_a_lexical_index_passed_in_is_used_whatever_the_size_and_language(world)
     assert Searcher(bridge, tgt, ExactBackend(vectors), index, lexical=lex).lexical is None  # no reranker to merge the lists
     assert Searcher(bridge, tgt, ExactBackend(vectors), index, ReverseAlphabetReranker(), lexical=None).lexical is None
     with pytest.raises(ValueError, match="has 800 documents"):
-        Searcher(bridge, tgt, ExactBackend(vectors), SizedIndex(index, 801), ReverseAlphabetReranker(), lexical=lex)
+        Searcher(bridge, tgt, UncheckedBackend(vectors), SizedIndex(index, 801), ReverseAlphabetReranker(), lexical=lex)
     with pytest.raises(ValueError, match="must be a LexicalIndex"):
         Searcher(bridge, tgt, ExactBackend(vectors), index, ReverseAlphabetReranker(), lexical="on")
 
@@ -161,7 +171,7 @@ def test_a_query_in_another_language_skips_bm25_and_takes_the_plain_pool(world):
     vectors, index, tgt, bridge = world
     lex = LexicalIndex.build(index)
     bridge.register_query_language("zh", tgt.encode_queries(["question 1", "question 2"]), tgt.encode_queries(["question 3", "question 4"]))
-    backend = ExactBackend(vectors)
+    backend = UncheckedBackend(vectors)
     large = SizedIndex(index, 1_000_000)
     large_lex = LexicalIndex(lex.X, lex.idf, list(lex.vocab))
     large_lex.__class__ = type("Sized", (LexicalIndex,), {"__len__": lambda self: 1_000_000})

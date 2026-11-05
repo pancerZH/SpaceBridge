@@ -9,6 +9,7 @@ from typing import Optional
 
 import numpy as np
 
+from spacebridge import Index
 from spacebridge.language import FLORES_SPLITS, SHIFT_BANKS, flores_available, load_flores, load_shift_bank  # noqa: F401
 
 from . import durable
@@ -29,6 +30,13 @@ class DatasetSpec:
     # of the ``nested_docs`` subsample (same seed, so that many rows hold exactly that subsample's documents), then the
     # rest, shuffled. repr=False keeps the parsed-dataset cache keys of every other dataset.
     nested_docs: Optional[int] = field(default=None, repr=False)
+    # Config names where a repo doesn't use the usual three (mteb/LoTTE: "technology_forum-corpus").
+    corpus_config: str = field(default="corpus", repr=False)
+    queries_config: str = field(default="queries", repr=False)
+    qrels_config: str = field(default="default", repr=False)
+    # Unused queries of another dataset's corpus: the same documents in the same row order, so its embeddings serve, and queries
+    # disjoint from every query it loads. For confirmation runs (docs/fresh_confirmation_plan.md).
+    fresh_of: Optional[str] = field(default=None, repr=False)
 
 
 DATASETS: dict[str, DatasetSpec] = {
@@ -110,6 +118,23 @@ DATASETS: dict[str, DatasetSpec] = {
         "google/xquad", "en", "Given a question, retrieve Wikipedia passages that answer the question", query_lang="zh"
     ),
 }
+# Fresh confirmation (docs/fresh_confirmation_plan.md): chosen after the final configuration was frozen and used for no decision.
+# Queries that were never loaded before, over corpora already embedded: 2,000 of MS MARCO's other dev queries, and of HotpotQA's other test queries.
+DATASETS["msmarco-full-fresh"] = replace(DATASETS["msmarco-full"], fresh_of="msmarco-full")
+DATASETS["hotpotqa-full-fresh"] = replace(DATASETS["hotpotqa-full"], fresh_of="hotpotqa-full")
+# New corpora, end to end, whole unless said. Real forum questions on technology; claims into Wikipedia, positive-preserving 1M; arguments on
+# controversial questions, long documents, 49 queries.
+DATASETS["lotte-technology"] = DatasetSpec(
+    "mteb/LoTTE", "en", "Given a question about technology, retrieve forum answers that answer the question", max_queries=2_000,
+    corpus_config="technology_forum-corpus", queries_config="technology_forum-queries", qrels_config="technology_forum-qrels",
+    corpus_split="test", queries_split="test",
+)
+DATASETS["fever-1m"] = DatasetSpec(
+    "mteb/fever", "en", "Given a claim, retrieve Wikipedia passages that support or refute the claim", max_docs=1_000_000, max_queries=2_000,
+)
+DATASETS["touche2020"] = DatasetSpec(
+    "mteb/touche2020", "en", "Given a question on a controversial topic, retrieve arguments that answer the question",
+)
 # Close-out (FLORES): other XQuAD query languages against the same English index, held out from every Tier 5a
 # decision, to check per-language validation (rho_val,Lq) on language shifts other than zh's.
 for _lang in ("de", "es", "ru", "ar", "hi", "vi"):
@@ -148,6 +173,10 @@ class RetrievalDataset:
     def N(self) -> int:
         return len(self.doc_ids)
 
+    def index_over(self, vectors) -> Index:
+        """An ``Index`` over these rows. A prefix keeps its whole corpus's text lists, so that its embeddings file is found: cut them here."""
+        return Index(vectors, self.texts[: self.N], self.titles[: self.N])
+
 
 DATASET_CACHE = Path("data/cache/datasets")
 
@@ -177,9 +206,11 @@ def _load_beir(name: str, split: Optional[str], seed: int) -> RetrievalDataset:
         return _load_xquad(name, spec)
     if spec.repo == "facebook/mlqa":
         return _load_mlqa(name, spec)
-    corpus = load_dataset(spec.repo, "corpus", split=spec.corpus_split)
-    queries = load_dataset(spec.repo, "queries", split=spec.queries_split)
-    qrels = load_dataset(spec.repo, "default", split=split or spec.split)
+    if spec.fresh_of is not None:
+        return _load_fresh(name, spec, FRESH_SEED)
+    corpus = load_dataset(spec.repo, spec.corpus_config, split=spec.corpus_split)
+    queries = load_dataset(spec.repo, spec.queries_config, split=spec.queries_split)
+    qrels = load_dataset(spec.repo, spec.qrels_config, split=split or spec.split)
     if spec.max_queries is not None:
         qrels = qrels.select(_query_subsample(qrels["query-id"], qrels["score"], spec.max_queries, seed))
 
@@ -205,7 +236,7 @@ def _load_beir(name: str, split: Optional[str], seed: int) -> RetrievalDataset:
         lang=spec.lang,
         task=spec.task,
         doc_ids=doc_ids,
-        titles=[t or "" for t in corpus["title"]],
+        titles=[t or "" for t in corpus["title"]] if "title" in corpus.column_names else [""] * len(texts),
         texts=texts,
         queries=[query_text[q] for q in qids],
         qrels=[rels[q] for q in qids],
@@ -215,9 +246,43 @@ def _load_beir(name: str, split: Optional[str], seed: int) -> RetrievalDataset:
 
 def self_match_rows(queries: list[str], texts: list[str]) -> np.ndarray:
     """Per query, the corpus row with identical text (BEIR drops it from results: ArguAna queries are
-    corpus arguments), else -1. Matched on text: query and corpus ids live in separate namespaces."""
-    row_of_text = {t: i for i, t in enumerate(texts) if t}
-    return np.array([row_of_text.get(q, -1) for q in queries], dtype=np.int64)
+    corpus arguments), else -1. Matched on text: query and corpus ids live in separate namespaces.
+
+    This holds one row per query, so a query whose exact text sits in several rows has no correct answer here and raises. None of the
+    corpora measured has one. Near duplicates and paraphrases aren't excluded."""
+    wanted = set(queries)
+    rows: dict[str, list[int]] = {}
+    for i, t in enumerate(texts):
+        if t and t in wanted:
+            rows.setdefault(t, []).append(i)
+    repeated = [q for q, found in rows.items() if len(found) > 1]
+    if repeated:
+        raise ValueError(f"{len(repeated)} queries match several corpus rows exactly, e.g. {repeated[0][:80]!r}: self-match exclusion needs a policy for them")
+    return np.array([rows[q][0] if q in rows else -1 for q in queries], dtype=np.int64)
+
+
+FRESH_SEED = 20_261_105
+
+
+def _load_fresh(name: str, spec: DatasetSpec, seed: int) -> RetrievalDataset:
+    """``spec.fresh_of``'s corpus and row order, with queries it never loads, chosen at random: never in any earlier run."""
+    from datasets import load_dataset
+
+    base = load_beir(spec.fresh_of)
+    queries = load_dataset(spec.repo, spec.queries_config, split=spec.queries_split)
+    qrels = load_dataset(spec.repo, spec.qrels_config, split=spec.split)
+    used = set(base.queries)
+    query_text = dict(zip(map(str, queries["_id"]), queries["text"]))
+    row_of = {doc_id: i for i, doc_id in enumerate(base.doc_ids)}
+    rels: dict[str, dict[int, int]] = {}
+    for qid, did, score in zip(qrels["query-id"], qrels["corpus-id"], qrels["score"]):
+        if score > 0 and str(did) in row_of and str(qid) in query_text and query_text[str(qid)] not in used:
+            rels.setdefault(str(qid), {})[row_of[str(did)]] = int(score)
+    qids = sorted(rels)
+    if spec.max_queries is not None and len(qids) > spec.max_queries:
+        qids = sorted(np.random.default_rng(seed).choice(qids, spec.max_queries, replace=False).tolist())
+    texts = [query_text[q] for q in qids]
+    return replace(base, name=name, queries=texts, qrels=[rels[q] for q in qids], self_rows=self_match_rows(texts, base.texts))
 
 
 def _query_subsample(query_ids: list, scores: list, n: int, seed: int) -> np.ndarray:

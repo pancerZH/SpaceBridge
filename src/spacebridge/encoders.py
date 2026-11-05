@@ -1,5 +1,6 @@
 """Token-budgeted batching and the ``sentence-transformers`` encoder adapter (optional dependency)."""
 
+import threading
 from typing import Callable, Optional
 
 import numpy as np
@@ -10,7 +11,7 @@ TOKENIZE_CHUNK = 100_000  # bulk tokenizing keeps only lengths; 8.8M token lists
 CPU_BATCH_TOKENS = 1_024  # smaller is faster on this CPU: 10.0 s vs. 17.4 s to rerank 60 pairs at 16,384
 GPU_BATCH_TOKENS = 20_000
 GPU_RERANK_TOKENS = 10_000
-SIZE_CLASS_LARGE_PARAMS = 2e9  # ~4B models and above: the doc-pair pass costs far more than it gains (M3)
+SIZE_CLASS_LARGE_PARAMS = 2e9  # at least 2B parameters. Measured at 0.6B and 4B only: the doc-pair pass cost far more than it gained at 4B
 
 
 def token_lengths(tokenizer, *texts: list[str], max_length: int) -> np.ndarray:
@@ -77,11 +78,24 @@ class SentenceTransformerEncoder:
         self.model.eval()
         params = sum(p.numel() for p in self.model.parameters())
         self.size_class = "large" if params >= SIZE_CLASS_LARGE_PARAMS else "small"
+        self.model_name, self._lock = model, threading.RLock()
+        self._max_seq_length = self.model.max_seq_length
+
+    @property
+    def identity(self) -> dict:
+        """What an artifact fitted with this encoder depends on. The commit is read from the loaded model, when it says."""
+        config = getattr(getattr(self.model[0], "auto_model", None), "config", None)
+        return {
+            "model": self.model_name, "revision": getattr(config, "_commit_hash", None), "query_template": self.query_template,
+            "doc_template": self.doc_template, "max_seq_length": self._max_seq_length, "normalized": True,
+        }
 
     def encode_queries(self, texts: list[str]) -> np.ndarray:
         return self._encode([self.query_template.format(text=t) for t in texts], self.model.max_seq_length)
 
     def encode_docs(self, titles: list[str], texts: list[str], max_tokens: Optional[int] = None) -> np.ndarray:
+        if len(titles) != len(texts):
+            raise ValueError(f"{len(titles)} titles and {len(texts)} texts: they must be row-aligned")
         inputs = [
             self.doc_template.format(body=f"{title}\n{text}" if title else text, title_or_none=title or "none", text=text)
             for title, text in zip(titles, texts)
@@ -90,6 +104,14 @@ class SentenceTransformerEncoder:
         return self._encode(inputs, limit if max_tokens is None else min(max_tokens, limit))
 
     def _encode(self, inputs: list[str], max_length: int) -> np.ndarray:
+        if not inputs:
+            return np.empty((0, self.model.get_sentence_embedding_dimension()), dtype=np.float32)
+        # The tokenizer's limit is one setting on a shared model, so calls run one at a time: a query must not inherit a
+        # mount's 128-token limit, and overlapping calls must not restore the wrong one.
+        with self._lock:
+            return self._encode_locked(inputs, max_length)
+
+    def _encode_locked(self, inputs: list[str], max_length: int) -> np.ndarray:
         saved, self.model.max_seq_length = self.model.max_seq_length, max_length
         try:
             lengths = token_lengths(self.model.tokenizer, inputs, max_length=max_length)

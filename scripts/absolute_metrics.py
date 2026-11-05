@@ -24,7 +24,10 @@ def main() -> None:
         for line in path.open():
             r = json.loads(line)
             if "reranker" not in r and r["row"] in ("0a", "0b", *args.rows):
-                cells[r["dataset"], r["src"], r["tgt"], r["K"]][r["row"]].append(r)
+                bucket = cells[r["dataset"], r["src"], r["tgt"], r["K"]][r["row"]]
+                if any(x.get("seed", 0) == r.get("seed", 0) for x in bucket):
+                    raise ValueError(f"{path}: two records for {r['dataset']}, {r['src']} <- {r['tgt']}, K {r['K']}, row {r['row']}, seed {r.get('seed', 0)}")
+                bucket.append(r)
     for m in args.metrics:
         cols = ["native", "re-index"] + [f"Row {r}" for r in args.rows] + [f"ρceil {r}" for r in args.rows] + [f"ρnative {r}" for r in args.rows]
         print(f"\n### {m} (mean over seeds)\n")

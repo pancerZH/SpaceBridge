@@ -224,6 +224,10 @@ class MountEncoder:
     def __init__(self, spec: ModelSpec, task: str, device: str = "cuda"):
         self.spec, self.task, self.device = spec, task, device
         self.size_class = "large" if spec.params_b >= 2 else "small"
+        self.identity = {
+            "model": spec.hf_id, "query_template": spec.query_template, "doc_template": spec.doc_template, "task": task,
+            "max_seq_length": spec.max_seq_length, "truncate_dim": spec.truncate_dim, "normalized": True,
+        }
         self._encoders: dict[int, Encoder] = {}
 
     def _encoder(self, max_length: int) -> Encoder:

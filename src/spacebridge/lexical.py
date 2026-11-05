@@ -1,8 +1,8 @@
 """The lexical channel (design §4.6): BM25 over the index's own text, a quarter of the rerank pool.
 
-The map loses the detail that picks out the right document, and better calibration can't repair that (HotpotQA study). BM25
-doesn't use the map at all, so it holds much of what the map loses. Only a reranker can merge the two lists, and only queries in
-the index's language can match its words.
+The map loses detail that can pick out the right document, and the calibration changes tested did not recover it (HotpotQA study).
+BM25 doesn't use the map at all, so it holds much of what the map loses. This implementation leaves comparing the two lists to a
+reranker rather than fusing their scores, and only queries in the index's language can match its words.
 """
 
 import array
@@ -16,6 +16,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from . import durable, storage
+from .identity import check_text_fingerprint, text_fingerprint
 
 LEXICAL_SHARE = 4  # BM25 gets a quarter of the budget
 BUILD_BATCH_ROWS = 65_536
@@ -31,9 +32,10 @@ def tokens(text: str) -> list[str]:
 class LexicalIndex:
     """BM25 (k1 = 0.9, b = 0.4) over title and text, as one sparse matrix of ready-weighted term frequencies."""
 
-    def __init__(self, X: sp.csc_matrix, idf: np.ndarray, words: list[str]):
+    def __init__(self, X: sp.csc_matrix, idf: np.ndarray, words: list[str], corpus: Optional[dict] = None):
         self.X, self.idf = X, idf
         self.vocab = {w: i for i, w in enumerate(words)}
+        self.corpus = corpus  # text_fingerprint of the corpus it was built on; None if saved before these existed
 
     def __len__(self) -> int:
         return self.X.shape[0]
@@ -53,12 +55,21 @@ class LexicalIndex:
                 indptr.append(len(idx))
         X = sp.csr_matrix((np.frombuffer(tf, np.float32), np.frombuffer(idx, np.int32), np.frombuffer(indptr, np.int64)), shape=(N, len(vocab)), copy=True)
         del idx, tf, indptr
+        # Replace each term frequency by its BM25 weight, tf * (k1 + 1) / (tf + k1 * (1 - b + b * doc_length / mean_length)), so a
+        # query only sums columns times idf. The sparse data runs row by row, so each entry needs its own row's length.
         dl = np.asarray(X.sum(1)).ravel()
-        X.data = X.data * (k1 + 1) / (X.data + k1 * (1 - b + b * np.repeat(dl, np.diff(X.indptr)) / dl.mean()))
+        length_of_entry = np.repeat(dl, np.diff(X.indptr))
+        X.data = X.data * (k1 + 1) / (X.data + k1 * (1 - b + b * length_of_entry / dl.mean()))
         X = X.tocsc()
         df = np.diff(X.indptr)
         idf = np.log(1 + (N - df + 0.5) / (df + 0.5)).astype(np.float32)
-        return cls(X, idf, list(vocab))
+        return cls(X, idf, list(vocab), corpus=text_fingerprint(index))
+
+    def check_corpus(self, index) -> None:
+        """Raises if this BM25 index was built on another corpus or row order."""
+        if len(self) != len(index):
+            raise ValueError(f"the lexical index has {len(self):,} documents and the index {len(index):,}")
+        check_text_fingerprint(self.corpus, index, "this lexical index")
 
     def top(self, query: str, k: int, exclude=None) -> np.ndarray:
         """Up to ``k`` rows, best first, ties in row order, so ``top(q, m)`` is the head of ``top(q, k)``; a query with no
@@ -80,13 +91,13 @@ class LexicalIndex:
     def save(self, path: str | Path) -> None:
         words = "\n".join(self.vocab).encode()  # no word holds a newline, so there's nothing to pickle
         arrays = {"data": self.X.data, "indices": self.X.indices, "indptr": self.X.indptr, "idf": self.idf, "words": np.frombuffer(words, np.uint8)}
-        storage.save_dir(path, "lexical-index", arrays, {"shape": list(self.X.shape)})
+        storage.save_dir(path, "lexical-index", arrays, {"shape": list(self.X.shape), "corpus": self.corpus})
 
     @classmethod
     def load(cls, path: str | Path) -> "LexicalIndex":
         arrays, meta = storage.load_dir(path, "lexical-index")
         words = arrays["words"].tobytes().decode()
-        return cls(sp.csc_matrix((arrays["data"], arrays["indices"], arrays["indptr"]), shape=tuple(meta["shape"])), arrays["idf"], words.split("\n") if words else [])
+        return cls(sp.csc_matrix((arrays["data"], arrays["indices"], arrays["indptr"]), shape=tuple(meta["shape"])), arrays["idf"], words.split("\n") if words else [], corpus=meta.get("corpus"))
 
 
 def timed_build(index, label: str = "lexical index") -> LexicalIndex:
@@ -97,9 +108,10 @@ def timed_build(index, label: str = "lexical index") -> LexicalIndex:
 
 
 def merge_pool(dense: np.ndarray, lexical: Optional[np.ndarray], budget: int) -> np.ndarray:
-    """All of ``lexical``, then the top of ``dense`` up to ``budget``, no repeats. Dense rows come first, so ties in the
-    reranker keep first-stage order. Ask ``dense`` for the whole budget, not the rest of it, since the two lists overlap."""
-    keep = [] if lexical is None else [int(x) for x in lexical if x >= 0]
+    """All of ``lexical``, then the top of ``dense`` up to ``budget``, no repeats and never over budget (a lexical list longer than the
+    budget is cut). Dense rows come first, so ties in the reranker keep first-stage order. Ask ``dense`` for the whole budget, not the
+    rest of it, since the two lists overlap."""
+    keep = [] if lexical is None else list(dict.fromkeys(int(x) for x in lexical if x >= 0))[:max(budget, 0)]
     have = set(keep)
     room = budget - len(keep)
     head = []

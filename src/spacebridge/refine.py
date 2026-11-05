@@ -26,7 +26,9 @@ class RefineConfig:
     kl_scale: float = 1.0
     beta: Optional[float] = None  # None: 1e-3, or 1e-2 when d_t > K_train
     eval_every: int = 10
-    early_stop: bool = True  # False: run all steps and return the final W (validation is only logged)
+    # True: return a checkpoint chosen by the stop rule. It doesn't end the loop early: all steps always run, so it saves no time.
+    # False: return the final W (validation is only logged).
+    early_stop: bool = True
     # Checkpoint selection. "floor" (M2): the checkpoint with the best held-out own-doc MRR among those keeping
     # min_agree_ratio of step 0's teacher agree@10. "tail" (M4): the average of the checkpoints from step
     # tail_from on, if its own agree@10 clears the gap floor a0 - floor_gap * (1 - a0) (a0: step 0's agree@10, so
@@ -49,6 +51,14 @@ class RefineConfig:
     # into the 2560-d Qwen3-4B index (M4: -0.1 / -0.4 points at K = 2,048 / 4,096, 3 seeds; a cap scaled by
     # batch_ref_dim / d_s, 655 candidates, lost 1.2 points at K = 4,096).
     batch_ref_dim: int = 1024
+
+    def __post_init__(self) -> None:
+        if self.steps < 1:
+            raise ValueError(f"RefineConfig.steps must be at least 1, got {self.steps}")
+        if self.eval_every < 1:
+            raise ValueError(f"RefineConfig.eval_every must be at least 1, got {self.eval_every}")
+        if self.stop_rule not in ("floor", "tail"):
+            raise ValueError(f"RefineConfig.stop_rule must be 'floor' or 'tail', got {self.stop_rule!r}")
 
 
 def agree_floor(a0: float, cfg: RefineConfig) -> float:
@@ -90,8 +100,9 @@ def refine(
     ``select_checkpoint`` picks one from the whole curve. Step 0 (W0) is a candidate.
     """
     K_train, d_t = Yc_train.shape
-    beta = cfg.beta if cfg.beta is not None else (1e-2 if d_t > K_train else 1e-3)
     n_cand, dev = Xd_train.shape[0], W0.device
+    # The penalty follows the anchor count: doc pairs double the rows, but those rows are related, not twice the information.
+    beta = cfg.beta if cfg.beta is not None else (1e-2 if d_t > n_cand else 1e-3)
     mu_x = mu_x.expand(K_train, -1) if mu_x.dim() == 1 else mu_x
     if labels is None:
         labels = torch.arange(K_train, device=dev)
@@ -114,6 +125,8 @@ def refine(
     for step in range(1, cfg.steps + 1):
         mu_b, Y_b, cand, lab, t = mu_x, Yc_train, Xd_train, labels, teacher
         if batch is not None:
+            # This step sees only some candidates, so it keeps only the rows whose positive is among them, and each label
+            # becomes its positive's position in the sample: slot[d] is candidate d's position, or -1 if it wasn't drawn.
             sel = torch.randperm(n_cand, generator=gen, device=dev)[:batch]
             slot = torch.full((n_cand,), -1, dtype=torch.long, device=dev)
             slot[sel] = torch.arange(batch, device=dev)

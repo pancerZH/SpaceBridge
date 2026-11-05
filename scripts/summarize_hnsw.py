@@ -1,5 +1,8 @@
 """M2 A4: end-to-end retention through a real HNSW index, from hnsw_study.py records.
 
+Two denominators, not to be mixed up: this script divides by min(native through the same HNSW setting, re-index exact), while scripts/summarize_m3.py and
+scripts/summarize_closeout.py divide by the exact min(native, re-index). A change between their tables can be the denominator, not the system.
+
 Retention through HNSW is bridged-through-HNSW / min(native through the same HNSW setting, re-index exact); a re-indexed model has
 no HNSW index here, so its exact score is the ceiling's other side, as in M1. Exact retention is the same ratio with exact search.
 

@@ -13,6 +13,7 @@ import argparse
 import json
 import time
 from pathlib import Path
+from typing import Optional
 
 import faiss
 import numpy as np
@@ -23,7 +24,8 @@ from spacebridge.serving import HNSW_SAVE_SECONDS, save_faiss_index
 from spacebridge_bench import durable
 from spacebridge_bench.datasets import load_beir
 from spacebridge_bench.encode import Encoder, MountEncoder
-from spacebridge_bench.metrics import per_query
+from spacebridge_bench.metrics import per_query, recall_at
+from spacebridge_bench.provenance import check_or_write_config
 from spacebridge_bench.models import MODELS
 from spacebridge_bench.rerank import RERANKERS, Reranker, rerank, rerank_pools
 from spacebridge_bench.run import _DocTexts, _first_docs, _first_queries, anchor_candidates, cached_anchors, cached_lexical
@@ -63,12 +65,11 @@ def rankings_report(res: Results, tag: str, approx: np.ndarray, exact: np.ndarra
             continue
         pq_a = per_query(rerank(rr, approx, pool, queries, docs, ds.task), ds.qrels)
         pq_e = per_query(rerank(rr, exact, pool, queries, docs, ds.task), ds.qrels)
-        first_a, first_e = per_query(approx[:, :pool], ds.qrels), per_query(exact[:, :pool], ds.qrels)
         res.add(
             key, tag=tag, pool=pool, recall_of_exact=overlap(approx[:, :pool], exact[:, :pool]),
             ndcg5_approx=float(pq_a["ndcg@5"].mean()), ndcg5_exact=float(pq_e["ndcg@5"].mean()),
-            recall_pool_approx=float(first_a.get(f"recall@{pool}", first_a["recall@100"]).mean()),
-            recall_pool_exact=float(first_e.get(f"recall@{pool}", first_e["recall@100"]).mean()),
+            recall_pool_approx=float(recall_at(approx, ds.qrels, pool).mean()),
+            recall_pool_exact=float(recall_at(exact, ds.qrels, pool).mean()),
         )
 
 
@@ -86,9 +87,15 @@ def lexical_report(res: Results, tag: str, approx: np.ndarray, exact: np.ndarray
                 recall30_approx=float(pq_a["recall@30"].mean()), recall30_exact=float(pq_e["recall@30"].mean()))
 
 
-def hnsw_search(index, Q: np.ndarray, k: int, ef: int) -> np.ndarray:
+def hnsw_search(index, Q: np.ndarray, k: int, ef: int, exclude: Optional[np.ndarray] = None) -> np.ndarray:
+    """Top-k row ids. ``exclude`` holds one row per query that may not be returned, the same self-match policy exact search applies: one
+    more row is asked for, so a removed row doesn't cost a candidate slot."""
     index.hnsw.efSearch = ef
-    return index.search(np.asarray(Q, dtype=np.float32), k)[1]
+    if exclude is None or (exclude < 0).all():
+        return index.search(np.asarray(Q, dtype=np.float32), k)[1]
+    ranked = index.search(np.asarray(Q, dtype=np.float32), k + 1)[1]
+    keep = ranked != exclude[:, None]
+    return np.stack([row[mask][:k] for row, mask in zip(ranked, keep)])
 
 
 class QuantizedIndex:
@@ -140,6 +147,7 @@ def main() -> None:
     p.add_argument("--nprobe", type=int, nargs="+", default=[64, 256])
     p.add_argument("--save-seconds", type=float, default=HNSW_SAVE_SECONDS, help="save a growing HNSW index this often")
     p.add_argument("--index-dir", type=Path, default=HNSW_CACHE, help="where indexes are kept")
+    p.add_argument("--index-path", type=Path, default=None, help="use this index rather than the one named after the dataset (the same rows under another name)")
     p.add_argument("--pools", type=int, nargs="+", default=list(POOLS), help="candidates sent to the reranker")
     p.add_argument("--efs", type=int, nargs="+", default=list(EFS), help="efSearch values to read")
     p.add_argument("--lexical", action="store_true", help="also put BM25 in the pool; refuses to build: it only reads an index that exists")
@@ -154,6 +162,8 @@ def main() -> None:
         ds = _first_docs(ds, args.max_docs)
     if args.max_queries is not None:
         ds = _first_queries(ds, args.max_queries)
+    # The key of a result names its query model, seed, ef and pool; this ties the file to everything else that can change a number.
+    check_or_write_config(args.out, {"dataset": ds.name, "n_docs": ds.N, "n_queries": len(ds.queries), "index_model": args.index_model, "K": args.K, "M": args.M, "ef_construction": args.ef_construction, "lexical": args.lexical, "ivfpq": args.ivfpq, "max_docs": args.max_docs})
     res = Results(args.out)
     src = MODELS[args.index_model]
     enc = Encoder(src, args.device)
@@ -161,7 +171,7 @@ def main() -> None:
     Q_native = enc.queries(ds.index_lang_queries, ds.task)
     enc.unload()
 
-    path = args.index_dir / f"{ds.name}_{store.path.stem}_{store.dim}d_M{args.M}_efc{args.ef_construction}.faiss"
+    path = args.index_path or args.index_dir / f"{ds.name}_{store.path.stem}_{store.dim}d_M{args.M}_efc{args.ef_construction}.faiss"
     if args.lexical and (not path.exists() or faiss.read_index(str(path), faiss.IO_FLAG_MMAP | faiss.IO_FLAG_READ_ONLY).ntotal < store.shape[0]):
         raise SystemExit(f"--lexical only reads a finished index, and {path} is not there or still building")
     t0 = time.perf_counter()
@@ -181,13 +191,13 @@ def main() -> None:
     exact_native = cached_search(Q_native, store, 1000, args.device, exclude=ds.self_rows)
     lexical_top = None
     if args.lexical:
-        lexical = cached_lexical(ds, Index(store, ds.texts, ds.titles))
+        lexical = cached_lexical(ds, ds.index_over(store))
         lexical_top = [lexical.top(q, maxk // LEXICAL_SHARE, exclude=s) for q, s in zip(ds.queries, ds.self_rows.tolist())]
     for ef in efs:
-        ranked = hnsw_search(index, Q_native, maxk, ef)
+        ranked = hnsw_search(index, Q_native, maxk, ef, ds.self_rows)
         rankings_report(res, f"hnsw|native|ef{ef}", ranked, exact_native, ds, ds.index_lang_queries, rr, pools)
     rr.unload()
-    pool_index = Index(store, ds.texts, ds.titles)
+    pool_index = ds.index_over(store)
     pq_index = None
     if args.ivfpq:
         pq_index = build_ivfpq(store, HNSW_CACHE / f"{ds.name}_{store.path.stem}_{store.dim}d_{args.ivfpq.replace(',', '_')}.faiss", args.ivfpq)
@@ -225,13 +235,14 @@ def main() -> None:
             Q_hat = bridge.transform_query(Q_tgt)
             exact = search(Q_hat, store, 1000, args.device, exclude=ds.self_rows)
             for ef in efs:
-                ranked = hnsw_search(index, Q_hat, maxk, ef)
+                ranked = hnsw_search(index, Q_hat, maxk, ef, ds.self_rows)
                 rankings_report(res, f"hnsw|{tgt_key}|s{seed}|ef{ef}", ranked, exact, ds, ds.queries, rr, pools)
                 if args.lexical:
                     lexical_report(res, f"lexical|{tgt_key}|s{seed}|ef{ef}", ranked, exact, lexical_top, ds, ds.queries, rr, pools)
             if pq_index is not None:
                 reader = QuantizedIndex(pq_index, ds, store.dim)
-                pq_bundle = freeze(reader, MountEncoder(src, ds.task, args.device), ds.lang, seed, args.K or None, device=args.device)
+                # The same anchors, split and candidates as the exact fit, so this contrast changes the vectors and nothing else.
+                pq_bundle = freeze(reader, MountEncoder(src, ds.task, args.device), ds.lang, seed, K, anchor_ids=anchors, device=args.device)
                 pq_bridge = mount(pq_bundle, reader, MountEncoder(MODELS[tgt_key], ds.task, args.device), device=args.device)
                 Q_hat_pq = pq_bridge.transform_query(Q_tgt)
                 for nprobe in args.nprobe:

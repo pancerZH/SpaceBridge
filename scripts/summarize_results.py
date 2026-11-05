@@ -15,9 +15,7 @@ TIER_OF = {("bge-base-en", "bge-large-en"): "1", ("bge-large-en", "bge-base-en")
 HIGH, MODERATE = 0.58, 0.40
 
 
-def spearman(a, b) -> float:
-    ra, rb = np.argsort(np.argsort(a)), np.argsort(np.argsort(b))
-    return float(np.corrcoef(ra, rb)[0, 1])
+from spacebridge_bench.metrics import spearman  # noqa: E402  ties get average ranks; a constant side is undefined
 
 
 def pair_name(r: dict) -> str:

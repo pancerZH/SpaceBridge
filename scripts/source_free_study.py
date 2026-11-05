@@ -62,7 +62,7 @@ def main() -> None:
         native = per_query(cached_search(Q_src, E_src, 1000, args.device, exclude=ds.self_rows), ds.qrels)
         oracle = per_query(cached_search(Q_tgt, E_tgt, 1000, args.device, exclude=ds.self_rows), ds.qrels)
         native_m, oracle_m = {m: float(v.mean()) for m, v in native.items()}, {m: float(v.mean()) for m, v in oracle.items()}
-        index = Index(E_src, ds.texts, ds.titles)
+        index = ds.index_over(E_src)
         for seed in args.seed:
             allowed = np.setdiff1d(np.arange(ds.N), ds.self_rows)
             K = args.K or None

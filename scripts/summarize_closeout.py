@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
+from spacebridge_bench.metrics import spearman  # noqa: E402
 from summarize_m3 import LINES, STRETCH, absolute, ci, cells_positive, mean_over_pairs, read, rho, short, strict, table, tier, worst  # noqa: E402
 
 BUDGET_LINE = 0.10
@@ -301,8 +302,7 @@ def b6() -> None:
         if ab:
             print(f"- Graded A or B, so served 60: {len(ab)} pairs, mean gain {st.mean(r['gain'] for r in ab):+.2f}, mean margin over the line {st.mean(r['margin'] for r in ab):+.1f}.")
         xs, ys = np.array([r["score"] for r in have]), np.array([r["gain"] for r in have])
-        ranks = lambda a: np.argsort(np.argsort(a))
-        print(f"- Spearman of score with what budget 100 gains, over {len(have)} pairs: {float(np.corrcoef(ranks(xs), ranks(ys))[0, 1]):+.2f}. Of margin with gain: {float(np.corrcoef(ranks(np.array([r['margin'] for r in have])), ranks(ys))[0, 1]):+.2f}.")
+        print(f"- Spearman of score with what budget 100 gains, over {len(have)} pairs: {spearman(xs, ys):+.2f}. Of margin with gain: {spearman(np.array([r['margin'] for r in have]), ys):+.2f}.")
 
 
 def b7() -> None:
@@ -341,10 +341,13 @@ def b7() -> None:
                 if pool == 60:
                     verdict[(t, ef)] = ret
     print("\n## The reading, fixed in advance, budget 60, mean over seeds\n")
-    if verdict:
-        at = lambda ef: all(verdict[(t, ef)] >= HNSW_LINE[t] for t in ("T1", "T3") if (t, ef) in verdict)
-        v = "**The supported range holds on HNSW**" if at(500) else "**It holds at a higher ef: ef 1000**" if 1000 in efs and at(1000) else "**It doesn't hold on HNSW**"
-        print("; ".join(f"Tier {t[1]} at ef {ef}: {x:.3f}" for (t, ef), x in sorted(verdict.items())) + f". {v}.")
+    # A pass needs every tier at this ef, each from all its seeds, baselines and settings (the loop above skips incomplete ones). Missing
+    # evidence reads "incomplete", never "pass".
+    complete = lambda ef: all((t, ef) in verdict for t in ("T1", "T3"))
+    at = lambda ef: complete(ef) and all(verdict[(t, ef)] >= HNSW_LINE[t] for t in ("T1", "T3"))
+    v = ("**The supported range holds on HNSW**" if at(500) else "**It holds at a higher ef: ef 1000**" if 1000 in efs and at(1000)
+         else "**Incomplete: results are missing at ef 500**" if not complete(500) else "**It doesn't hold on HNSW**")
+    print("; ".join(f"Tier {t[1]} at ef {ef}: {x:.3f}" for (t, ef), x in sorted(verdict.items())) + f". {v}.")
 
 
 def final() -> None:

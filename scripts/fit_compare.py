@@ -47,7 +47,7 @@ def main() -> None:
     enc = Encoder(MODELS[args.query_model], args.device)
     Q = np.asarray(enc.queries(ds.queries, ds.task), dtype=np.float32)
     enc.unload()
-    index = Index(store, ds.texts, ds.titles)
+    index = ds.index_over(store)
     lang = ds.query_lang
     banks = {lang: load_shift_bank(lang)[:2]} if lang else None
     K = args.K or default_anchor_count(ds.N)

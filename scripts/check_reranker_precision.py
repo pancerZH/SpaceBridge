@@ -33,7 +33,7 @@ BOOTSTRAPS = 2_000
 
 
 class Fp32Reranker(Reranker):
-    """A reranker in fp32 on the GPU: the same numbers as a CPU's, faster."""
+    """A reranker in fp32 on the GPU. The same dtype as a CPU run, not proven the same numbers: kernels and attention code can differ, and CPU agreement on this task is assumed, not tested."""
 
     @property
     def model(self):

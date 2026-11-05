@@ -22,6 +22,7 @@ import torch
 from spacebridge import CrossEncoderReranker, ExactBackend, HnswBackend, Index, LexicalIndex, Searcher, SpaceBridge, freeze, mount
 from spacebridge.encoders import CPU_BATCH_TOKENS, predict_pairs, token_lengths
 from spacebridge_bench import durable
+from spacebridge_bench.provenance import check_or_write_config, query_digest
 from spacebridge_bench.datasets import load_beir
 from spacebridge_bench.encode import Encoder, MountEncoder
 from spacebridge_bench.models import MODELS
@@ -109,16 +110,18 @@ def main() -> None:
 
     ds, store = load(args)
     if args.mode == "fit":
-        index = Index(store, ds.texts, ds.titles)
+        index = ds.index_over(store)
         bundle = freeze(index, MountEncoder(MODELS[args.index_model], ds.task, args.device), ds.lang, args.seed, device=args.device)
         mount(bundle, index, MountEncoder(MODELS[args.query_model], ds.task, args.device), device=args.device).save(args.bridge)
         durable.progress(f"bridge saved to {args.bridge}")
         return
 
     torch.set_num_threads(args.threads)
+    if args.out:
+        check_or_write_config(args.out, {"dataset": ds.name, "n_docs": ds.N, "queries_sha256": query_digest(ds.queries[: args.n + 1]), "index_model": args.index_model, "query_model": args.query_model, "n": args.n, "seed": args.seed, "bridge": str(args.bridge)})
     done = {r["key"] for r in durable.read_jsonl(args.out)[0]} if args.out and args.out.exists() else set()
     bridge = SpaceBridge.load(args.bridge, device="cpu")
-    index = Index(store, ds.texts, ds.titles)
+    index = ds.index_over(store)
     t0 = time.perf_counter()
     if args.backend == "exact":
         backend = ExactBackend(store[np.arange(len(store))] if len(store) < 3_000_000 else _load_all(store), device=args.search_device or args.device)

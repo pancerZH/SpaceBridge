@@ -157,7 +157,7 @@ def main() -> None:
 
     rng = np.random.default_rng(0)
     print(f"Real ρ ({args.metric}; identity vs. native, bridge vs. ceiling) of the checkpoint each rule picks. "
-          f"Δ vs. {args.base}, points, 95% bootstrap CI over (pair, seed) cells; swing = per-pair s.d. over seeds "
+          f"Δ vs. {args.base}, points, bootstrap over this table's (pair, seed) cells, which share queries (not a CI for new queries or corpora); swing = per-pair s.d. over seeds "
           f"(points, mean over pairs); regret = best checkpoint in hindsight − pick (points, mean / max).\n")
     for (ds, kind, K), rs in sorted(groups.items(), key=lambda kv: tuple(map(str, kv[0]))):
         best = np.array([max(v[args.metric] for k, v in r["stage2_real"].items() if not k.startswith("avg")) for r in rs])
