@@ -16,10 +16,10 @@ import numpy as np
 from spacebridge import Index, freeze, mount
 from spacebridge.anchors import _truncate_tokens
 from spacebridge_bench import durable
-from spacebridge_bench.datasets import load_beir
+from spacebridge_bench.datasets import DATASETS, load_beir
 from spacebridge_bench.encode import Encoder, MountEncoder
 from spacebridge_bench.metrics import bootstrap_retention_ci, per_query, retention
-from spacebridge_bench.provenance import check_or_write_config, implementation_digest, query_digest
+from spacebridge_bench.provenance import check_or_write_config, implementation_digest, query_digest, revisions
 from spacebridge_bench.models import MODELS
 from spacebridge_bench.run import _first_queries
 from spacebridge_bench.search import cached_search_nested, search_nested
@@ -64,9 +64,12 @@ def ranked_for(key: str, ds, sizes, queries, device) -> tuple:
     return store, Q, cached_search_nested(Q, store, sizes, device, exclude=ds.self_rows)
 
 
-def file_config(ds, sizes: list[int], device: str) -> dict:
-    """What a results file is tied to, beyond each cell's pair, K and seed: the size grid, the queries, the device and the code."""
-    return {"dataset": ds.name, "n_docs": ds.N, "sizes": list(sizes), "queries_sha256": query_digest(ds.queries), "device": device, "implementation": implementation_digest()}
+def file_config(ds, sizes: list[int], device: str, model_keys: tuple = ()) -> dict:
+    """What a results file is tied to, beyond each cell's pair, K and seed: the size grid, the queries, the device, the code including this
+    script, and the resolved revisions of the models it uses and of the dataset."""
+    return {"dataset": ds.name, "n_docs": ds.N, "sizes": list(sizes), "queries_sha256": query_digest(ds.queries), "device": device,
+            "implementation": implementation_digest(Path(__file__)),
+            "revisions": revisions([MODELS[k].hf_id for k in model_keys], [DATASETS[ds.name.split("@")[0]].repo])}
 
 
 def main() -> None:
@@ -86,7 +89,7 @@ def main() -> None:
         ds = _first_queries(ds, args.max_queries)
     sizes = sorted(s for s in args.sizes if s <= ds.N)
     # A cell's key names its pair, K and seed; the file is tied to the rest: sizes, queries, device and code.
-    check_or_write_config(args.out, file_config(ds, sizes, args.device))
+    check_or_write_config(args.out, file_config(ds, sizes, args.device, tuple(sorted({k for pr in args.pair for k in pr.split(":")}))))
     done = finished(args.out)
     positives = np.array(sorted({d for rel in ds.qrels for d in rel}))
     if positives.max() >= sizes[0]:

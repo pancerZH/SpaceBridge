@@ -47,9 +47,13 @@ def collect(model_ids: Iterable[str], dataset_repos: Iterable[str]) -> dict[str,
     }
 
 
-def implementation_digest() -> str:
-    """A hash of the library's and the harness's source, and the shipped calibration: every default and every code path a number
-    depends on. Any edit changes it, so results never resume across code changes."""
+LOCK_FILE = Path(__file__).parents[2] / "uv.lock"
+
+
+def implementation_digest(*scripts: Path) -> str:
+    """A hash of the code a number depends on: the library's and the harness's source and the shipped calibration, the dependency lock,
+    and any ``scripts`` given (a study script passes its own file). Editing any of these starts a new result file. Code outside them, such
+    as another study script or a summary script, isn't covered, and neither are packages installed outside the lock."""
     import spacebridge
 
     h = hashlib.sha256()
@@ -57,6 +61,8 @@ def implementation_digest() -> str:
         for path in sorted(root.rglob("*")):
             if path.suffix in (".py", ".json") and "__pycache__" not in path.parts:
                 h.update(str(path.relative_to(root.parent)).encode() + b"\x00" + path.read_bytes() + b"\x01")
+    for path in ([LOCK_FILE] if LOCK_FILE.exists() else []) + [Path(p) for p in scripts]:
+        h.update(Path(path).name.encode() + b"\x00" + Path(path).read_bytes() + b"\x01")
     return h.hexdigest()[:16]
 
 

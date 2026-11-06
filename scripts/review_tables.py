@@ -58,6 +58,10 @@ def pts(v) -> str:
     return "" if v is None else f"{100 * v:+.1f}"
 
 
+# Names, not numbers: row "9" is the BM25-off row, never the integer 9.
+TEXT_COLUMNS = {"source", "dataset", "row", "family", "verdict", "missing_cells", "worst_pair_name", "cell", "system", "run", "kind", "model", "device", "stage", "backend", "source_note"}
+
+
 def read_csv(name: str) -> list[dict]:
     def typed(v: str):
         if v == "":
@@ -71,7 +75,7 @@ def read_csv(name: str) -> list[dict]:
                 return v
 
     with (RESULTS / name).open(newline="") as f:
-        return [{k: typed(v) for k, v in r.items()} for r in csv.DictReader(f)]
+        return [{k: (v if k in TEXT_COLUMNS else typed(v)) for k, v in r.items()} for r in csv.DictReader(f)]
 
 
 def read_jsonl(name: str) -> list[dict]:
@@ -316,6 +320,10 @@ def main() -> None:
     p.add_argument("--check", action="store_true")
     a = p.parse_args()
     tables = build_tables()
+    empty = sorted(name for name, text in tables.items() if len(text.splitlines()) < 3)
+    if empty:  # a table with a header and no rows means its inputs weren't found: never write or accept it
+        print(f"tables with no rows: {', '.join(empty)}")
+        sys.exit(1)
     stale = []
     for name in DOCS:
         path = Path(name)

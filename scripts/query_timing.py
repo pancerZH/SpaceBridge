@@ -22,8 +22,8 @@ import torch
 from spacebridge import CrossEncoderReranker, ExactBackend, HnswBackend, Index, LexicalIndex, Searcher, SpaceBridge, freeze, mount
 from spacebridge.encoders import CPU_BATCH_TOKENS, predict_pairs, token_lengths
 from spacebridge_bench import durable
-from spacebridge_bench.provenance import artifact_digest, check_or_write_config, implementation_digest, query_digest
-from spacebridge_bench.datasets import load_beir
+from spacebridge_bench.provenance import artifact_digest, check_or_write_config, implementation_digest, query_digest, revisions
+from spacebridge_bench.datasets import DATASETS, load_beir
 from spacebridge_bench.encode import Encoder, MountEncoder
 from spacebridge_bench.models import MODELS
 from spacebridge_bench.rerank import OnnxCrossEncoder
@@ -122,7 +122,9 @@ def main() -> None:
             "dataset": ds.name, "n_docs": ds.N, "queries_sha256": query_digest(ds.queries[: args.n + 1]), "index_model": args.index_model, "query_model": args.query_model,
             "n": args.n, "seed": args.seed, "bridge": str(args.bridge), "bridge_sha256": artifact_digest(args.bridge),
             "backend_sha256": "exact" if args.backend == "exact" else artifact_digest(Path(args.backend)),
-            "lexical_sha256": artifact_digest(args.lexical) if args.lexical else None, "implementation": implementation_digest(),
+            "lexical_sha256": artifact_digest(args.lexical) if args.lexical else None, "implementation": implementation_digest(Path(__file__)),
+            "revisions": revisions([MODELS[args.index_model].hf_id, MODELS[args.query_model].hf_id] + ([] if args.reranker.startswith("onnx:") else [args.reranker]),
+                                   [DATASETS[ds.name.split("@")[0]].repo]),
         })
     done = {r["key"] for r in durable.read_jsonl(args.out)[0]} if args.out and args.out.exists() else set()
     bridge = SpaceBridge.load(args.bridge, device="cpu")

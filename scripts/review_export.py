@@ -181,8 +181,8 @@ def export_timing() -> None:
             for r in read_jsonl(path):
                 for stage, v in r["stages_ms"].items():
                     w.writerow([path.stem, r["device"] if r.get("search_device") in (None, r["device"]) else f"{r['device']}, search on {r['search_device']}", r["dataset"], r["N"],
-                                "HNSW" if r["backend"] != "exact" else "exact", r["pool"], r["n"], stage, round(v["p50"], 2), round(v["p95"], 2),
-                                round(r.get("tokens_per_pair", 0), 1), round(r.get("peak_rss_gb", 0), 2), round(r.get("peak_vram_gb", 0) or 0, 2), round(r.get("load_s", 0), 1)])
+                                "HNSW" if r["backend"] != "exact" else "exact", r["pool"], r["n"], stage, v["p50"], v["p95"],
+                                r.get("tokens_per_pair", 0), r.get("peak_rss_gb", 0), r.get("peak_vram_gb", 0) or 0, r.get("load_s", 0)])
 
 
 def export_setup() -> None:
@@ -192,12 +192,12 @@ def export_setup() -> None:
         w.writerow(["kind", "model", "device", "documents", "K", "tokens_per_doc", "tokens_per_s", "seconds", "source"])
         for r in read_jsonl(PHASE1 / "m1_timing/mount.jsonl"):
             if r.get("mode") == "rate":
-                w.writerow(["encode_rate", r["model"], r["device"], r["N"], "", round(r["tokens_per_doc"], 3), round(r["tokens_per_s"], 1), "", "outputs/phase1/m1_timing/mount.jsonl"])
+                w.writerow(["encode_rate", r["model"], r["device"], r["N"], "", r["tokens_per_doc"], r["tokens_per_s"], "", "outputs/phase1/m1_timing/mount.jsonl"])
             elif r.get("mode") == "mount":
-                w.writerow(["mount", r["model"], r["device"], r["N"], r["K"], "", "", round(r["mount_s"], 2), "outputs/phase1/m1_timing/mount.jsonl"])
+                w.writerow(["mount", r["model"], r["device"], r["N"], r["K"], "", "", r["mount_s"], "outputs/phase1/m1_timing/mount.jsonl"])
         build = next((r for r in read_jsonl(PHASE1 / "w5_ann/ms1m.jsonl") if r.get("key") == "build"), None)
         if build:
-            w.writerow(["hnsw_build", "bge-large-en", "cpu", 1_000_000, "", "", "", round(build["build_s_this_run"], 1), "outputs/phase1/w5_ann/ms1m.jsonl"])
+            w.writerow(["hnsw_build", "bge-large-en", "cpu", 1_000_000, "", "", "", build["build_s_this_run"], "outputs/phase1/w5_ann/ms1m.jsonl"])
         w.writerow(["hnsw_build", "bge-large-en", "cpu", 8_841_823, "", "", "", 1.8 * 3600, "the 8.84M build, about 1.8 hours on 12 threads"])
         w.writerow(["bm25_build", "", "cpu", 1_000_000, "", "", "", 22.0, "LexicalIndex.build, 14 to 22 s at 1M; the upper end"])
         w.writerow(["bm25_build", "", "cpu", 8_841_823, "", "", "", 128.0, "LexicalIndex.build at 8.84M"])
@@ -242,7 +242,7 @@ def export_datasets() -> None:
         w = csv.DictWriter(f, list(rows[0]))
         w.writeheader()
         for r in rows:
-            w.writerow({k: round(v, 6) if isinstance(v, float) else v for k, v in r.items()})
+            w.writerow(r)
 
 
 def write_checksums() -> None:

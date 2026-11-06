@@ -18,10 +18,10 @@ import torch
 from spacebridge import Index, SentenceTransformerEncoder, freeze, mount
 from spacebridge.encoders import token_lengths
 from spacebridge_bench import durable
-from spacebridge_bench.datasets import load_beir
+from spacebridge_bench.datasets import DATASETS, load_beir
 from spacebridge_bench.encode import Encoder, MountEncoder
 from spacebridge_bench.models import MODELS
-from spacebridge_bench.provenance import config_id, implementation_digest
+from spacebridge_bench.provenance import config_id, implementation_digest, revisions
 from spacebridge_bench.run import _first_docs
 
 
@@ -76,7 +76,8 @@ def time_rate(args, ds) -> dict:
 def measurement_key(args) -> str:
     """Readable parts first, then a hash of every option that can change the measurement, and of the code."""
     options = {"mode": args.mode, "dataset": args.dataset, "model": args.model, "index_model": args.index_model, "K": args.K, "max_docs": args.max_docs,
-               "seed": args.seed, "n": args.n, "device": args.device, "threads": args.threads, "implementation": implementation_digest()}
+               "seed": args.seed, "n": args.n, "device": args.device, "threads": args.threads, "implementation": implementation_digest(Path(__file__)),
+               "revisions": revisions([MODELS[args.model].hf_id, MODELS[args.index_model].hf_id], [DATASETS[args.dataset.split("@")[0]].repo])}
     return f"{args.mode}|{args.dataset}|{args.model}|{args.device}|t{args.threads}|{config_id(options)}"
 
 

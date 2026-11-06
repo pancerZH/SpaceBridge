@@ -6,6 +6,9 @@ weaker baseline in each, and recomputes that whole average. It is conditional on
 separately: it does not vary the evaluation sample, only the anchors, split and distractors.
 
     python scripts/retention_ci.py outputs/review/per_query/<name> ... --row 9h --out table.jsonl
+    python scripts/retention_ci.py outputs/review/per_query/<name> --plan results/manifests.jsonl   for runs whose manifest has no plan
+
+A family missing any planned cell reads "incomplete", and the command then exits with an error, so it never confirms a partial run.
 """
 import argparse
 import json
@@ -124,26 +127,61 @@ def summarize(cells: list[dict], n_docs: int, boot: int = BOOTSTRAPS, seed: int 
     return out
 
 
-def main() -> None:
-    p = argparse.ArgumentParser()
+def parse_cell(cell: str) -> tuple:
+    """(index model, query model, seed) of a planned cell: "dataset|src|tgt|K|s0" from a run's manifest, or "src|tgt|0" from results/."""
+    parts = cell.split("|")
+    if len(parts) == 3:
+        return parts[0], parts[1], int(parts[2])
+    return parts[1], parts[2], int(parts[4].removeprefix("s"))
+
+
+def run_plan(manifest: Path, plan_file: Path | None, name: str) -> tuple[set, int]:
+    """The planned cells and corpus size of one run. Its manifest must name one configuration, so its cells share one query list. The plan
+    comes from the manifest, or else from a published plan (results/manifests.jsonl) for runs made before manifests recorded it."""
+    if not manifest.exists():
+        raise SystemExit(f"{name}: no manifest at {manifest}, so nothing says which cells were planned or that they share one query list")
+    lines = [json.loads(line) for line in manifest.read_text().splitlines() if line.strip()]
+    configs = [m for m in lines if "config" in m]
+    ids = {m["config_id"] for m in configs}
+    if len(ids) != 1:
+        raise SystemExit(f"{name}: its manifest names {len(ids)} configurations, so its cells may not share one query list")
+    planned = {parse_cell(c) for m in configs for c in m.get("planned_cells", [])}
+    if not planned and plan_file is not None:
+        published = {m["run"]: m for m in (json.loads(line) for line in plan_file.read_text().splitlines() if line.strip())}
+        if published.get(name, {}).get("expected_cells"):
+            if published[name]["config_id"] != configs[0]["config_id"]:
+                raise SystemExit(f"{name}: the published plan is for configuration {published[name]['config_id']}, and this run is {configs[0]['config_id']}")
+            planned = {parse_cell(c) for c in published[name]["expected_cells"]}
+    return planned, configs[0]["config"]["n_docs"]
+
+
+def main(argv: list[str] | None = None) -> None:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("directories", nargs="+", type=Path)
     p.add_argument("--row", default="9h")
+    p.add_argument("--plan", type=Path, default=None, help="a published plan, results/manifests.jsonl, for runs whose own manifest has no planned cells")
+    p.add_argument("--allow-unplanned", action="store_true", help="with no plan, judge the cells present; verdicts then say nothing about missing cells")
     p.add_argument("--out", type=Path, default=None)
-    a = p.parse_args()
-    rows = []
+    a = p.parse_args(argv)
+    rows, incomplete = [], []
     for d in a.directories:
         cells = load_cells(d, a.row)
         if not cells:
             continue
         name = cells[0]["dataset"]
-        manifest = d.parent.parent / f"{d.name}.jsonl.manifest.jsonl"
-        n_docs = json.loads(manifest.read_text().splitlines()[0])["config"]["n_docs"]
-        for r in summarize(cells, n_docs):
+        planned, n_docs = run_plan(d.parent.parent / f"{d.name}.jsonl.manifest.jsonl", a.plan, d.name)
+        if not planned and not a.allow_unplanned:
+            raise SystemExit(f"{d.name}: no planned cells in its manifest or in --plan, so a missing cell couldn't be detected. Pass --plan, or --allow-unplanned")
+        for r in summarize(cells, n_docs, expected=planned or None):
             rows.append({"source": d.name, "dataset": name, "row": a.row, **r})
+            if r.get("verdict") == "incomplete":
+                incomplete.append(f"{d.name} {r['family']}: missing {', '.join(r['missing_cells'])}")
             print(f"{d.name:42} {r['family']:6} n={r['n_queries']:5} {r['retention']:.3f} [{r['retention_low']:.3f}, {r['retention_high']:.3f}] {r.get('verdict', ''):11} vs re-index {r.get('vs_reindex', float('nan')):.3f}")
     if a.out:
         a.out.parent.mkdir(parents=True, exist_ok=True)
         a.out.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    if incomplete:
+        raise SystemExit("incomplete runs, so no verdict:\n" + "\n".join(incomplete))
 
 
 if __name__ == "__main__":

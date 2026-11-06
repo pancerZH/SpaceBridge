@@ -695,3 +695,148 @@ def test_a_cached_file_made_by_another_revision_is_refused(tmp_path, monkeypatch
     cache_meta.write(path, cache_meta.describe("BAAI/bge-base-en-v1.5", "rev-then", "cpu-fp32"))
     with pytest.raises(ValueError, match="revision"):
         enc.encode(inputs)
+
+
+# ---- closure assessment: through the real entry points
+
+class _FixedReranker:
+    """A ``Reranker`` whose predictor returns 0.75, so ``score()`` runs for real with no model."""
+
+    @staticmethod
+    def make(cache_dir, precision=None):
+        from spacebridge_bench.rerank import RERANKERS, Reranker
+
+        class Fixed(Reranker):
+            calls = 0
+
+            def _predict(self, queries, docs, prompt):
+                Fixed.calls += 1
+                return np.full(len(queries), 0.75, dtype=np.float32)
+
+        r = Fixed(RERANKERS["bge-reranker-v2-m3"], "cpu", cache_dir=cache_dir)
+        r.precision = precision
+        return r
+
+
+def test_a_new_rerank_cache_written_by_score_has_a_sidecar_and_refuses_other_provenance(tmp_path, monkeypatch):
+    from spacebridge_bench import cache_meta, rerank
+
+    monkeypatch.setattr(rerank, "_revision", lambda kind, repo: "rev-a")
+    monkeypatch.setattr(rerank, "_CACHES", {})
+    first = _FixedReranker.make(tmp_path)
+    assert first.score(["q"], ["d"], "task").tolist() == [0.75]
+    assert cache_meta.sidecar(first.cache_path).exists()
+    assert json.loads(cache_meta.sidecar(first.cache_path).read_text())["revision"] == "rev-a"
+
+    monkeypatch.setattr(rerank, "_CACHES", {})  # a new process: the same provenance reuses the saved score
+    again = _FixedReranker.make(tmp_path)
+    calls = type(again).calls
+    assert again.score(["q"], ["d"], "task").tolist() == [0.75] and type(again).calls == calls
+
+    monkeypatch.setattr(rerank, "_CACHES", {})
+    monkeypatch.setattr(rerank, "_revision", lambda kind, repo: "rev-b")  # the model was updated upstream
+    with pytest.raises(ValueError, match="revision"):
+        _FixedReranker.make(tmp_path).score(["q"], ["d"], "task")
+
+    monkeypatch.setattr(rerank, "_CACHES", {})
+    monkeypatch.setattr(rerank, "_revision", lambda kind, repo: "rev-a")
+    with pytest.raises(ValueError, match="device_class"):  # same file, another precision
+        _FixedReranker.make(tmp_path, precision="bf16").score(["q"], ["d"], "task")
+
+
+def test_a_new_embedding_file_written_by_encode_has_a_sidecar_and_refuses_other_provenance(tmp_path, monkeypatch):
+    from spacebridge_bench import cache_meta, encode
+    from spacebridge_bench.models import MODELS
+
+    def fake_encode(self, inputs, path, parts):  # stands in for the model, writing what a real encode writes
+        np.save(path, np.ones((len(inputs), 768), dtype=np.float16))
+
+    monkeypatch.setattr(encode.Encoder, "_encode_to_file", fake_encode)
+    monkeypatch.setattr(encode, "_revision", lambda kind, repo: "rev-a")
+    encode._MEMO.clear()
+    enc = encode.Encoder(MODELS["bge-base-en"], "cpu", cache_dir=tmp_path)
+    enc.encode(["a", "b"])
+    path = enc.cache_dir / f"{enc._key(['a', 'b'])}.npy"
+    assert json.loads(cache_meta.sidecar(path).read_text())["revision"] == "rev-a"
+    encode._MEMO.clear()
+    monkeypatch.setattr(encode, "_revision", lambda kind, repo: "rev-b")
+    with pytest.raises(ValueError, match="revision"):
+        encode.Encoder(MODELS["bge-base-en"], "cpu", cache_dir=tmp_path).encode(["a", "b"])
+
+
+def _toy_run(tmp_path, seeds_on_disk, planned_seeds, with_plan=True):
+    """A run as spacebridge_bench.run leaves it: per-query archives under per_query/<run>/ and a manifest beside them."""
+    run_dir = tmp_path / "per_query" / "toy"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    for seed in seeds_on_disk:
+        q = np.full(50, 0.9, dtype=np.float32)
+        np.savez(run_dir / f"toy__bge-large-en__bge-base-en__K0__s{seed}.npz", **{f"9h/{s}/ndcg@5": q for s in ("bridge", "native", "oracle")})
+    manifest = {"config_id": "abc", "config": {"n_docs": 1_000, "queries_sha256": "x"}}
+    if with_plan:
+        manifest["planned_cells"] = [f"toy|bge-large-en|bge-base-en|K0|s{s}" for s in planned_seeds]
+    (tmp_path / "toy.jsonl.manifest.jsonl").write_text(json.dumps(manifest) + "\n")
+    return run_dir
+
+
+def test_the_interval_command_refuses_a_run_missing_a_planned_cell(tmp_path, capsys):
+    import sys
+
+    sys.path.insert(0, "scripts")
+    import retention_ci
+
+    run_dir = _toy_run(tmp_path, seeds_on_disk=[0], planned_seeds=[0, 1, 2])
+    with pytest.raises(SystemExit, match="incomplete runs"):
+        retention_ci.main([str(run_dir)])
+    out = capsys.readouterr().out
+    assert "incomplete" in out and "confirmed" not in out
+
+    complete = _toy_run(tmp_path / "full", seeds_on_disk=[0, 1, 2], planned_seeds=[0, 1, 2])
+    retention_ci.main([str(complete)])
+    assert "confirmed" in capsys.readouterr().out
+
+
+def test_the_interval_command_needs_a_plan_and_one_configuration(tmp_path):
+    import sys
+
+    sys.path.insert(0, "scripts")
+    import retention_ci
+
+    run_dir = _toy_run(tmp_path, seeds_on_disk=[0], planned_seeds=[], with_plan=False)
+    with pytest.raises(SystemExit, match="no planned cells"):
+        retention_ci.main([str(run_dir)])
+    plan = tmp_path / "manifests.jsonl"
+    plan.write_text(json.dumps({"run": "toy", "config_id": "abc", "expected_cells": ["bge-large-en|bge-base-en|0", "bge-large-en|bge-base-en|1"]}) + "\n")
+    with pytest.raises(SystemExit, match="incomplete runs"):
+        retention_ci.main([str(run_dir), "--plan", str(plan)])
+    plan.write_text(json.dumps({"run": "toy", "config_id": "other", "expected_cells": ["bge-large-en|bge-base-en|0"]}) + "\n")
+    with pytest.raises(SystemExit, match="published plan is for configuration"):
+        retention_ci.main([str(run_dir), "--plan", str(plan)])
+    manifest = tmp_path / "toy.jsonl.manifest.jsonl"
+    manifest.write_text(manifest.read_text() + json.dumps({"config_id": "def", "config": {"n_docs": 1_000}}) + "\n")
+    with pytest.raises(SystemExit, match="2 configurations"):
+        retention_ci.main([str(run_dir), "--allow-unplanned"])
+
+
+def test_the_code_identity_covers_the_lock_and_a_study_script(tmp_path):
+    from spacebridge_bench.provenance import implementation_digest
+
+    script = tmp_path / "study.py"
+    script.write_text("x = 1\n")
+    base, with_script = implementation_digest(), implementation_digest(script)
+    assert base != with_script
+    script.write_text("x = 2\n")
+    assert implementation_digest(script) != with_script  # editing the study script starts a new result file
+
+
+def test_every_generated_table_has_rows_and_reads_rows_as_names():
+    """The BM25 table once regenerated empty: CSV typing read row "9" as the number 9. Every table must have rows."""
+    import sys
+
+    sys.path.insert(0, "scripts")
+    import review_tables
+
+    tables = review_tables.build_tables()
+    assert {"retention", "bm25", "fresh", "speed", "breakeven", "precision", "stage1", "reindex", "nobridge"} <= set(tables)
+    for name, text in tables.items():
+        assert len(text.splitlines()) >= 3, f"table {name} has no rows"
+    assert all(r["row"] in ("9", "9h") for r in review_tables.read_csv("retention.csv"))

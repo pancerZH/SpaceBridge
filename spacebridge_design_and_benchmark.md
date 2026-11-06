@@ -472,6 +472,16 @@ These five corpora didn't help choose BM25. They split:
 <!-- table:bm25 -->
 | Corpus | Documents | Queries | Models | Retention, BM25 off | Retention, BM25 on | Absolute, BM25 off | Absolute, BM25 on | Cells that gain | Cells |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| SciFact | 5,183 | 300 | Same family | 0.991 | 1.008 | 0.709 | 0.721 | 3 | 3 |
+| SciFact | 5,183 | 300 | Across families | 0.999 | 1.008 | 0.715 | 0.721 | 5 | 6 |
+| ArguAna | 8,674 | 1401 | Same family | 1.046 | 1.066 | 0.384 | 0.391 | 3 | 3 |
+| ArguAna | 8,674 | 1401 | Across families | 1.053 | 1.073 | 0.387 | 0.394 | 6 | 6 |
+| SciDocs | 25,657 | 1000 | Same family | 1.013 | 0.984 | 0.153 | 0.149 | 0 | 3 |
+| SciDocs | 25,657 | 1000 | Across families | 1.018 | 0.970 | 0.154 | 0.147 | 0 | 6 |
+| FiQA | 57,638 | 648 | Same family | 1.027 | 1.018 | 0.423 | 0.420 | 0 | 3 |
+| FiQA | 57,638 | 648 | Across families | 0.995 | 0.981 | 0.423 | 0.417 | 0 | 6 |
+| TREC-COVID | 171,332 | 50 | Same family | 1.015 | 1.001 | 0.843 | 0.831 | 0 | 3 |
+| TREC-COVID | 171,332 | 50 | Across families | 1.009 | 0.987 | 0.845 | 0.827 | 0 | 6 |
 <!-- /table:bm25 -->
 
 "Gain in cells" counts (pair, seed) cells, which share queries and models: they're dependent, not independent trials. SciDocs' relevance is citation links rather than words. MS MARCO and NQ prefixes below 50K pass both ways.
@@ -592,22 +602,22 @@ where setup is the wall-clock to re-encode the corpus and build an HNSW index, a
 <!-- table:breakeven -->
 | Query model | Documents | Device | Re-index setup | Bridge setup | Per query, if it also reranks | Break-even queries | Per query, if it doesn't | Break-even queries |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `all-MiniLM-L6-v2` | 1M | GPU | 13 min | 27 s | 1.1 ms | 684K | 0.15 s | 5.0K |
+| `all-MiniLM-L6-v2` | 1M | GPU | 13 min | 27 s | 1.1 ms | 682K | 0.15 s | 5.0K |
 | `all-MiniLM-L6-v2` | 1M | CPU | 1.6 h | 2 min | 10.2 ms | 565K | 10.48 s | 549 |
-| `all-MiniLM-L6-v2` | 8.84M | GPU | 2.1 h | 2 min | 1.1 ms | 6.7M | 0.18 s | 42K |
+| `all-MiniLM-L6-v2` | 8.84M | GPU | 2.1 h | 2 min | 1.1 ms | 6.6M | 0.18 s | 42K |
 | `all-MiniLM-L6-v2` | 8.84M | CPU | 14.6 h | 4 min | 9.7 ms | 5.4M | 10.43 s | 5.0K |
-| `bge-base-en-v1.5` | 1M | GPU | 16 min | 31 s | 1.1 ms | 829K | 0.15 s | 6.1K |
+| `bge-base-en-v1.5` | 1M | GPU | 16 min | 31 s | 1.1 ms | 827K | 0.15 s | 6.1K |
 | `bge-base-en-v1.5` | 1M | CPU | 10.2 h | 22 s, BM25 only: mount not timed here | 10.2 ms | 3.6M | 10.48 s | 3.5K |
 | `bge-base-en-v1.5` | 8.84M | GPU | 2.5 h | 2 min | 1.1 ms | 7.9M | 0.18 s | 50K |
 | `bge-base-en-v1.5` | 8.84M | CPU | 89.9 h | 2 min, BM25 only: mount not timed here | 9.7 ms | 33.2M | 10.43 s | 31K |
 | `bge-large-en-v1.5` | 1M | GPU | 23 min | 35 s | 1.1 ms | 1.2M | 0.15 s | 9.0K |
 | `bge-large-en-v1.5` | 1M | CPU | 35.2 h | 22 s, BM25 only: mount not timed here | 10.2 ms | 12.4M | 10.48 s | 12K |
-| `bge-large-en-v1.5` | 8.84M | GPU | 3.6 h | 2 min | 1.1 ms | 11.5M | 0.18 s | 72K |
-| `bge-large-en-v1.5` | 8.84M | CPU | 311.7 h | 2 min, BM25 only: mount not timed here | 9.7 ms | 115.2M | 10.43 s | 108K |
+| `bge-large-en-v1.5` | 8.84M | GPU | 3.6 h | 2 min | 1.1 ms | 11.4M | 0.18 s | 72K |
+| `bge-large-en-v1.5` | 8.84M | CPU | 311.7 h | 2 min, BM25 only: mount not timed here | 9.7 ms | 115.3M | 10.43 s | 108K |
 | `Qwen3-Embedding-0.6B` | 1M | GPU | 39 min | 59 s | 1.1 ms | 2.1M | 0.15 s | 15K |
 | `Qwen3-Embedding-0.6B` | 1M | CPU | 56.3 h | 22 s, BM25 only: mount not timed here | 10.2 ms | 19.9M | 10.48 s | 19K |
-| `Qwen3-Embedding-0.6B` | 8.84M | GPU | 6.0 h | 3 min | 1.1 ms | 19.3M | 0.18 s | 121K |
-| `Qwen3-Embedding-0.6B` | 8.84M | CPU | 497.8 h | 2 min, BM25 only: mount not timed here | 9.7 ms | 184.0M | 10.43 s | 172K |
+| `Qwen3-Embedding-0.6B` | 8.84M | GPU | 6.0 h | 3 min | 1.1 ms | 19.2M | 0.18 s | 121K |
+| `Qwen3-Embedding-0.6B` | 8.84M | CPU | 497.8 h | 2 min, BM25 only: mount not timed here | 9.7 ms | 184.1M | 10.43 s | 172K |
 <!-- /table:breakeven -->
 
 ### 9.6 The Stage-1 selector at 128 tokens

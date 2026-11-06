@@ -153,8 +153,13 @@ class Encoder:
                 shutil.rmtree(parts)
             cache_meta.check(path, self._meta())
             return
+        # The sidecar comes first: a run continuing a crashed encode is checked against how that encode began, so parts made by another
+        # model revision or device are never completed by this one.
+        if cache_meta.sidecar(path).exists():
+            cache_meta.check(path, self._meta())
+        else:
+            cache_meta.write(path, self._meta())
         self._encode_to_file(inputs, path, parts)
-        cache_meta.write(path, self._meta())
 
     def _encode_to_file(self, inputs: list[str], path: Path, parts: Path) -> None:
         """Encodes longest first, saving a part every ``PART_ROWS`` rows or ``PART_SECONDS`` seconds. A rerun after a

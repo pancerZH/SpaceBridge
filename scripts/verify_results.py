@@ -5,10 +5,14 @@
 1. Every file matches results/SHA256SUMS.
 2. Each run's per-query archive holds exactly the cells its manifest planned, every cell scores the same number of queries, and that
    number and the query digest agree with results/datasets.csv.
-3. Every retention row's point estimate is recomputed from the full-precision cell means in results/cells.csv, and must match exactly.
-4. Every interval is recomputed from the per-query scores, which are stored to 1/10,000, and must match within 0.001. Verdicts must match.
-5. The HNSW rows are recomputed from their own archive and records the same way.
-6. Every table in the README, the report and the design doc is regenerated from results/ and must match the documents exactly.
+3. Every field of every retention row is recomputed. Point estimates, absolute scores, differences, seed spread and the worst pair come
+   from the full-precision cell means in results/cells.csv and must match exactly. Every interval bound, the difference intervals
+   included, comes from the per-query scores, stored to 1/10,000, and must match within 0.001. Counts, plans and names must match
+   exactly. Each verdict must follow from its row's point estimate, low end and line.
+4. The HNSW rows: point estimates from their records, intervals from their own per-query archive, and verdicts, the same way.
+5. Every table in the README, the report and the design doc is regenerated from results/ and must match the documents exactly. What the
+   tables show beyond retention.csv (timings, setup figures, the precision and Stage-1 studies) is regenerated from the records here,
+   which are themselves checksummed, but not recomputed from anything rawer.
 
 Exits 1 on the first kind of failure it finds, saying what failed.
 """
@@ -23,11 +27,15 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
-from retention_ci import summarize  # noqa: E402
+from retention_ci import summarize, verdict  # noqa: E402
 
 RESULTS = Path("results")
 QUANTUM = 10_000
 POINT_TOL, INTERVAL_TOL = 1e-9, 1e-3
+POINT_FIELDS = ("retention", "strict", "vs_reindex", "gap_reindex", "no_bridge_retention", "bridge_gain", "abs_bridge", "abs_native", "abs_oracle",
+                "abs_native_bm25", "abs_oracle_bm25", "abs_no_bridge", "seed_sd", "worst_pair")
+INTERVAL_FIELDS = tuple(f"{base}_{end}" for base in ("retention", "strict", "vs_reindex", "gap_reindex", "no_bridge", "bridge_gain") for end in ("low", "high"))
+EXACT_FIELDS = ("n_queries", "pairs", "seeds", "cells", "worst_pair_name", "missing_cells")
 failures: list[str] = []
 
 
@@ -110,15 +118,31 @@ def check_runs() -> None:
         exact = {r["family"]: r for r in summarize(load_archive(source, row, cell_means[source]), n_docs, boot=10, expected=planned)}
         approx = {r["family"]: r for r in summarize(cells, n_docs, expected=planned)}
         for fam, published in by_family.items():
-            if abs(exact[fam]["retention"] - float(published["retention"])) > POINT_TOL:
-                fail(f"{source} {row} {fam}: retention {published['retention']} published, {exact[fam]['retention']} from cells.csv")
-            for key in ("retention_low", "retention_high", "strict_low", "strict_high", "vs_reindex_low", "vs_reindex_high", "no_bridge_low", "no_bridge_high"):
-                if number(published.get(key)) is not None and abs(approx[fam][key] - float(published[key])) > INTERVAL_TOL:
-                    fail(f"{source} {row} {fam}: {key} {published[key]} published, {approx[fam][key]:.5f} from per-query scores")
-            if published["verdict"] and approx[fam].get("verdict") != published["verdict"]:
-                fail(f"{source} {row} {fam}: verdict {published['verdict']} published, {approx[fam].get('verdict')} recomputed")
+            check_row(f"{source} {row} {fam}", published, exact[fam], approx[fam])
             checked += 1
-    print(f"retention rows: {checked} checked against cells.csv and the per-query archives")
+    print(f"retention rows: {checked}, every field checked against cells.csv and the per-query archives")
+
+
+def check_row(where: str, published: dict, exact: dict, approx: dict) -> None:
+    for key in POINT_FIELDS:
+        mine, theirs = exact.get(key), number(published.get(key))
+        if (mine is None) != (theirs is None) or (mine is not None and abs(mine - theirs) > POINT_TOL):
+            fail(f"{where}: {key} {published.get(key)} published, {mine} from cells.csv")
+    for key in INTERVAL_FIELDS:
+        mine, theirs = approx.get(key), number(published.get(key))
+        if (mine is None) != (theirs is None) or (mine is not None and abs(mine - theirs) > INTERVAL_TOL):
+            fail(f"{where}: {key} {published.get(key)} published, {mine} from per-query scores")
+    for key in EXACT_FIELDS:
+        mine = ";".join(approx[key]) if key == "missing_cells" else approx.get(key)
+        if str(mine) != str(published.get(key)):
+            fail(f"{where}: {key} {published.get(key)!r} published, {mine!r} recomputed")
+    if published.get("line"):
+        line = float(published["line"])
+        if abs(line - approx["line"]) > 0:
+            fail(f"{where}: line {line} published, {approx['line']} by the rule")
+        expected = verdict(float(published["retention"]), float(published["retention_low"]), line, complete=not published["missing_cells"])
+        if published["verdict"] != expected:
+            fail(f"{where}: verdict {published['verdict']} published, but its numbers give {expected}")
 
 
 def check_hnsw() -> None:
@@ -128,6 +152,15 @@ def check_hnsw() -> None:
         pq = {k: z[k].astype(np.float64) / QUANTUM for k in z.files}
     nat = pq["hnsw|native|ef500|pool60/exact"]
     n = len(nat)
+    # Its configuration file predates query digests, so the query list is checked another way: its exact native and re-index rankings,
+    # reranked, must score every query exactly as the fresh MS MARCO run's do on the same index model.
+    with np.load(RESULTS / "per_query" / "fresh_msmarco.npz") as z:
+        native_cells = [z[k] for k in z.files if k.endswith("/9/native") and k.split("__")[1] == "bge-large-en"]
+        oracle_cells = {t: [z[k] for k in z.files if k.endswith("/9/oracle") and k.split("__")[1] == "bge-large-en" and k.split("__")[2] == t] for t in ("bge-base-en", "qwen3-0.6b")}
+    aligned = native_cells and all(np.array_equal(np.round(c * QUANTUM) if c.dtype.kind == "f" else c, np.round(nat * QUANTUM)) for c in native_cells)
+    aligned = aligned and all(all(np.array_equal(c, np.round(pq[f"oracle|{t}|pool60/exact"] * QUANTUM)) for c in cells) and cells for t, cells in oracle_cells.items())
+    if not aligned:
+        fail("HNSW: its per-query scores don't line up with the fresh MS MARCO run's, so the two may not share one query list")
     w = np.random.default_rng(0).multinomial(n, np.full(n, 1.0 / n), size=2_000) / n
     for tgt, fam in (("bge-base-en", "same"), ("qwen3-0.6b", "across")):
         point = np.mean([records[f"lexical|{tgt}|s{s}|ef500|pool60"]["ndcg5_approx"] for s in (0, 1, 2)]) / min(
@@ -140,7 +173,10 @@ def check_hnsw() -> None:
             fail(f"HNSW {fam}: retention {r['retention']} published, {point} from its records")
         if abs(low - float(r["retention_low"])) > INTERVAL_TOL or abs(high - float(r["retention_high"])) > INTERVAL_TOL:
             fail(f"HNSW {fam}: interval [{r['retention_low']}, {r['retention_high']}] published, [{low:.5f}, {high:.5f}] from per-query scores")
-    print("HNSW rows: checked against their records and per-query scores")
+        expected = verdict(float(r["retention"]), float(r["retention_low"]), float(r["line"]))
+        if r["verdict"] != expected:
+            fail(f"HNSW {fam}: verdict {r['verdict']} published, but its numbers give {expected}")
+    print("HNSW rows: query list, points, intervals and verdicts checked against their records and per-query scores")
 
 
 def check_documents() -> None:

@@ -22,10 +22,10 @@ from spacebridge import Index, build_hnsw, default_anchor_count, freeze, merge_p
 from spacebridge.lexical import LEXICAL_SHARE
 from spacebridge.serving import HNSW_SAVE_SECONDS, save_faiss_index
 from spacebridge_bench import durable
-from spacebridge_bench.datasets import load_beir
+from spacebridge_bench.datasets import DATASETS, load_beir
 from spacebridge_bench.encode import Encoder, MountEncoder
 from spacebridge_bench.metrics import per_query, recall_at
-from spacebridge_bench.provenance import artifact_digest, check_or_write_config, implementation_digest, query_digest
+from spacebridge_bench.provenance import artifact_digest, check_or_write_config, implementation_digest, query_digest, revisions
 from spacebridge_bench.models import MODELS
 from spacebridge_bench.rerank import RERANKERS, Reranker, rerank, rerank_pools
 from spacebridge_bench.run import _DocTexts, _first_docs, _first_queries, anchor_candidates, cached_anchors, cached_lexical
@@ -177,7 +177,8 @@ def main() -> None:
         "dataset": ds.name, "n_docs": ds.N, "queries_sha256": query_digest(ds.queries), "index_model": args.index_model, "K": args.K, "M": args.M,
         "ef_construction": args.ef_construction, "lexical": args.lexical, "ivfpq": args.ivfpq, "max_docs": args.max_docs, "device": args.device,
         "index_path": str(args.index_path) if args.index_path else None, "index_sha256": artifact_digest(args.index_path) if args.index_path else None,
-        "implementation": implementation_digest(),
+        "implementation": implementation_digest(Path(__file__)),
+        "revisions": revisions([MODELS[k].hf_id for k in (args.index_model, *args.query_models)] + [RERANKERS["bge-reranker-v2-m3"].hf_id], [DATASETS[ds.name.split("@")[0]].repo]),
     })
     res = Results(args.out)
     src = MODELS[args.index_model]

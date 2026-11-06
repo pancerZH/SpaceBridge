@@ -162,7 +162,7 @@ Reviewers read the code and documents after we'd finished. They found real defec
 | **An HNSW file at a reused path could pair the old graph with new text** | Not in the benchmarks | Paths named the vectors | Checked against the vectors, in the library |
 | **"Upper bound" and "loss against re-indexing"** were overstated | Claims, yes | The denominator is the weaker baseline, not a bound, and not re-indexing | Renamed, and direct re-index comparison added |
 
-A second, final review found more: a degenerate fit could still return a map of NaNs that looked fitted; resume checks still left out the device, the code and the model revisions; two library checks had gaps; and `results/` couldn't regenerate the tables alone. All were fixed and tested. None of them touched a published number, which the recheck and `scripts/verify_results.py` confirm.
+A second, final review found more: a degenerate fit could still return a map of NaNs that looked fitted; resume checks still left out the device, the code and the model revisions; two library checks had gaps; and `results/` couldn't regenerate the tables alone. All were fixed and tested. None of them changed the 19,836 published metric and retention values that the recheck compares, and `scripts/verify_results.py` checks the published tables against `results/`. A closing check then found one more problem of my own making: the BM25 table of the design doc had been regenerated empty, which is fixed, and a table with no rows now stops the generator.
 
 The report's earlier claim that a nonlinear map was never tried was also wrong: one was tried, and it didn't help. That result is narrow: one architecture, trained on cosine.
 

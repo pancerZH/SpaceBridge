@@ -21,6 +21,7 @@ DEFAULT_CACHE = Path("data/cache/rerank")
 _LOG_RECORD = np.dtype([("key", "<u8"), ("score", "<f4")])
 SAVE_EVERY_SECONDS = 30  # new scores reach the disk this often, whatever the speed (858 pairs/s on GPU, 5 on CPU)
 _CACHES: dict[Path, dict[int, float]] = {}  # one copy per process: loading takes seconds, and every pair needs it
+_NEW: set[Path] = set()  # caches with nothing on disk when this process first loaded them: they get a sidecar before their first score
 
 
 @dataclass(frozen=True)
@@ -110,12 +111,17 @@ class Reranker:
             if self.cache_path.exists():
                 with np.load(self.cache_path) as z:
                     cache.update(zip(z["keys"].tolist(), z["scores"].tolist()))
-            for log in sorted(self.cache_path.parent.glob(f"{self.cache_path.stem}.*.scores")):
+            logs = sorted(self.cache_path.parent.glob(f"{self.cache_path.stem}.*.scores"))
+            for log in logs:
                 n = log.stat().st_size // _LOG_RECORD.itemsize  # a power loss can tear the last record
                 records = np.fromfile(log, dtype=_LOG_RECORD, count=n)
                 cache.update(zip(records["key"].tolist(), records["score"].tolist()))
-            if cache:
+            # Decided from the disk, before anything is scored: a sidecar is always checked; data with no sidecar is a legacy cache,
+            # used and counted; nothing at all is a new cache, which gets its sidecar before its first score is written.
+            if cache_meta.sidecar(self.cache_path).exists() or self.cache_path.exists() or logs:
                 cache_meta.check(self.cache_path, self._meta())
+            else:
+                _NEW.add(self.cache_path)
             _CACHES[self.cache_path] = cache
         return _CACHES[self.cache_path]
 
@@ -125,9 +131,14 @@ class Reranker:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def _describe_new_cache(self) -> None:
+        """A new cache says how it was made, before it holds anything."""
+        if self.cache_path in _NEW:
+            cache_meta.write(self.cache_path, self._meta())
+            _NEW.discard(self.cache_path)
+
     def _save_scores(self, keys: list[int], scores: np.ndarray) -> None:
-        if not cache_meta.sidecar(self.cache_path).exists() and not self.cache and not any(self.cache_path.parent.glob(f"{self.cache_path.stem}.*.scores")):
-            cache_meta.write(self.cache_path, self._meta())  # a new cache: it says how it was made
+        self._describe_new_cache()
         records = np.empty(len(keys), dtype=_LOG_RECORD)
         records["key"], records["score"] = np.array(keys, dtype=np.uint64), scores
         durable.append_bytes(self.cache_path.parent / f"{self.cache_path.stem}.{os.getpid()}.scores", records.tobytes())
@@ -138,6 +149,8 @@ class Reranker:
         keys = [_pair_key(prompt, q, d) for q, d in zip(queries, docs)]
         cache = self.cache
         todo = list({k: i for i, k in enumerate(keys) if k not in cache}.values())
+        if todo:
+            self._describe_new_cache()
         pos, t_begin = 0, time.perf_counter()
         while pos < len(todo):
             t0 = time.perf_counter()
