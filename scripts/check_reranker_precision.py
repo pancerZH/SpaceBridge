@@ -1,4 +1,5 @@
-"""Does precision change what a reranker ranks? fp32 (what a CPU runs), bf16 (what every benchmark scored in, on the GPU) and, for
+"""Does precision or device change what a reranker ranks? fp32 on the GPU, fp32 on the CPU (``cpu``: what CPU serving runs), bf16 (what
+every benchmark scored in, on the GPU) and, for
 bge-reranker-v2-m3, int8 (ONNX, on the CPU), on the same candidates: the index model's own first stage, with no bridge, so only the
 reranker differs. Each record also has the tokens per pair of the reranked top 5 and of the pool, which shows a pull towards length.
 
@@ -56,13 +57,15 @@ def main() -> None:
     p.add_argument("--queries", type=int, required=True)
     p.add_argument("--index-model", default="bge-large-en")
     p.add_argument("--reranker", default="bge-reranker-v2-m3", choices=["bge-reranker-v2-m3", "bge-reranker-base"])
-    p.add_argument("--variants", nargs="+", default=["fp32", "bf16", "int8"], choices=["fp32", "bf16", "int8"], help="int8 needs --extra onnx and bge-reranker-v2-m3")
+    p.add_argument("--variants", nargs="+", default=["fp32", "bf16", "int8"], choices=["fp32", "bf16", "int8", "cpu"], help="int8 needs --extra onnx and bge-reranker-v2-m3; cpu is fp32 on the CPU")
+    p.add_argument("--threads", type=int, default=10, help="CPU threads for the cpu variant")
     p.add_argument("--pools", type=int, nargs="+", default=[60, 100, 300])
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
 
     spec = RERANKERS[args.reranker]
-    specs = {"fp32": RerankerSpec(f"{spec.key}-fp32", spec.hf_id, instructed=False), "bf16": spec, "int8": RERANKERS["bge-reranker-v2-m3-int8"]}
+    specs = {"fp32": RerankerSpec(f"{spec.key}-fp32", spec.hf_id, instructed=False), "bf16": spec, "int8": RERANKERS["bge-reranker-v2-m3-int8"],
+             "cpu": RerankerSpec(f"{spec.key}-cpu", spec.hf_id, instructed=False)}  # its own cache: CPU scores never mix with GPU ones
     variants = {name: specs[name] for name in args.variants}
     assert "fp32" in variants and ("int8" not in variants or args.reranker == "bge-reranker-v2-m3")
     cell = lambda r: (r.get("reranker", "bge-reranker-v2-m3"), r["dataset"], r["n_queries"], r["pool"], r["variant"])
@@ -87,7 +90,9 @@ def main() -> None:
 
     scores = {}
     for name, variant in variants.items():
-        rr = (Fp32Reranker if name == "fp32" else Reranker)(variant, "cuda")
+        if name == "cpu":
+            torch.set_num_threads(args.threads)
+        rr = (Fp32Reranker if name == "fp32" else Reranker)(variant, "cpu" if name == "cpu" else "cuda")
         scores[name] = rr.score(queries, texts, ds.task).reshape(n, depth)
         rr.unload()
 

@@ -496,7 +496,16 @@ One query at a time, on an idle machine, warm: this excludes the first query, mo
 
 **Reranker alternatives, measured and not in the library.** An int8 export of `bge-reranker-v2-m3` is 2.4 to 3.7 times faster on this CPU (AVX-VNNI), and differs from `fp32` by -0.17 to +1.20 absolute `nDCG@5` points on 50 to 100 queries per corpus, with intervals of about ±2. That's no loss seen on too few queries, not no loss shown. `bge-reranker-base` and `ms-marco-MiniLM-L6-v2` are faster and lose up to 43.9 and 11.9 absolute points, depending on the corpus.
 
-**Precision.** The benchmarks score in `bf16` on the GPU. On the same candidates, 250 queries over three corpora with no bridge, `fp32` on the GPU moved `nDCG@5` by at most 0.07 absolute points. That's GPU `fp32`: a CPU's agreement on this task is assumed, not tested.
+**Precision and device.** The benchmarks score in `bf16` on the GPU, and CPU serving runs `fp32`. The table below holds the same candidates, the index model's own top 60, with no bridge, scored three ways (`scripts/check_reranker_precision.py`, `outputs/review/followup/`). The CPU's scores differ from the GPU's `fp32` scores by at most 0.00003, on 17,995 pairs, and no top 5 changed. The quality measured on the GPU therefore holds for CPU serving on these corpora, up to `bf16`'s differences of at most 0.07 absolute points.
+
+<!-- table:precision -->
+| Corpus | Queries | Tokens per pair | GPU fp32 | CPU fp32 | CPU minus GPU, absolute points | Low | High | Top-5 overlap, CPU and GPU | GPU bf16 | bf16 minus GPU fp32, absolute points |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| MS MARCO 1M | 100 | 95 | 0.8053 | 0.8053 | +0.00 | +0.00 | +0.00 | 1.000 | 0.8046 | -0.07 |
+| NQ 1M | 100 | 164 | 0.7719 | 0.7719 | +0.00 | +0.00 | +0.00 | 1.000 | 0.7719 | +0.00 |
+| FiQA | 50 | 237 | 0.4022 | 0.4022 | +0.00 | +0.00 | +0.00 | 1.000 | 0.4022 | +0.00 |
+| TREC-COVID | 50 | 279 | 0.8385 | 0.8385 | +0.00 | +0.00 | +0.00 | 1.000 | 0.8380 | -0.05 |
+<!-- /table:precision -->
 
 **Harness encoding speed.** Sorting by exact token count under a per-model token budget gains 1.24 to 1.63 times over a fixed batch size. A fresh encode can move `Recall@30` retention by up to about 0.3 points, so use one encoding method within a comparison.
 
@@ -593,11 +602,11 @@ The system above, frozen, on data that chose nothing, by [rules fixed in advance
 | FEVER | 1M | 2000 | Across families | 0.994 | 0.991 | 0.999 | 0.94 | Confirmed | 0.977 | 0.944 |
 | Touché 2020 | 382.5K | 49 | Same family | 1.021 | 0.976 | 1.087 | 0.98 | Point pass | 1.096 | 0.380 |
 | Touché 2020 | 382.5K | 49 | Across families | 1.034 | 0.989 | 1.101 | 0.94 | Confirmed | 1.096 | 0.384 |
-| MS MARCO, unused queries, HNSW | 8.84M | 2000 | Same family, one direction | 0.973 |  |  | 0.95 | Point pass |  | 0.429 |
-| MS MARCO, unused queries, HNSW | 8.84M | 2000 | Across families, one direction | 0.961 |  |  | 0.90 | Point pass |  | 0.420 |
+| MS MARCO, unused queries, HNSW | 8.84M | 2000 | Same family, one direction | 0.973 | 0.958 | 0.987 | 0.95 | Confirmed |  | 0.429 |
+| MS MARCO, unused queries, HNSW | 8.84M | 2000 | Across families, one direction | 0.961 | 0.943 | 0.980 | 0.90 | Confirmed |  | 0.420 |
 <!-- /table:fresh -->
 
-**How to read it.** No fresh result missed a line. Eight of the ten verdicts with an interval are confirmed and two are point passes: LoTTE same family reads 0.989 with a low end of 0.976, against 0.98, and Touché same family reads 1.021 with a low end of 0.976, on only 49 queries. Through the HNSW index, MS MARCO reads 0.973 and 0.961 against 0.95 and 0.90. Those are point estimates only, because that script keeps means, not per-query scores. Four things qualify the result:
+**How to read it.** No fresh result missed a line. Eight of the ten verdicts with an interval are confirmed and two are point passes: LoTTE same family reads 0.989 with a low end of 0.976, against 0.98, and Touché same family reads 1.021 with a low end of 0.976, on only 49 queries. Through the HNSW index, MS MARCO reads 0.973 and 0.961 against 0.95 and 0.90, with low ends of 0.958 and 0.943, so both are confirmed. That interval was computed after the point estimates were known, from per-query scores saved by a rerun of the same configuration. Four things qualify the result:
 
 - **New queries are not a new corpus.** The MS MARCO and HotpotQA rows are new queries on corpora that shaped the system. LoTTE, FEVER and Touché are the new corpora.
 - **On some corpora BM25 does the work.** On FEVER, BM25 and the reranker with no bridge read 0.977, close to the bridge's 0.997 and 0.994. On HotpotQA they read 0.949 and 0.999. **On Touché, no bridge reads 1.096, above the bridge's 1.021 and 1.034: there the bridge lowers quality against BM25 alone**, on 49 queries. Where the map earns its place: LoTTE, 0.838 and 0.818 with no bridge against 0.989 and 0.964, and MS MARCO, 0.862 and 0.870 against 0.971 and 0.956.

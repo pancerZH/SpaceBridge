@@ -275,7 +275,20 @@ def hnsw_fresh() -> list[list]:
             rows.append(["MS MARCO, unused queries, HNSW", "8.84M", "", label, "", "", "", f"{line:.2f}", "Not run", "", ""])
             continue
         v = float(np.mean([r["ndcg5_approx"] for r in lex])) / min(native["ndcg5_exact"], oracle["ndcg5_exact"])
-        rows.append(["MS MARCO, unused queries, HNSW", "8.84M", 2000, label, f3(v), "", "", f"{line:.2f}", "Point pass" if v >= line else "Miss", "", f3(float(np.mean([r["ndcg5_approx"] for r in lex])))])
+        low = high = None
+        pq_path = REVIEW / "followup/hnsw_per_query.npz"
+        if pq_path.exists():  # the same joint bootstrap as retention_ci, over queries, retaking the weaker baseline each time
+            with np.load(pq_path) as z:
+                seeds = [z[f"lexical|{tgt}|s{s}|ef500|pool60/approx"].astype(np.float64) for s in (0, 1, 2)]
+                nat, ora = z["hnsw|native|ef500|pool60/exact"].astype(np.float64), z[f"oracle|{tgt}|pool60/exact"].astype(np.float64)
+            n = len(nat)
+            w = np.random.default_rng(0).multinomial(n, np.full(n, 1.0 / n), size=2_000) / n
+            reps = np.mean([w @ x for x in seeds], axis=0) / np.minimum(w @ nat, w @ ora)
+            low, high = float(np.percentile(reps, 2.5)), float(np.percentile(reps, 97.5))
+            point = float(np.mean([x.mean() for x in seeds])) / min(nat.mean(), ora.mean())
+            assert abs(point - v) < 1e-6, (point, v)  # the per-query file and the records agree
+        verdict = "Miss" if v < line else "Confirmed" if low is not None and low >= line else "Point pass"
+        rows.append(["MS MARCO, unused queries, HNSW", "8.84M", 2000, label, f3(v), f3(low), f3(high), f"{line:.2f}", verdict, "", f3(float(np.mean([r["ndcg5_approx"] for r in lex])))])
     return rows
 
 
@@ -362,6 +375,15 @@ def build_tables() -> dict[str, str]:
     t["speed_short"] = table(sh, speed_rows(short_only=True))
     t["breakeven"] = table(["Query model", "Documents", "Device", "Re-index setup", "Bridge setup", "Per query, if it also reranks", "Break-even queries", "Per query, if it doesn't", "Break-even queries"], breakeven_rows())
     t["stage1"] = table(["Corpus", "Fits", "Mean Spearman, agreement against real retention", "Lowest", "Highest", "Agreement's pick, after Stage 2", "Best candidate, after Stage 2", "Retention points a perfect selector would gain"], stage1_rows())
+    prec = [r for r in read_jsonl(REVIEW / "followup/precision_cpu.jsonl") if r["pool"] == 60]
+    names = {"msmarco-1m": "MS MARCO 1M", "nq-1m": "NQ 1M", "fiqa": "FiQA", "trec-covid": "TREC-COVID"}
+    rows = []
+    for ds in names:
+        by = {r["variant"]: r for r in prec if r["dataset"] == ds}
+        if {"fp32", "bf16", "cpu"} <= set(by):
+            rows.append([names[ds], by["cpu"]["n_queries"], f"{by['cpu']['pool_tokens']:.0f}", f"{by['fp32']['ndcg@5']:.4f}", f"{by['cpu']['ndcg@5']:.4f}", f"{100 * by['cpu']['difference_from_fp32']:+.2f}",
+                         f"{100 * by['cpu']['ci_difference'][0]:+.2f}", f"{100 * by['cpu']['ci_difference'][1]:+.2f}", f"{by['cpu']['top5_jaccard_with_fp32']:.3f}", f"{by['bf16']['ndcg@5']:.4f}", f"{100 * by['bf16']['difference_from_fp32']:+.2f}"])
+    t["precision"] = table(["Corpus", "Queries", "Tokens per pair", "GPU fp32", "CPU fp32", "CPU minus GPU, absolute points", "Low", "High", "Top-5 overlap, CPU and GPU", "GPU bf16", "bf16 minus GPU fp32, absolute points"], rows)
     t["fresh"] = table(["Data", "Documents", "Queries", "Models", "Retention", "Low", "High", "Line", "Verdict", "No bridge, retention", "Bridge, absolute `nDCG@5`"], fresh_rows(fresh, hnsw_fresh()))
     return t
 

@@ -207,11 +207,11 @@ We froze the system, wrote down the rules before any result existed ([plan](docs
 | FEVER | 1M | 2000 | Across families | 0.994 | 0.991 | 0.999 | 0.94 | Confirmed | 0.977 | 0.944 |
 | Touché 2020 | 382.5K | 49 | Same family | 1.021 | 0.976 | 1.087 | 0.98 | Point pass | 1.096 | 0.380 |
 | Touché 2020 | 382.5K | 49 | Across families | 1.034 | 0.989 | 1.101 | 0.94 | Confirmed | 1.096 | 0.384 |
-| MS MARCO, unused queries, HNSW | 8.84M | 2000 | Same family, one direction | 0.973 |  |  | 0.95 | Point pass |  | 0.429 |
-| MS MARCO, unused queries, HNSW | 8.84M | 2000 | Across families, one direction | 0.961 |  |  | 0.90 | Point pass |  | 0.420 |
+| MS MARCO, unused queries, HNSW | 8.84M | 2000 | Same family, one direction | 0.973 | 0.958 | 0.987 | 0.95 | Confirmed |  | 0.429 |
+| MS MARCO, unused queries, HNSW | 8.84M | 2000 | Across families, one direction | 0.961 | 0.943 | 0.980 | 0.90 | Confirmed |  | 0.420 |
 <!-- /table:fresh -->
 
-**How to read it.** No fresh result missed a line. Eight of the ten verdicts with an interval are confirmed and two are point passes: LoTTE same family reads 0.989 with a low end of 0.976, against 0.98, and Touché same family reads 1.021 with a low end of 0.976, on only 49 queries. Through the HNSW index, MS MARCO reads 0.973 and 0.961 against 0.95 and 0.90. Those are point estimates only, because that script keeps means, not per-query scores. Four things qualify the result:
+**How to read it.** No fresh result missed a line. Eight of the ten verdicts with an interval are confirmed and two are point passes: LoTTE same family reads 0.989 with a low end of 0.976, against 0.98, and Touché same family reads 1.021 with a low end of 0.976, on only 49 queries. Through the HNSW index, MS MARCO reads 0.973 and 0.961 against 0.95 and 0.90, with low ends of 0.958 and 0.943, so both are confirmed. That interval was computed after the point estimates were known, from per-query scores saved by a rerun of the same configuration. Four things qualify the result:
 
 - **New queries are not a new corpus.** The MS MARCO and HotpotQA rows are new queries on corpora that shaped the system. LoTTE, FEVER and Touché are the new corpora.
 - **On some corpora BM25 does the work.** On FEVER, BM25 and the reranker with no bridge read 0.977, close to the bridge's 0.997 and 0.994. On HotpotQA they read 0.949 and 0.999. **On Touché, no bridge reads 1.096, above the bridge's 1.021 and 1.034: there the bridge lowers quality against BM25 alone**, on 49 queries. Where the map earns its place: LoTTE, 0.838 and 0.818 with no bridge against 0.989 and 0.964, and MS MARCO, 0.862 and 0.870 against 0.971 and 0.956.

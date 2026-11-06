@@ -86,8 +86,8 @@ The final system, frozen, with [rules fixed before any result existed](docs/fres
 | FEVER | 1M | 2000 | Across families | 0.994 | 0.991 | 0.999 | 0.94 | Confirmed | 0.977 | 0.944 |
 | Touché 2020 | 382.5K | 49 | Same family | 1.021 | 0.976 | 1.087 | 0.98 | Point pass | 1.096 | 0.380 |
 | Touché 2020 | 382.5K | 49 | Across families | 1.034 | 0.989 | 1.101 | 0.94 | Confirmed | 1.096 | 0.384 |
-| MS MARCO, unused queries, HNSW | 8.84M | 2000 | Same family, one direction | 0.973 |  |  | 0.95 | Point pass |  | 0.429 |
-| MS MARCO, unused queries, HNSW | 8.84M | 2000 | Across families, one direction | 0.961 |  |  | 0.90 | Point pass |  | 0.420 |
+| MS MARCO, unused queries, HNSW | 8.84M | 2000 | Same family, one direction | 0.973 | 0.958 | 0.987 | 0.95 | Confirmed |  | 0.429 |
+| MS MARCO, unused queries, HNSW | 8.84M | 2000 | Across families, one direction | 0.961 | 0.943 | 0.980 | 0.90 | Confirmed |  | 0.420 |
 <!-- /table:fresh -->
 
 No fresh result missed a line. Two are point passes: LoTTE same family (0.989, low end 0.976, line 0.98) and Touché same family, on only 49 queries. MS MARCO and HotpotQA here are new queries on corpora that shaped the system, and LoTTE, FEVER and Touché are new corpora. **On Touché, BM25 and the reranker with no bridge did better than the bridge** (1.096 against 1.021 and 1.034), and on FEVER they came close (0.977). The design doc, §9.7, has the full reading.
@@ -115,6 +115,28 @@ One query, warm, on an idle machine: this leaves out the first query, model load
 <!-- /table:speed -->
 
 On a CPU the reranker takes almost all of this: it's roughly 1.91 ms × candidates × tokens per pair. A CPU query of 10 to 36 seconds is usable for occasional queries, not for traffic. An int8 export of the reranker was about 3 times faster on this CPU, with too few queries checked to claim its quality, so it isn't in the library.
+
+### Queries in another language
+
+**Chinese queries into an English index**, `bge-large-en-v1.5` index, `Qwen3-Embedding-0.6B` queries, 60 candidates, absolute `nDCG@5` (0 to 1). A translator, when used, only feeds BM25: the bridge and the reranker read the original Chinese query.
+
+| System | XQuAD | MLQA |
+| --- | --- | --- |
+| Bridge alone | 0.809 | 0.669 |
+| Bridge, BM25 reading an opus-mt translation | 0.859 | 0.725 |
+| Bridge, BM25 reading a MADLAD-400 translation | 0.861 | 0.733 |
+| Old model on MADLAD-400's translation, no bridge | 0.849 | 0.694 |
+| Old model on MADLAD-400's translation, with BM25 on it | 0.862 | 0.728 |
+| Re-index with `Qwen3-Embedding-0.6B` | 0.851 | 0.713 |
+
+| Set | Documents | Queries |
+| --- | --- | --- |
+| XQuAD | 20,958 English Wikipedia paragraphs | 1,190 Chinese questions |
+| MLQA | 10,894 English Wikipedia paragraphs | 5,137 Chinese questions |
+
+So with a translator, the bridge matches the old model plus translation, without needing the old model. The translator adds 38 ms on a GPU and 196 ms on a CPU per query for opus-mt, and 215 ms and 3.1 s for MADLAD-400. Without one, BM25 can't help, since only numbers and Latin names match.
+
+**Limits:** Chinese to English only, on two Wikipedia question-answering sets, at no size above about 21K documents. Bridge rows are the mean of 3 seeds. The others involve no fitted map, so they have none. No other language or larger index was measured end to end. The [usage guide](docs/usage.md#languages) shows how to set it up.
 
 ## Use it or re-index
 

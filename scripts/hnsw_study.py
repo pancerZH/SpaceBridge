@@ -56,6 +56,9 @@ def overlap(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.mean([len(set(x) & set(y)) / len(x) for x, y in zip(a, b)]))
 
 
+PER_QUERY: dict[str, np.ndarray] = {}  # "<key>/<approx or exact>" -> per-query nDCG@5, for intervals (--per-query)
+
+
 def rankings_report(res: Results, tag: str, approx: np.ndarray, exact: np.ndarray, ds, queries, rr, pools) -> None:
     """Recall of the exact top-pool, and absolute end-to-end nDCG@5, for one approximate ranking against the exact one."""
     docs = _DocTexts(ds.titles, ds.texts)
@@ -65,6 +68,7 @@ def rankings_report(res: Results, tag: str, approx: np.ndarray, exact: np.ndarra
             continue
         pq_a = per_query(rerank(rr, approx, pool, queries, docs, ds.task), ds.qrels)
         pq_e = per_query(rerank(rr, exact, pool, queries, docs, ds.task), ds.qrels)
+        PER_QUERY[f"{key}/approx"], PER_QUERY[f"{key}/exact"] = pq_a["ndcg@5"], pq_e["ndcg@5"]
         res.add(
             key, tag=tag, pool=pool, recall_of_exact=overlap(approx[:, :pool], exact[:, :pool]),
             ndcg5_approx=float(pq_a["ndcg@5"].mean()), ndcg5_exact=float(pq_e["ndcg@5"].mean()),
@@ -83,6 +87,7 @@ def lexical_report(res: Results, tag: str, approx: np.ndarray, exact: np.ndarray
         share = pool // LEXICAL_SHARE
         a, e = ([merge_pool(r, b[:share], pool) for r, b in zip(ranked, lexical_top)] for ranked in (approx, exact))
         pq_a, pq_e = (per_query(rerank_pools(rr, x, queries, docs, ds.task), ds.qrels) for x in (a, e))
+        PER_QUERY[f"{key}/approx"], PER_QUERY[f"{key}/exact"] = pq_a["ndcg@5"], pq_e["ndcg@5"]
         res.add(key, tag=tag, pool=pool, share=share, ndcg5_approx=float(pq_a["ndcg@5"].mean()), ndcg5_exact=float(pq_e["ndcg@5"].mean()),
                 recall30_approx=float(pq_a["recall@30"].mean()), recall30_exact=float(pq_e["recall@30"].mean()))
 
@@ -153,6 +158,7 @@ def main() -> None:
     p.add_argument("--lexical", action="store_true", help="also put BM25 in the pool; refuses to build: it only reads an index that exists")
     p.add_argument("--build-only", action="store_true")
     p.add_argument("--device", default="cuda")
+    p.add_argument("--per-query", type=Path, default=None, help="also save per-query nDCG@5 of every result to this .npz, for intervals")
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
     pools, efs = tuple(args.pools), tuple(args.efs)
@@ -219,6 +225,7 @@ def main() -> None:
             key = f"oracle|{tgt_key}|pool{pool}"
             if key not in res.done:
                 pq = per_query(rerank(rr, oracle, pool, ds.queries, docs, ds.task), ds.qrels)
+                PER_QUERY[f"{key}/exact"] = pq["ndcg@5"]
                 res.add(key, tag="oracle", tgt=tgt_key, pool=pool, ndcg5_exact=float(pq["ndcg@5"].mean()))
         rr.unload()
         for seed in args.seed:
@@ -250,6 +257,9 @@ def main() -> None:
                     ranked = pq_index.search(np.asarray(Q_hat_pq, dtype=np.float32), maxk)[1]
                     rankings_report(res, f"{args.ivfpq}|{tgt_key}|s{seed}|nprobe{nprobe}", ranked, exact, ds, ds.queries, rr, pools)
             rr.unload()
+    if args.per_query is not None:
+        with durable.atomic_file(args.per_query) as f:
+            np.savez_compressed(f, **PER_QUERY)
 
 
 if __name__ == "__main__":

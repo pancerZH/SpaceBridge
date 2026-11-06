@@ -165,7 +165,7 @@ An index not in English always needs `shift_banks`, because the default banks al
 
 ### Chinese queries into an English index, end to end
 
-This is the one cross-language setup with measured results. The query model has to read both languages. It uses a translator feeding BM25, with the bridge doing the dense search. Only BM25 reads the translation.
+This is the one cross-language setup with measured results, which the README's [Queries in another language](../README.md#queries-in-another-language) table gives: Chinese to English only, on two Wikipedia sets up to about 21K documents. The query model has to read both languages. It uses a translator feeding BM25, with the bridge doing the dense search. Only BM25 reads the translation.
 
 ```python
 import torch
