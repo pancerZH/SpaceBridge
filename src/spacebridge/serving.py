@@ -19,7 +19,7 @@ from .anchors import LARGE_INDEX_DOCS
 from .bridge import SpaceBridge
 from .identity import check_encoder, sample_rows, vectors_match
 from .lexical import LEXICAL_SHARE, LexicalIndex, merge_pool, timed_build
-from .mount import IndexReader, QueryEncoder
+from .mount import IndexReader, QueryEncoder, check_legacy
 from .quality import lexical_rerank_pool, size_rerank_pool
 
 HNSW_SAVE_SECONDS = 600  # a crash loses at most this much building
@@ -232,7 +232,8 @@ class Searcher:
     without ``query_lang="zh"`` is centered as if it were English and goes to BM25 as is.
 
     Artifacts are checked against the index at construction, on a sample of rows: the bridge, the lexical index and, if it can tell, the
-    backend. A mismatch raises ``ValueError``. Those saved before these checks existed are checked only by size.
+    backend. A mismatch raises ``ValueError``. Those saved before these checks existed are checked by the size and vector width they
+    recorded, with a warning that their content and row order are unverified.
 
     Above ``LARGE_INDEX_DOCS`` documents a reranker is required: first-stage results lose far more there (MS MARCO 1M, nDCG@5
     0.33-0.44 instead of 0.66-0.69). ``allow_no_reranker=True`` opts out, to time search alone.
@@ -262,6 +263,9 @@ class Searcher:
         corpus = getattr(bridge, "corpus", None)
         if corpus is not None:
             corpus.check(index, "this bridge")
+        elif getattr(bridge, "W", None) is not None:  # saved before fingerprints: check what it recorded
+            size = (bridge.quality.details.get("coverage", {}).get("index_size") if bridge.quality is not None else None)
+            check_legacy(None if size is None else int(size), bridge.W.shape[1], index, "this bridge")
         check_encoder(getattr(bridge, "tgt_encoder", None), encoder, "this bridge")
         check_backend = getattr(backend, "check_index", None)
         if check_backend is not None:

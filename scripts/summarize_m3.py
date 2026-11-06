@@ -1,4 +1,4 @@
-"""M3's tables, from the records on disk. Retention is ρceil on nDCG@5: mean over pairs of the mean over seeds, as the targets define it.
+"""Historical: M3's tables, from the records on disk. The current documents' tables come from scripts/review_tables.py. Retention is ρceil on nDCG@5: mean over pairs of the mean over seeds, as the targets define it.
 
     uv run python scripts/summarize_m3.py a6 > outputs/phase1/m3_tables/a6.md
     uv run python scripts/summarize_m3.py full > outputs/phase1/m3_tables/full.md
@@ -248,9 +248,13 @@ class Timing:
     def search_ms(self, device: str, size: int) -> float:
         if size > 1_000_000:
             device = "cpu"
-        hnsw = [r for r in self.records if r["device"] == device and not r["rerank"] and r["backend"] != "exact" and r["threads"] == 10 and r["ef"] == 500 and r["N"] == size]
+        hnsw = [r for r in self.records if r["device"] == device and not r["rerank"] and r["backend"] != "exact" and r["threads"] == 10 and r["ef"] == 500 and r["N"] == size
+                and r.get("index_model", "bge-large-en") == "bge-large-en" and r.get("query_model", "qwen3-0.6b") == "qwen3-0.6b"]
         if size == 1_000_000 and hnsw:
-            return hnsw[-1]["stages_ms"]["search"]["p50"]
+            values = {round(r["stages_ms"]["search"]["p50"], 3) for r in hnsw}
+            if len(values) > 1:  # two measurements of one configuration: record order is not a reason to prefer one
+                raise ValueError(f"{len(hnsw)} HNSW search timings match {device} at {size:,} documents ({sorted(values)}): remove the ones that don't apply")
+            return hnsw[0]["stages_ms"]["search"]["p50"]
         pts = sorted({r["N"]: r["stages_ms"]["search"]["p50"] for r in self.records if r["device"] == device and r["backend"] == "exact" and r.get("search_device", device) == device and (not r["rerank"] or r["N"] > 1_000_000)}.items())
         return float(np.interp(size, *zip(*pts)))
 

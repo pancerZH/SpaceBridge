@@ -21,6 +21,7 @@ from spacebridge_bench import durable
 from spacebridge_bench.datasets import load_beir
 from spacebridge_bench.encode import Encoder, MountEncoder
 from spacebridge_bench.models import MODELS
+from spacebridge_bench.provenance import config_id, implementation_digest
 from spacebridge_bench.run import _first_docs
 
 
@@ -72,6 +73,13 @@ def time_rate(args, ds) -> dict:
     return {"seconds": seconds, "n_docs": len(rows), "tokens_per_doc": float(tokens.mean()), "tokens_per_s": float(tokens.sum() / seconds), "docs_per_s": len(rows) / seconds}
 
 
+def measurement_key(args) -> str:
+    """Readable parts first, then a hash of every option that can change the measurement, and of the code."""
+    options = {"mode": args.mode, "dataset": args.dataset, "model": args.model, "index_model": args.index_model, "K": args.K, "max_docs": args.max_docs,
+               "seed": args.seed, "n": args.n, "device": args.device, "threads": args.threads, "implementation": implementation_digest()}
+    return f"{args.mode}|{args.dataset}|{args.model}|{args.device}|t{args.threads}|{config_id(options)}"
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("mode", choices=("mount", "rate"))
@@ -87,7 +95,7 @@ def main() -> None:
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
 
-    key = f"{args.mode}|{args.dataset}|{args.model}|{args.device}|t{args.threads}" + (f"|K{args.K}" if args.mode == "mount" else "") + (f"|N{args.max_docs}" if args.max_docs else "")
+    key = measurement_key(args)
     if args.out.exists() and key in {r["key"] for r in durable.read_jsonl(args.out)[0]}:
         durable.progress(f"{key}: already recorded")
         return

@@ -18,7 +18,8 @@ from spacebridge.anchors import _truncate_tokens
 from spacebridge_bench import durable
 from spacebridge_bench.datasets import load_beir
 from spacebridge_bench.encode import Encoder, MountEncoder
-from spacebridge_bench.metrics import bootstrap_ratio_ci, per_query, retention
+from spacebridge_bench.metrics import bootstrap_retention_ci, per_query, retention
+from spacebridge_bench.provenance import check_or_write_config, implementation_digest, query_digest
 from spacebridge_bench.models import MODELS
 from spacebridge_bench.run import _first_queries
 from spacebridge_bench.search import cached_search_nested, search_nested
@@ -63,6 +64,11 @@ def ranked_for(key: str, ds, sizes, queries, device) -> tuple:
     return store, Q, cached_search_nested(Q, store, sizes, device, exclude=ds.self_rows)
 
 
+def file_config(ds, sizes: list[int], device: str) -> dict:
+    """What a results file is tied to, beyond each cell's pair, K and seed: the size grid, the queries, the device and the code."""
+    return {"dataset": ds.name, "n_docs": ds.N, "sizes": list(sizes), "queries_sha256": query_digest(ds.queries), "device": device, "implementation": implementation_digest()}
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("dataset")
@@ -79,6 +85,8 @@ def main() -> None:
     if args.max_queries is not None:
         ds = _first_queries(ds, args.max_queries)
     sizes = sorted(s for s in args.sizes if s <= ds.N)
+    # A cell's key names its pair, K and seed; the file is tied to the rest: sizes, queries, device and code.
+    check_or_write_config(args.out, file_config(ds, sizes, args.device))
     done = finished(args.out)
     positives = np.array(sorted({d for rel in ds.qrels for d in rel}))
     if positives.max() >= sizes[0]:
@@ -111,11 +119,10 @@ def main() -> None:
             mean = lambda d: {m: float(v.mean()) for m, v in d.items()}
             bridged_m, native_m, oracle_m = mean(pq), mean(native_pq), mean(oracle_pq)
             rho_oracle, rho_ceil = retention(bridged_m, native_m, oracle_m)
-            ceil = lambda m: native_pq[m] if native_m[m] <= oracle_m[m] else oracle_pq[m]
             records.append({
                 "dataset": ds.name, "src": src_key, "tgt": tgt_key, "K": bundle.K, "seed": seed, "size": size, "n_queries": len(ds.queries),
                 "metrics": bridged_m, "native": native_m, "oracle": oracle_m, "rho_ceil": rho_ceil, "rho_oracle": rho_oracle,
-                "ci_ceil": {m: bootstrap_ratio_ci(pq[m], ceil(m)) for m in ("recall@30", "recall@300", "ndcg@10")},
+                "ci_ceil": {m: bootstrap_retention_ci(pq[m], native_pq[m], oracle_pq[m]) for m in ("recall@30", "recall@300", "ndcg@10")},
                 "rho_val": bridge.metrics["rho_val"], "solver": bridge.metrics.get("solver"), "mount": bridge.metrics["mount"],
                 "overlap": {k: float(top_overlap(ranked[size], native[size], k).mean()) for k in (10, 30, 100)},
                 "overlap30_sd": float(top_overlap(ranked[size], native[size], 30).std()),

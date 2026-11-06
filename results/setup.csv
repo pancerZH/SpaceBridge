@@ -1,0 +1,24 @@
+kind,model,device,documents,K,tokens_per_doc,tokens_per_s,seconds,source
+mount,minilm,cuda,1000000,2048,,,5.63,outputs/phase1/m1_timing/mount.jsonl
+mount,minilm,cuda,1000000,8192,,,4.94,outputs/phase1/m1_timing/mount.jsonl
+encode_rate,minilm,cuda,1000000,,77.06,658165.4,,outputs/phase1/m1_timing/mount.jsonl
+encode_rate,minilm,cpu,1000000,,76.836,14777.8,,outputs/phase1/m1_timing/mount.jsonl
+mount,bge-base-en,cuda,1000000,2048,,,6.42,outputs/phase1/m1_timing/mount.jsonl
+mount,bge-base-en,cuda,1000000,8192,,,8.83,outputs/phase1/m1_timing/mount.jsonl
+encode_rate,bge-base-en,cuda,1000000,,77.065,274997.9,,outputs/phase1/m1_timing/mount.jsonl
+encode_rate,bge-base-en,cpu,1000000,,76.836,2141.2,,outputs/phase1/m1_timing/mount.jsonl
+mount,bge-large-en,cuda,1000000,2048,,,5.34,outputs/phase1/m1_timing/mount.jsonl
+mount,bge-large-en,cuda,1000000,8192,,,12.81,outputs/phase1/m1_timing/mount.jsonl
+encode_rate,bge-large-en,cuda,1000000,,77.065,106690.2,,outputs/phase1/m1_timing/mount.jsonl
+encode_rate,bge-large-en,cpu,1000000,,76.836,608.9,,outputs/phase1/m1_timing/mount.jsonl
+mount,qwen3-0.6b,cuda,1000000,2048,,,17.76,outputs/phase1/m1_timing/mount.jsonl
+mount,qwen3-0.6b,cuda,1000000,8192,,,37.0,outputs/phase1/m1_timing/mount.jsonl
+encode_rate,qwen3-0.6b,cuda,1000000,,79.148,46361.8,,outputs/phase1/m1_timing/mount.jsonl
+encode_rate,qwen3-0.6b,cpu,1000000,,78.866,390.5,,outputs/phase1/m1_timing/mount.jsonl
+mount,minilm,cpu,1000000,2048,,,27.5,outputs/phase1/m1_timing/mount.jsonl
+mount,minilm,cpu,1000000,8192,,,85.35,outputs/phase1/m1_timing/mount.jsonl
+mount,bge-base-en,cpu,1000000,2048,,,137.65,outputs/phase1/m1_timing/mount.jsonl
+hnsw_build,bge-large-en,cpu,1000000,,,,662.5,outputs/phase1/w5_ann/ms1m.jsonl
+hnsw_build,bge-large-en,cpu,8841823,,,,6480.0,"the 8.84M build, about 1.8 hours on 12 threads"
+bm25_build,,cpu,1000000,,,,22.0,"LexicalIndex.build, 14 to 22 s at 1M; the upper end"
+bm25_build,,cpu,8841823,,,,128.0,LexicalIndex.build at 8.84M

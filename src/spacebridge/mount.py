@@ -71,6 +71,12 @@ class Index:
         return [self._titles[i] if self._titles is not None else "" for i in ids]
 
 
+def _check_anchor_count(K: int, source: str) -> None:
+    """The effective anchor count, after exclusions, explicit anchors or a bank decided it: the split needs room."""
+    if K < MIN_ANCHORS:
+        raise ValueError(f"{source} give {K} anchors, and at least {MIN_ANCHORS} are needed for a training and a validation split")
+
+
 def check_vectors(index: IndexReader) -> None:
     """Spot-checks stored vectors, on a sample so it stays cheap on a large or lazy index: finite, and unit length, the case that was measured."""
     sample = np.asarray(index.vectors(sample_rows(len(index))), dtype=np.float64)
@@ -126,6 +132,7 @@ def freeze(
     if parallel_bank is not None:
         src_side, tgt_side = parallel_bank
         K = min(K or len(src_side), len(src_side))
+        _check_anchor_count(K, "the parallel bank")
         pick = np.sort(np.random.default_rng(seed).permutation(len(src_side))[:K])
         doc_texts = proxies = [src_side[i] for i in pick]
         tgt_anchor_texts = [tgt_side[i] for i in pick]
@@ -139,6 +146,7 @@ def freeze(
             else:
                 anchor_ids = allowed[select_anchors(index.vectors(allowed), K, seed, device, method="kmeans")]
         K = len(anchor_ids)
+        _check_anchor_count(K, "the anchors given" if anchor_ids is not None else "the rows left after exclusions")
         titles, doc_texts = index.titles(anchor_ids), index.texts(anchor_ids)
         proxies = make_proxies(titles, doc_texts)
         X_doc = index.vectors(anchor_ids)
@@ -172,6 +180,18 @@ def freeze(
     )
 
 
+def check_legacy(n_docs: Optional[int], dim: Optional[int], index: IndexReader, what: str) -> None:
+    """For artifacts saved before corpus fingerprints existed: the recorded size and vector width must match. This can't detect
+    another corpus of the same size and width, or a reordering, so it warns that identity is unverified."""
+    if n_docs is not None and n_docs != len(index):
+        raise ValueError(f"{what} was made for {n_docs:,} documents and this index has {len(index):,}")
+    if dim is not None:
+        width = np.asarray(index.vectors(np.array([0]))).shape[-1]
+        if width != dim:
+            raise ValueError(f"{what} was made for {dim}-dimension vectors and this index has {width}")
+    warnings.warn(f"{what} has no corpus fingerprint (saved before they existed): checked by size and width only, not by content or row order")
+
+
 def mount(
     bundle: CalibrationBundle,
     index: IndexReader,
@@ -195,6 +215,8 @@ def mount(
     """
     if bundle.corpus is not None:
         bundle.corpus.check(index, "this calibration bundle")
+    else:  # saved before fingerprints: its size and width are all it can be checked by, and its row order can't be
+        check_legacy(bundle.index_size, bundle.X_doc_raw.shape[1], index, "this calibration bundle")
     timing = {}
 
     def timed(name: str, call: Callable):

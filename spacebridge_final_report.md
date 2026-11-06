@@ -35,7 +35,7 @@ Here $q$ is the query from the new model, $\mu_Y$ is the new model's average que
 
 W is then fitted in two stages. **Stage 1** has closed-form solutions: a rotation and a least-squares fit, picked by how well they reproduce the old model's rankings. **Stage 2** runs 50 steps of gradient descent to make each proxy find its own document.
 
-**What a map can't do.** The stored vectors never change. If the old model put two documents almost in the same place, no query can separate them. And a small error in the query matters more as the index grows, since each query's neighbours get closer together.
+**What a map can't do.** The stored vectors never change. If the old model gave two documents the same vector, no query can separate them, and if it put them nearly together, a small error in the mapped query is enough to swap them. And a small error in the query matters more as the index grows, since each query's neighbours get closer together.
 
 **Why a reranker and BM25 help.** A **reranker** reads the query and document text together, and gives a far better score than vectors can, but it's too slow to run on everything. So a first search finds a few dozen **candidates** and the reranker orders them. Then the map only has to get the right document into the candidates, not to the top. **BM25**, a classic keyword search, adds candidates that don't depend on the map at all. A document whose exact name appears in the query is what BM25 finds easily and what a map tends to blur.
 
@@ -54,7 +54,8 @@ Every dataset is a public retrieval benchmark: documents, queries, and human lab
 | NQ | 1,000,000 of 2.68M | 2,000 | Real questions and Wikipedia | Scale |
 | HotpotQA | 5,233,329 | 2,000 | Questions needing two Wikipedia pages | Scale, hardest case |
 | T2Retrieval | 50,000 | 2,000 | Chinese web search | Chinese |
-| XQuAD, MLQA | 20,958 and 10,894 | 1,190 and 5,137 | Questions in other languages | Other languages |
+| XQuAD | 20,958 | 1,190 | Chinese questions, English Wikipedia paragraphs | Other languages |
+| MLQA | 10,894 | 5,137 | Chinese questions, English Wikipedia paragraphs | Other languages |
 | **For the final check only** | | | | |
 | MS MARCO, unused queries | 8,841,823 | 2,000 | New queries, same corpus | Fresh confirmation |
 | HotpotQA, unused queries | 5,233,329 | 2,000 | New queries, same corpus | Fresh confirmation |
@@ -94,7 +95,7 @@ The score is **nDCG@5**, which rewards putting the right documents in the top 5,
 | A held-out corpus | Does it hold on data we hadn't used? | **No.** HotpotQA missed at 1M |
 | Why, and how to fix it | What does the map lose? | BM25 in the pool passes, at a fifth of the reranking cost |
 | Largest sizes | How far up? | Up to 8.84M, on the lower line |
-| Review | Is the evidence sound? | The defects found changed no published number. Claims and statistics were corrected |
+| Review | Is the evidence sound? | Recomputed, the 19,836 published metric and retention values were unchanged. The intervals were wrong and were replaced, and claims were narrowed |
 | Fresh confirmation | Does the final system, unchanged, hold on data that chose nothing? | [§7](#7-what-we-achieved) |
 
 **Rules that kept results honest.** Three seeds for anything reported. Reading rules written before the result, for the largest decisions. A result that came out mixed stayed mixed. Records saved as they were produced, so a crash loses little, and a rerun continues.
@@ -115,9 +116,9 @@ The score is **nDCG@5**, which rewards putting the right documents in the top 5,
 
 **It works with the old model gone.** A fit from stored vectors and the new model alone holds up, at a larger pool of 100, on one pair per family, 500 queries, at 1M.
 
-**The recheck held up.** Recomputing every published cell from the caches, with the corrected code, matched the published records: 19,836 values, all identical to six decimal places.
+**The recheck held up.** Recomputing the published cells of 44 record files from the caches, with the corrected code, matched the records: 19,836 metric and retention values, all identical to six decimal places. What did change were the intervals, which had been computed wrongly, and some diagnostic summaries.
 
-**The fresh confirmation held up.** On data that chose nothing, no result missed a line, and eight of ten were confirmed outright ([§7](#7-what-we-achieved)).
+**The fresh confirmation held up.** On data that chose nothing, no result missed a line, and ten of twelve were confirmed outright ([§7](#7-what-we-achieved)).
 
 ## 6. What went badly, and what we did
 
@@ -160,6 +161,8 @@ Reviewers read the code and documents after we'd finished. They found real defec
 | **Latency tails were modeled but labeled measured** | Yes | Sizes without their own run were modeled | Timed at more sizes, and every cell says which it is |
 | **An HNSW file at a reused path could pair the old graph with new text** | Not in the benchmarks | Paths named the vectors | Checked against the vectors, in the library |
 | **"Upper bound" and "loss against re-indexing"** were overstated | Claims, yes | The denominator is the weaker baseline, not a bound, and not re-indexing | Renamed, and direct re-index comparison added |
+
+A second, final review found more: a degenerate fit could still return a map of NaNs that looked fitted; resume checks still left out the device, the code and the model revisions; two library checks had gaps; and `results/` couldn't regenerate the tables alone. All were fixed and tested. None of them touched a published number, which the recheck and `scripts/verify_results.py` confirm.
 
 The report's earlier claim that a nonlinear map was never tried was also wrong: one was tried, and it didn't help. That result is narrow: one architecture, trained on cosine.
 
@@ -211,7 +214,7 @@ We froze the system, wrote down the rules before any result existed ([plan](docs
 | MS MARCO, unused queries, HNSW | 8.84M | 2000 | Across families, one direction | 0.961 | 0.943 | 0.980 | 0.90 | Confirmed |  | 0.420 |
 <!-- /table:fresh -->
 
-**How to read it.** No fresh result missed a line. Eight of the ten verdicts with an interval are confirmed and two are point passes: LoTTE same family reads 0.989 with a low end of 0.976, against 0.98, and Touché same family reads 1.021 with a low end of 0.976, on only 49 queries. Through the HNSW index, MS MARCO reads 0.973 and 0.961 against 0.95 and 0.90, with low ends of 0.958 and 0.943, so both are confirmed. That interval was computed after the point estimates were known, from per-query scores saved by a rerun of the same configuration. Four things qualify the result:
+**How to read it.** No fresh result missed a line. Ten of the twelve verdicts are confirmed: eight of the ten exact-search rows, and both HNSW rows. Two are point passes: LoTTE same family reads 0.989 with a low end of 0.976, against 0.98, and Touché same family reads 1.021 with a low end of 0.976, on only 49 queries. Through the HNSW index, MS MARCO reads 0.973 and 0.961 against 0.95 and 0.90, with low ends of 0.958 and 0.943. That interval was computed after the point estimates were known, from per-query scores saved by a rerun of the same configuration, whose records match the first run's exactly. Four things qualify the result:
 
 - **New queries are not a new corpus.** The MS MARCO and HotpotQA rows are new queries on corpora that shaped the system. LoTTE, FEVER and Touché are the new corpora.
 - **On some corpora BM25 does the work.** On FEVER, BM25 and the reranker with no bridge read 0.977, close to the bridge's 0.997 and 0.994. On HotpotQA they read 0.949 and 0.999. **On Touché, no bridge reads 1.096, above the bridge's 1.021 and 1.034: there the bridge lowers quality against BM25 alone**, on 49 queries. Where the map earns its place: LoTTE, 0.838 and 0.818 with no bridge against 0.989 and 0.964, and MS MARCO, 0.862 and 0.870 against 0.971 and 0.956.

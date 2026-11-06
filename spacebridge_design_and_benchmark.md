@@ -37,6 +37,10 @@ Querying a vector index with a different embedding model normally means re-embed
 | **Teacher** | The old model's embedding of a proxy, used as a training signal |
 | **Retention point** | 0.01 of retention. A point of absolute `nDCG@5` is 0.01 of `nDCG@5`. The two are always named, since they differ |
 | **Grade, score** | See [§7](#7-the-quality-report) |
+| $d_t$, $d_s$ | The new (target) model's and the old (source) model's vector dimensions |
+| **InfoNCE** | A contrastive loss: a softmax over candidates whose target is the right one |
+| **KL** | Kullback-Leibler divergence, here between the old model's and the mapped query's score distributions over the anchors |
+| **bf16, fp32** | 16-bit brain floating point, which GPU inference uses here, and 32-bit floating point, which a CPU uses |
 
 ## 2. Overview of the system
 
@@ -167,7 +171,7 @@ The two forms are the same for any $\lambda > 0$; the code inverts the smaller m
 
 Besides (proxy, document) pairs, the anchors also give (document, document) pairs: the new model encodes the anchor document, cut at 128 tokens, and maps to its stored vector, each kind centered on its own mean. They double the rows of both stages. They are related rows, not twice the independent information.
 
-Query models of at least 2B parameters skip them (`size_class = "large"`). Only 0.6B and 4B models were measured, not those between. At 4B the pass cost 51 s at K = 2,048 and gained +0.1 ± 3.0 retention points on one pair. Below that, they gain +1.6 to +7.4 points of first-stage `Recall@30` across FiQA, TREC-COVID and truncated-dimension models.
+Query models of at least 2B parameters skip them (`size_class = "large"`). Only 0.6B and 4B models were measured, not those between. At 4B the pass cost 51 s at K = 2,048 and gained +0.1 retention points on one pair, with a standard deviation of 3.0 over 3 seeds. Below that, they gain +1.6 to +7.4 points of first-stage `Recall@30` across FiQA, TREC-COVID and truncated-dimension models.
 
 Cutting anchor documents at 128 tokens rather than using their full length costs at most 0.8 retention points of first-stage `Recall@30` (Tier 3 at K = 2,048 on TREC-COVID, whose anchor documents are long), and nothing on short passages. A 128-token pass takes about 1.3 times the proxy pass. A full-length pass took about 3 times, on the same models and corpora. The length is a parameter (`doc_pair_tokens`).
 
@@ -257,7 +261,7 @@ $$\mu_{Y, L_q} = \mu_{Y, L_{\text{src}}} + (\mu_{\text{bank}, L_q} - \mu_{\text{
 
 The bank is parallel sentences, encoded with the new model's query prompt. The default is the FLORES `dev` split with sentences that appear in Belebele or in `devtest` removed, which leaves 94 for Chinese (all used, at most 256), or, when FLORES is out of reach, 256 Tatoeba pairs, for Chinese only. The default banks need an English index. A registered language can also get its own experimental score from `devtest` sentences.
 
-**A new model that can't read the index's language at all.** `freeze(parallel_bank=...)` replaces corpus anchors with parallel sentences: the whole FLORES bank, 2,009 pairs, unless Belebele is an evaluation set. Measured once: 0.822 ± 0.015 of native `Recall@30`, MLQA, English queries into a Chinese index. With the 338 filtered pairs it reads 0.587.
+**A new model that can't read the index's language at all.** `freeze(parallel_bank=...)` replaces corpus anchors with parallel sentences: the whole FLORES bank, 2,009 pairs, unless Belebele is an evaluation set. Measured once: 0.822 of native `Recall@30`, with a standard deviation of 0.015 over 3 seeds, MLQA, English queries into a Chinese index. With the 338 filtered pairs it reads 0.587.
 
 **The caller supplies the language.** Nothing detects it, `src_lang` defaults to English, and `query_lang` defaults to the index's language.
 
@@ -327,7 +331,7 @@ On queries naming both positives' titles, repairing both recovers 96% to 100% of
 
 ## 9. Results
 
-**Status of this evidence.** The configuration was developed on these benchmarks, with decisions made after looking at results. The [decision ledger](docs/decision_ledger.md) records which data informed which choice. So everything in §9.1 to §9.5 is exploratory: point estimates reaching chosen thresholds on the configurations measured. Only §9.7 is a confirmation run. Records behind the tables are in [`results/`](results/README.md).
+**Status of this evidence.** The configuration was developed on these benchmarks, with decisions made after looking at results. The [decision ledger](docs/decision_ledger.md) records which data informed which choice. So everything in §9.1 to §9.5 is exploratory: point estimates reaching chosen thresholds on the configurations measured. Only §9.7 is a confirmation run. The records behind every generated table are in [`results/`](results/README.md), and `uv run python scripts/verify_results.py` checks them and the tables from a public checkout. Figures quoted in prose from earlier studies are reported measurements: `results/README.md` says which.
 
 **Positive-preserving corpora.** Most sizes below the full corpora keep every positive of the evaluation queries, then add uniformly sampled distractors. That makes sizes comparable, but it's a condition on evaluation labels: these aren't ordinary random corpora of that size. At 10K documents, positives are 21% to 42% of the rows. Full-corpus measurements are SciFact, ArguAna, SciDocs, FiQA, TREC-COVID, and the 8.84M MS MARCO and 5.23M HotpotQA rows.
 
@@ -338,51 +342,94 @@ On queries naming both positives' titles, repairing both recovers 96% to 100% of
 The served configuration: BM25 in a pool of 60, `bge-reranker-v2-m3`, exact search. The interval is defined in [§3](#intervals). A blank means not measured, and each value is the mean over that family's pairs: `results/retention.csv` gives the pair counts.
 
 <!-- table:retention -->
-| Corpus | Documents | Queries | Same family | Low | High | Across families | Low | High | Same family, strict | Across families, strict | Same family, absolute | Across families, absolute | Native, absolute | Re-index, absolute |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| MS MARCO | 10K | 500 | 1.000 | 0.993 | 1.007 | 1.001 | 0.995 | 1.007 | 0.998 | 0.998 | 0.986 | 0.987 | 0.988 | 0.988 |
-| MS MARCO | 20K | 500 | 1.003 | 0.998 | 1.011 | 1.004 | 0.996 | 1.012 | 1.001 | 1.001 | 0.977 | 0.977 | 0.977 | 0.977 |
-| MS MARCO | 30K | 500 | 1.004 | 0.996 | 1.013 | 1.003 | 0.994 | 1.012 | 0.999 | 0.998 | 0.966 | 0.965 | 0.967 | 0.967 |
-| MS MARCO | 50K | 500 | 1.000 | 0.993 | 1.009 | 1.000 | 0.992 | 1.008 | 0.996 | 0.996 | 0.955 | 0.955 | 0.959 | 0.959 |
-| MS MARCO | 100K | 500 | 1.000 | 0.990 | 1.009 | 0.996 | 0.988 | 1.004 | 0.995 | 0.995 | 0.929 | 0.929 | 0.934 | 0.935 |
-| MS MARCO | 150K | 500 | 1.002 | 0.992 | 1.013 | 0.997 | 0.989 | 1.005 | 0.997 | 0.996 | 0.909 | 0.908 | 0.912 | 0.914 |
-| MS MARCO | 160K | 500 | 1.002 | 0.992 | 1.013 | 0.996 | 0.988 | 1.004 | 0.996 | 0.995 | 0.905 | 0.904 | 0.909 | 0.910 |
-| MS MARCO | 160,001 | 500 | 1.003 | 0.993 | 1.014 | 0.998 | 0.991 | 1.004 | 0.997 | 0.997 | 0.906 | 0.906 | 0.909 | 0.910 |
-| MS MARCO | 200K | 500 | 0.998 | 0.988 | 1.008 | 0.995 | 0.987 | 1.004 | 0.997 | 0.996 | 0.893 | 0.893 | 0.899 | 0.898 |
-| MS MARCO | 500K | 500 | 0.996 | 0.986 | 1.006 | 0.989 | 0.978 | 0.999 | 0.995 | 0.989 | 0.819 | 0.817 | 0.826 | 0.828 |
-| MS MARCO | 1M | 2000 | 0.995 | 0.989 | 1.002 | 0.982 | 0.976 | 0.989 | 0.994 | 0.983 | 0.722 | 0.715 | 0.728 | 0.728 |
-| MS MARCO | 2M | 2000 | 0.986 | 0.980 | 0.995 | 0.972 | 0.963 | 0.982 | 0.985 | 0.973 | 0.632 | 0.622 | 0.640 | 0.640 |
-| MS MARCO | 4M | 2000 | 0.985 | 0.975 | 0.995 | 0.962 | 0.950 | 0.975 | 0.982 | 0.958 | 0.530 | 0.517 | 0.539 | 0.539 |
-| MS MARCO | 8.84M | 2000 | 0.979 | 0.966 | 0.993 | 0.946 | 0.930 | 0.964 | 0.981 | 0.945 | 0.419 | 0.405 | 0.429 | 0.429 |
-| NQ | 10K | 500 | 1.000 | 0.998 | 1.005 | 1.002 | 0.999 | 1.007 | 1.000 | 1.001 | 0.964 | 0.964 | 0.963 | 0.963 |
-| NQ | 20K | 500 | 1.002 | 0.998 | 1.008 | 1.003 | 0.999 | 1.008 | 1.001 | 0.999 | 0.964 | 0.963 | 0.962 | 0.962 |
-| NQ | 30K | 500 | 1.002 | 0.998 | 1.007 | 1.000 | 0.995 | 1.005 | 1.000 | 0.997 | 0.959 | 0.955 | 0.957 | 0.957 |
-| NQ | 50K | 500 | 1.000 | 0.995 | 1.007 | 1.000 | 0.996 | 1.005 | 1.000 | 0.998 | 0.948 | 0.946 | 0.947 | 0.947 |
-| NQ | 100K | 500 | 0.996 | 0.987 | 1.006 | 0.999 | 0.992 | 1.008 | 0.995 | 0.997 | 0.925 | 0.926 | 0.928 | 0.928 |
-| NQ | 150K | 500 | 0.994 | 0.985 | 1.003 | 0.996 | 0.988 | 1.005 | 0.993 | 0.993 | 0.908 | 0.906 | 0.912 | 0.912 |
-| NQ | 160K | 500 | 0.999 | 0.989 | 1.007 | 0.994 | 0.985 | 1.003 | 0.996 | 0.990 | 0.910 | 0.904 | 0.912 | 0.912 |
-| NQ | 160,001 | 500 | 0.997 | 0.986 | 1.007 | 1.000 | 0.992 | 1.008 | 0.995 | 0.996 | 0.909 | 0.909 | 0.912 | 0.912 |
-| NQ | 200K | 500 | 0.995 | 0.986 | 1.006 | 0.996 | 0.989 | 1.005 | 0.998 | 0.992 | 0.896 | 0.894 | 0.900 | 0.900 |
-| NQ | 500K | 500 | 0.989 | 0.976 | 1.000 | 0.988 | 0.974 | 1.001 | 0.993 | 0.985 | 0.831 | 0.820 | 0.838 | 0.838 |
-| NQ | 1M | 2000 | 0.985 | 0.979 | 0.993 | 0.979 | 0.971 | 0.987 | 0.985 | 0.975 | 0.772 | 0.761 | 0.781 | 0.781 |
-| HotpotQA | 10K | 500 | 1.004 | 1.001 | 1.009 | 1.005 | 1.001 | 1.011 | 1.003 | 1.001 | 0.958 | 0.958 | 0.954 | 0.954 |
-| HotpotQA | 20K | 500 | 1.003 | 0.999 | 1.008 | 1.008 | 1.003 | 1.016 | 1.002 | 1.001 | 0.958 | 0.958 | 0.953 | 0.953 |
-| HotpotQA | 30K | 500 | 1.006 | 1.001 | 1.012 | 1.011 | 1.003 | 1.019 | 1.002 | 0.999 | 0.957 | 0.956 | 0.950 | 0.950 |
-| HotpotQA | 50K | 500 | 1.005 | 1.000 | 1.011 | 1.010 | 1.003 | 1.019 | 1.000 | 0.999 | 0.954 | 0.952 | 0.947 | 0.947 |
-| HotpotQA | 100K | 500 | 1.000 | 0.992 | 1.008 | 1.012 | 1.003 | 1.022 | 0.995 | 0.997 | 0.943 | 0.938 | 0.937 | 0.937 |
-| HotpotQA | 150K | 500 | 0.997 | 0.990 | 1.005 | 1.014 | 1.004 | 1.025 | 0.993 | 0.996 | 0.935 | 0.930 | 0.929 | 0.929 |
-| HotpotQA | 160K | 500 | 0.997 | 0.990 | 1.005 | 1.015 | 1.005 | 1.026 | 0.992 | 0.997 | 0.934 | 0.928 | 0.927 | 0.927 |
-| HotpotQA | 160,001 | 500 | 1.003 | 0.996 | 1.011 | 1.018 | 1.008 | 1.029 | 0.998 | 1.000 | 0.939 | 0.931 | 0.927 | 0.927 |
-| HotpotQA | 200K | 500 | 1.000 | 0.993 | 1.008 | 1.018 | 1.007 | 1.029 | 0.999 | 0.999 | 0.934 | 0.928 | 0.924 | 0.924 |
-| HotpotQA | 500K | 500 | 0.997 | 0.988 | 1.007 | 1.016 | 1.003 | 1.031 | 0.994 | 0.993 | 0.912 | 0.900 | 0.903 | 0.903 |
-| HotpotQA | 1M | 2000 | 0.995 | 0.990 | 1.000 | 1.020 | 1.012 | 1.029 | 0.989 | 0.988 | 0.882 | 0.866 | 0.869 | 0.869 |
-| HotpotQA | 2M | 2000 | 0.994 | 0.988 | 1.000 | 1.020 | 1.011 | 1.029 | 0.982 | 0.981 | 0.857 | 0.837 | 0.845 | 0.845 |
-| HotpotQA | 5.23M | 2000 | 0.985 | 0.977 | 0.993 | 1.009 | 0.999 | 1.021 | 0.967 | 0.961 | 0.808 | 0.783 | 0.803 | 0.803 |
-| SciFact | 5.2K | 300 | 1.008 | 0.993 | 1.028 | 1.008 | 0.995 | 1.032 | 1.002 | 1.001 | 0.721 | 0.721 | 0.715 | 0.715 |
-| ArguAna | 8.7K | 1401 | 1.066 | 1.051 | 1.081 | 1.073 | 1.060 | 1.088 | 1.054 | 1.062 | 0.391 | 0.394 | 0.378 | 0.378 |
-| SciDocs | 25.7K | 1000 | 0.984 | 0.967 | 1.006 | 0.970 | 0.956 | 0.986 | 1.012 | 1.007 | 0.149 | 0.147 | 0.152 | 0.152 |
-| FiQA | 57.6K | 648 | 1.018 | 0.999 | 1.039 | 0.981 | 0.967 | 0.997 | 1.023 | 0.996 | 0.420 | 0.417 | 0.427 | 0.427 |
-| TREC-COVID | 171.3K | 50 | 1.001 | 0.968 | 1.049 | 0.987 | 0.958 | 1.023 | 0.994 | 0.994 | 0.831 | 0.827 | 0.850 | 0.848 |
+| Corpus | Documents | Queries | Models | Retention | Low | High | Strict retention | Bridge, absolute | Native, absolute | Re-index, absolute |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| MS MARCO | 10K | 500 | Same family | 1.000 | 0.993 | 1.007 | 0.998 | 0.986 | 0.986 | 0.988 |
+| MS MARCO | 10K | 500 | Across families | 1.001 | 0.995 | 1.007 | 0.998 | 0.987 | 0.988 | 0.988 |
+| MS MARCO | 20K | 500 | Same family | 1.003 | 0.998 | 1.011 | 1.001 | 0.977 | 0.973 | 0.978 |
+| MS MARCO | 20K | 500 | Across families | 1.004 | 0.996 | 1.012 | 1.001 | 0.977 | 0.977 | 0.977 |
+| MS MARCO | 30K | 500 | Same family | 1.004 | 0.996 | 1.013 | 0.999 | 0.966 | 0.963 | 0.967 |
+| MS MARCO | 30K | 500 | Across families | 1.003 | 0.994 | 1.012 | 0.998 | 0.965 | 0.967 | 0.967 |
+| MS MARCO | 50K | 500 | Same family | 1.000 | 0.993 | 1.009 | 0.996 | 0.955 | 0.955 | 0.957 |
+| MS MARCO | 50K | 500 | Across families | 1.000 | 0.992 | 1.008 | 0.996 | 0.955 | 0.959 | 0.959 |
+| MS MARCO | 100K | 500 | Same family | 1.000 | 0.990 | 1.009 | 0.995 | 0.929 | 0.933 | 0.929 |
+| MS MARCO | 100K | 500 | Across families | 0.996 | 0.988 | 1.004 | 0.995 | 0.929 | 0.934 | 0.935 |
+| MS MARCO | 150K | 500 | Same family | 1.002 | 0.992 | 1.013 | 0.997 | 0.909 | 0.911 | 0.907 |
+| MS MARCO | 150K | 500 | Across families | 0.997 | 0.989 | 1.005 | 0.996 | 0.908 | 0.912 | 0.914 |
+| MS MARCO | 160K | 500 | Same family | 1.002 | 0.992 | 1.013 | 0.996 | 0.905 | 0.908 | 0.903 |
+| MS MARCO | 160K | 500 | Across families | 0.996 | 0.988 | 1.004 | 0.995 | 0.904 | 0.909 | 0.910 |
+| MS MARCO | 160,001 | 500 | Same family | 1.003 | 0.993 | 1.014 | 0.997 | 0.906 | 0.908 | 0.903 |
+| MS MARCO | 160,001 | 500 | Across families | 0.998 | 0.991 | 1.004 | 0.997 | 0.906 | 0.909 | 0.910 |
+| MS MARCO | 200K | 500 | Same family | 0.998 | 0.988 | 1.008 | 0.997 | 0.893 | 0.898 | 0.895 |
+| MS MARCO | 200K | 500 | Across families | 0.995 | 0.987 | 1.004 | 0.996 | 0.893 | 0.899 | 0.898 |
+| MS MARCO | 500K | 500 | Same family | 0.996 | 0.986 | 1.006 | 0.995 | 0.819 | 0.827 | 0.822 |
+| MS MARCO | 500K | 500 | Across families | 0.989 | 0.978 | 0.999 | 0.989 | 0.817 | 0.826 | 0.828 |
+| MS MARCO | 1M | 2000 | Same family | 0.995 | 0.989 | 1.002 | 0.994 | 0.722 | 0.727 | 0.727 |
+| MS MARCO | 1M | 2000 | Across families | 0.982 | 0.976 | 0.989 | 0.983 | 0.715 | 0.728 | 0.728 |
+| MS MARCO | 2M | 2000 | Same family | 0.986 | 0.980 | 0.995 | 0.985 | 0.632 | 0.641 | 0.641 |
+| MS MARCO | 2M | 2000 | Across families | 0.972 | 0.963 | 0.982 | 0.973 | 0.622 | 0.640 | 0.640 |
+| MS MARCO | 4M | 2000 | Same family | 0.985 | 0.975 | 0.995 | 0.982 | 0.530 | 0.539 | 0.539 |
+| MS MARCO | 4M | 2000 | Across families | 0.962 | 0.950 | 0.975 | 0.958 | 0.517 | 0.539 | 0.539 |
+| MS MARCO | 8.84M | 2000 | Same family | 0.979 | 0.966 | 0.993 | 0.981 | 0.419 | 0.429 | 0.429 |
+| MS MARCO | 8.84M | 2000 | Across families | 0.946 | 0.930 | 0.964 | 0.945 | 0.405 | 0.429 | 0.429 |
+| NQ | 10K | 500 | Same family | 1.000 | 0.998 | 1.005 | 1.000 | 0.964 | 0.964 | 0.964 |
+| NQ | 10K | 500 | Across families | 1.002 | 0.999 | 1.007 | 1.001 | 0.964 | 0.963 | 0.963 |
+| NQ | 20K | 500 | Same family | 1.002 | 0.998 | 1.008 | 1.001 | 0.964 | 0.964 | 0.961 |
+| NQ | 20K | 500 | Across families | 1.003 | 0.999 | 1.008 | 0.999 | 0.963 | 0.962 | 0.962 |
+| NQ | 30K | 500 | Same family | 1.002 | 0.998 | 1.007 | 1.000 | 0.959 | 0.959 | 0.957 |
+| NQ | 30K | 500 | Across families | 1.000 | 0.995 | 1.005 | 0.997 | 0.955 | 0.957 | 0.957 |
+| NQ | 50K | 500 | Same family | 1.000 | 0.995 | 1.007 | 1.000 | 0.948 | 0.948 | 0.949 |
+| NQ | 50K | 500 | Across families | 1.000 | 0.996 | 1.005 | 0.998 | 0.946 | 0.947 | 0.947 |
+| NQ | 100K | 500 | Same family | 0.996 | 0.987 | 1.006 | 0.995 | 0.925 | 0.929 | 0.931 |
+| NQ | 100K | 500 | Across families | 0.999 | 0.992 | 1.008 | 0.997 | 0.926 | 0.928 | 0.928 |
+| NQ | 150K | 500 | Same family | 0.994 | 0.985 | 1.003 | 0.993 | 0.908 | 0.914 | 0.915 |
+| NQ | 150K | 500 | Across families | 0.996 | 0.988 | 1.005 | 0.993 | 0.906 | 0.912 | 0.912 |
+| NQ | 160K | 500 | Same family | 0.999 | 0.989 | 1.007 | 0.996 | 0.910 | 0.915 | 0.911 |
+| NQ | 160K | 500 | Across families | 0.994 | 0.985 | 1.003 | 0.990 | 0.904 | 0.912 | 0.912 |
+| NQ | 160,001 | 500 | Same family | 0.997 | 0.986 | 1.007 | 0.995 | 0.909 | 0.915 | 0.911 |
+| NQ | 160,001 | 500 | Across families | 1.000 | 0.992 | 1.008 | 0.996 | 0.909 | 0.912 | 0.912 |
+| NQ | 200K | 500 | Same family | 0.995 | 0.986 | 1.006 | 0.998 | 0.896 | 0.902 | 0.900 |
+| NQ | 200K | 500 | Across families | 0.996 | 0.989 | 1.005 | 0.992 | 0.894 | 0.900 | 0.900 |
+| NQ | 500K | 500 | Same family | 0.989 | 0.976 | 1.000 | 0.993 | 0.831 | 0.845 | 0.841 |
+| NQ | 500K | 500 | Across families | 0.988 | 0.974 | 1.001 | 0.985 | 0.820 | 0.838 | 0.838 |
+| NQ | 1M | 2000 | Same family | 0.985 | 0.979 | 0.993 | 0.985 | 0.772 | 0.784 | 0.784 |
+| NQ | 1M | 2000 | Across families | 0.979 | 0.971 | 0.987 | 0.975 | 0.761 | 0.781 | 0.781 |
+| HotpotQA | 10K | 500 | Same family | 1.004 | 1.001 | 1.009 | 1.003 | 0.958 | 0.955 | 0.955 |
+| HotpotQA | 10K | 500 | Across families | 1.005 | 1.001 | 1.011 | 1.001 | 0.958 | 0.954 | 0.954 |
+| HotpotQA | 20K | 500 | Same family | 1.003 | 0.999 | 1.008 | 1.002 | 0.958 | 0.956 | 0.956 |
+| HotpotQA | 20K | 500 | Across families | 1.008 | 1.003 | 1.016 | 1.001 | 0.958 | 0.953 | 0.953 |
+| HotpotQA | 30K | 500 | Same family | 1.006 | 1.001 | 1.012 | 1.002 | 0.957 | 0.954 | 0.952 |
+| HotpotQA | 30K | 500 | Across families | 1.011 | 1.003 | 1.019 | 0.999 | 0.956 | 0.950 | 0.950 |
+| HotpotQA | 50K | 500 | Same family | 1.005 | 1.000 | 1.011 | 1.000 | 0.954 | 0.950 | 0.949 |
+| HotpotQA | 50K | 500 | Across families | 1.010 | 1.003 | 1.019 | 0.999 | 0.952 | 0.947 | 0.947 |
+| HotpotQA | 100K | 500 | Same family | 1.000 | 0.992 | 1.008 | 0.995 | 0.943 | 0.947 | 0.943 |
+| HotpotQA | 100K | 500 | Across families | 1.012 | 1.003 | 1.022 | 0.997 | 0.938 | 0.937 | 0.937 |
+| HotpotQA | 150K | 500 | Same family | 0.997 | 0.990 | 1.005 | 0.993 | 0.935 | 0.942 | 0.937 |
+| HotpotQA | 150K | 500 | Across families | 1.014 | 1.004 | 1.025 | 0.996 | 0.930 | 0.929 | 0.929 |
+| HotpotQA | 160K | 500 | Same family | 0.997 | 0.990 | 1.005 | 0.992 | 0.934 | 0.940 | 0.936 |
+| HotpotQA | 160K | 500 | Across families | 1.015 | 1.005 | 1.026 | 0.997 | 0.928 | 0.927 | 0.927 |
+| HotpotQA | 160,001 | 500 | Same family | 1.003 | 0.996 | 1.011 | 0.998 | 0.939 | 0.940 | 0.936 |
+| HotpotQA | 160,001 | 500 | Across families | 1.018 | 1.008 | 1.029 | 1.000 | 0.931 | 0.927 | 0.927 |
+| HotpotQA | 200K | 500 | Same family | 1.000 | 0.993 | 1.008 | 0.999 | 0.934 | 0.937 | 0.935 |
+| HotpotQA | 200K | 500 | Across families | 1.018 | 1.007 | 1.029 | 0.999 | 0.928 | 0.924 | 0.924 |
+| HotpotQA | 500K | 500 | Same family | 0.997 | 0.988 | 1.007 | 0.994 | 0.912 | 0.919 | 0.915 |
+| HotpotQA | 500K | 500 | Across families | 1.016 | 1.003 | 1.031 | 0.993 | 0.900 | 0.903 | 0.903 |
+| HotpotQA | 1M | 2000 | Same family | 0.995 | 0.990 | 1.000 | 0.989 | 0.882 | 0.888 | 0.888 |
+| HotpotQA | 1M | 2000 | Across families | 1.020 | 1.012 | 1.029 | 0.988 | 0.866 | 0.869 | 0.869 |
+| HotpotQA | 2M | 2000 | Same family | 0.994 | 0.988 | 1.000 | 0.982 | 0.857 | 0.866 | 0.866 |
+| HotpotQA | 2M | 2000 | Across families | 1.020 | 1.011 | 1.029 | 0.981 | 0.837 | 0.845 | 0.845 |
+| HotpotQA | 5.23M | 2000 | Same family | 0.985 | 0.977 | 0.993 | 0.967 | 0.808 | 0.825 | 0.825 |
+| HotpotQA | 5.23M | 2000 | Across families | 1.009 | 0.999 | 1.021 | 0.961 | 0.783 | 0.803 | 0.803 |
+| SciFact | 5.2K | 300 | Same family | 1.008 | 0.993 | 1.028 | 1.002 | 0.721 | 0.715 | 0.718 |
+| SciFact | 5.2K | 300 | Across families | 1.008 | 0.995 | 1.032 | 1.001 | 0.721 | 0.715 | 0.715 |
+| ArguAna | 8.7K | 1401 | Same family | 1.066 | 1.051 | 1.081 | 1.054 | 0.391 | 0.367 | 0.383 |
+| ArguAna | 8.7K | 1401 | Across families | 1.073 | 1.060 | 1.088 | 1.062 | 0.394 | 0.378 | 0.378 |
+| SciDocs | 25.7K | 1000 | Same family | 0.984 | 0.967 | 1.006 | 1.012 | 0.149 | 0.153 | 0.151 |
+| SciDocs | 25.7K | 1000 | Across families | 0.970 | 0.956 | 0.986 | 1.007 | 0.147 | 0.152 | 0.152 |
+| FiQA | 57.6K | 648 | Same family | 1.018 | 0.999 | 1.039 | 1.023 | 0.420 | 0.425 | 0.412 |
+| FiQA | 57.6K | 648 | Across families | 0.981 | 0.967 | 0.997 | 0.996 | 0.417 | 0.427 | 0.427 |
+| TREC-COVID | 171.3K | 50 | Same family | 1.001 | 0.968 | 1.049 | 0.994 | 0.831 | 0.838 | 0.831 |
+| TREC-COVID | 171.3K | 50 | Across families | 0.987 | 0.958 | 1.023 | 0.994 | 0.827 | 0.850 | 0.848 |
 <!-- /table:retention -->
 
 **Best range: up to 1M documents,** on MS MARCO, NQ and HotpotQA at each point estimate. At 1M, the interval's low end also clears the line for five of the six corpus and family combinations. NQ same family is the exception, with 0.985 and a low end of 0.979, against 0.98.
@@ -425,16 +472,6 @@ These five corpora didn't help choose BM25. They split:
 <!-- table:bm25 -->
 | Corpus | Documents | Queries | Models | Retention, BM25 off | Retention, BM25 on | Absolute, BM25 off | Absolute, BM25 on | Cells that gain | Cells |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| SciFact | 5,183 | 300 | Same family | 0.991 | 1.008 | 0.709 | 0.721 | 3 | 3 |
-| SciFact | 5,183 | 300 | Across families | 0.999 | 1.008 | 0.715 | 0.721 | 5 | 6 |
-| ArguAna | 8,674 | 1401 | Same family | 1.046 | 1.066 | 0.384 | 0.391 | 3 | 3 |
-| ArguAna | 8,674 | 1401 | Across families | 1.053 | 1.073 | 0.387 | 0.394 | 6 | 6 |
-| SciDocs | 25,657 | 1000 | Same family | 1.013 | 0.984 | 0.153 | 0.149 | 0 | 3 |
-| SciDocs | 25,657 | 1000 | Across families | 1.018 | 0.970 | 0.154 | 0.147 | 0 | 6 |
-| FiQA | 57,638 | 648 | Same family | 1.027 | 1.018 | 0.423 | 0.420 | 0 | 3 |
-| FiQA | 57,638 | 648 | Across families | 0.995 | 0.981 | 0.423 | 0.417 | 0 | 6 |
-| TREC-COVID | 171,332 | 50 | Same family | 1.015 | 1.001 | 0.843 | 0.831 | 0 | 3 |
-| TREC-COVID | 171,332 | 50 | Across families | 1.009 | 0.987 | 0.845 | 0.827 | 0 | 6 |
 <!-- /table:bm25 -->
 
 "Gain in cells" counts (pair, seed) cells, which share queries and models: they're dependent, not independent trials. SciDocs' relevance is citation links rather than words. MS MARCO and NQ prefixes below 50K pass both ways.
@@ -555,22 +592,22 @@ where setup is the wall-clock to re-encode the corpus and build an HNSW index, a
 <!-- table:breakeven -->
 | Query model | Documents | Device | Re-index setup | Bridge setup | Per query, if it also reranks | Break-even queries | Per query, if it doesn't | Break-even queries |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `all-MiniLM-L6-v2` | 1M | GPU | 13 min | 27 s | 1.1 ms | 682K | 0.15 s | 5.0K |
+| `all-MiniLM-L6-v2` | 1M | GPU | 13 min | 27 s | 1.1 ms | 684K | 0.15 s | 5.0K |
 | `all-MiniLM-L6-v2` | 1M | CPU | 1.6 h | 2 min | 10.2 ms | 565K | 10.48 s | 549 |
-| `all-MiniLM-L6-v2` | 8.84M | GPU | 2.1 h | 2 min | 1.1 ms | 6.6M | 0.18 s | 42K |
+| `all-MiniLM-L6-v2` | 8.84M | GPU | 2.1 h | 2 min | 1.1 ms | 6.7M | 0.18 s | 42K |
 | `all-MiniLM-L6-v2` | 8.84M | CPU | 14.6 h | 4 min | 9.7 ms | 5.4M | 10.43 s | 5.0K |
-| `bge-base-en-v1.5` | 1M | GPU | 16 min | 31 s | 1.1 ms | 827K | 0.15 s | 6.1K |
+| `bge-base-en-v1.5` | 1M | GPU | 16 min | 31 s | 1.1 ms | 829K | 0.15 s | 6.1K |
 | `bge-base-en-v1.5` | 1M | CPU | 10.2 h | 22 s, BM25 only: mount not timed here | 10.2 ms | 3.6M | 10.48 s | 3.5K |
 | `bge-base-en-v1.5` | 8.84M | GPU | 2.5 h | 2 min | 1.1 ms | 7.9M | 0.18 s | 50K |
 | `bge-base-en-v1.5` | 8.84M | CPU | 89.9 h | 2 min, BM25 only: mount not timed here | 9.7 ms | 33.2M | 10.43 s | 31K |
 | `bge-large-en-v1.5` | 1M | GPU | 23 min | 35 s | 1.1 ms | 1.2M | 0.15 s | 9.0K |
 | `bge-large-en-v1.5` | 1M | CPU | 35.2 h | 22 s, BM25 only: mount not timed here | 10.2 ms | 12.4M | 10.48 s | 12K |
-| `bge-large-en-v1.5` | 8.84M | GPU | 3.6 h | 2 min | 1.1 ms | 11.4M | 0.18 s | 72K |
-| `bge-large-en-v1.5` | 8.84M | CPU | 311.7 h | 2 min, BM25 only: mount not timed here | 9.7 ms | 115.3M | 10.43 s | 108K |
+| `bge-large-en-v1.5` | 8.84M | GPU | 3.6 h | 2 min | 1.1 ms | 11.5M | 0.18 s | 72K |
+| `bge-large-en-v1.5` | 8.84M | CPU | 311.7 h | 2 min, BM25 only: mount not timed here | 9.7 ms | 115.2M | 10.43 s | 108K |
 | `Qwen3-Embedding-0.6B` | 1M | GPU | 39 min | 59 s | 1.1 ms | 2.1M | 0.15 s | 15K |
 | `Qwen3-Embedding-0.6B` | 1M | CPU | 56.3 h | 22 s, BM25 only: mount not timed here | 10.2 ms | 19.9M | 10.48 s | 19K |
-| `Qwen3-Embedding-0.6B` | 8.84M | GPU | 6.0 h | 3 min | 1.1 ms | 19.2M | 0.18 s | 121K |
-| `Qwen3-Embedding-0.6B` | 8.84M | CPU | 497.8 h | 2 min, BM25 only: mount not timed here | 9.7 ms | 184.1M | 10.43 s | 172K |
+| `Qwen3-Embedding-0.6B` | 8.84M | GPU | 6.0 h | 3 min | 1.1 ms | 19.3M | 0.18 s | 121K |
+| `Qwen3-Embedding-0.6B` | 8.84M | CPU | 497.8 h | 2 min, BM25 only: mount not timed here | 9.7 ms | 184.0M | 10.43 s | 172K |
 <!-- /table:breakeven -->
 
 ### 9.6 The Stage-1 selector at 128 tokens
@@ -606,7 +643,7 @@ The system above, frozen, on data that chose nothing, by [rules fixed in advance
 | MS MARCO, unused queries, HNSW | 8.84M | 2000 | Across families, one direction | 0.961 | 0.943 | 0.980 | 0.90 | Confirmed |  | 0.420 |
 <!-- /table:fresh -->
 
-**How to read it.** No fresh result missed a line. Eight of the ten verdicts with an interval are confirmed and two are point passes: LoTTE same family reads 0.989 with a low end of 0.976, against 0.98, and Touché same family reads 1.021 with a low end of 0.976, on only 49 queries. Through the HNSW index, MS MARCO reads 0.973 and 0.961 against 0.95 and 0.90, with low ends of 0.958 and 0.943, so both are confirmed. That interval was computed after the point estimates were known, from per-query scores saved by a rerun of the same configuration. Four things qualify the result:
+**How to read it.** No fresh result missed a line. Ten of the twelve verdicts are confirmed: eight of the ten exact-search rows, and both HNSW rows. Two are point passes: LoTTE same family reads 0.989 with a low end of 0.976, against 0.98, and Touché same family reads 1.021 with a low end of 0.976, on only 49 queries. Through the HNSW index, MS MARCO reads 0.973 and 0.961 against 0.95 and 0.90, with low ends of 0.958 and 0.943. That interval was computed after the point estimates were known, from per-query scores saved by a rerun of the same configuration, whose records match the first run's exactly. Four things qualify the result:
 
 - **New queries are not a new corpus.** The MS MARCO and HotpotQA rows are new queries on corpora that shaped the system. LoTTE, FEVER and Touché are the new corpora.
 - **On some corpora BM25 does the work.** On FEVER, BM25 and the reranker with no bridge read 0.977, close to the bridge's 0.997 and 0.994. On HotpotQA they read 0.949 and 0.999. **On Touché, no bridge reads 1.096, above the bridge's 1.021 and 1.034: there the bridge lowers quality against BM25 alone**, on 49 queries. Where the map earns its place: LoTTE, 0.838 and 0.818 with no bridge against 0.989 and 0.964, and MS MARCO, 0.862 and 0.870 against 0.971 and 0.956.
@@ -632,7 +669,9 @@ All are public, fetched at runtime and never committed. `flores_plus` and `beleb
 | NQ | `mteb/nq` | 1M subsample of 2.68M; 50K subsample; prefixes | 3,452, with 2,000 or 500 of them at most sizes | Real questions |
 | HotpotQA | `mteb/hotpotqa` | 5,233,329; 1M; 50K | 2,000 of 7,405 | Multi-hop questions |
 | T2Retrieval | `mteb/T2Retrieval` | 50,000 subsample | 2,000 | Chinese |
-| XQuAD, MLQA | `google/xquad`, `facebook/mlqa` | 20,958; 10,894 and 4,989 | 1,190; 5,137 | Across languages. XQuAD's six other languages share its questions and contexts: they test language transfer, and aren't separate corpora |
+| XQuAD | `google/xquad` | 20,958 | 1,190 | Across languages. Its six other languages share its questions and contexts: they test language transfer, and aren't separate corpora |
+| MLQA, Chinese queries | `facebook/mlqa` | 10,894 | 5,137 | Across languages |
+| MLQA, English queries | `facebook/mlqa` | 4,989 | 5,137 | Into a Chinese index |
 | LoTTE technology | `mteb/LoTTE` | 638,509 | 2,000 forum questions | Fresh confirmation |
 | FEVER | `mteb/fever` | 1M subsample of 5.42M | 2,000 claims | Fresh confirmation |
 | Touché 2020 | `mteb/touche2020` | 382,545 | 49 | Fresh confirmation, long documents |
@@ -684,7 +723,7 @@ Each model gets its own prompts, as in `spacebridge_bench/models.py`. `{task}` i
 
 Native and re-index are reranked at the same pool, with and without BM25. `--no-bridge` adds BM25 alone. Each result records the configuration's identity, and a resume refuses another configuration's records. Each run writes a manifest with the commit, dependency lock hash, model and dataset revisions.
 
-**What each result can be traced to.** The `results/` release keeps retention records and per-query scores for the published cells. The `rerank_ms_first_query_min3` field in a record is a warm microbenchmark, the fastest of three repeats of one query. It isn't typical latency: `scripts/query_timing.py` measures that. The caches' limits are in [`data/README.md`](data/README.md#before-you-rely-on-a-cached-file): filenames don't cover model revisions, device or precision.
+**What each result can be traced to.** The `results/` release keeps retention records and per-query scores for the published cells. The `rerank_ms_first_query_min3` field in a record is a warm microbenchmark, the fastest of three repeats of one query. It isn't typical latency: `scripts/query_timing.py` measures that. Historical cache files don't record model revisions, device or precision, so their provenance is unknown ([`data/README.md`](data/README.md#before-you-rely-on-a-cached-file)). Files written from now on do: CPU runs use their own cache namespace, `<name>@cpu-fp32`, and every new file has a sidecar naming its model, revision and device class, which a later run checks before reusing it (`spacebridge_bench/cache_meta.py`). Each run's manifest counts the legacy and validated files it read. `results/datasets.csv` gives each run's exact positive and distractor counts and the digests of its corpus, judgments and queries.
 
 ### 10.4 Crash safety of the harness
 

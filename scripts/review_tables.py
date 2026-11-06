@@ -1,7 +1,8 @@
-"""Every result table in the README, the report and the design doc, from the records, between <!-- table:NAME --> and <!-- /table:NAME --> markers. Also writes results/.
+"""Every result table in the README, the report and the design doc, between <!-- table:NAME --> and <!-- /table:NAME --> markers, from
+results/ alone, so a public checkout can regenerate them. `scripts/review_export.py` writes results/ from the local records.
 
-    python scripts/review_tables.py        rewrites results/ and the tables in place
-    python scripts/review_tables.py --check  says which documents would change
+    python scripts/review_tables.py          fills the tables in place
+    python scripts/review_tables.py --check  exits 1, naming the documents, if any table differs from results/
 """
 import argparse
 import csv
@@ -13,16 +14,18 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent))
-from retention_ci import load_cells, summarize  # noqa: E402
-
-REVIEW = Path("outputs/review")
-PHASE1 = Path("outputs/phase1")
 RESULTS = Path("results")
 DOCS = ("README.md", "spacebridge_final_report.md", "spacebridge_design_and_benchmark.md")
 CORPUS = {"msmarco": "MS MARCO", "nq": "NQ", "hotpotqa": "HotpotQA", "scifact": "SciFact", "arguana": "ArguAna", "scidocs": "SciDocs", "fiqa": "FiQA", "trec-covid": "TREC-COVID",
           "lotte-technology": "LoTTE technology", "fever": "FEVER", "touche2020": "Touché 2020"}
 ORDER = ["MS MARCO", "NQ", "HotpotQA", "SciFact", "ArguAna", "SciDocs", "FiQA", "TREC-COVID"]
+FAMILIES = (("same", "Same family"), ("across", "Across families"))
+SAME_FAMILY = {("bge-large-en", "bge-base-en"), ("bge-base-en", "bge-large-en")}
+TIMED = [  # label, corpus, documents, search, documents' length
+    ("100k", "MS MARCO", 100_000, "Exact", "Short"), ("long171k", "TREC-COVID", 171_332, "Exact", "Long"), ("long382k", "Touché 2020", 382_545, "Exact", "Long"),
+    ("1m_hnsw", "MS MARCO", 1_000_000, "HNSW", "Short"), ("2m", "MS MARCO", 2_000_000, "Exact", "Short"), ("4m", "MS MARCO", 4_000_000, "Exact", "Short"),
+    ("5m", "HotpotQA", 5_233_329, "Exact", "Medium"), ("8m_exact", "MS MARCO", 8_841_823, "Exact", "Short"), ("8m_hnsw", "MS MARCO", 8_841_823, "HNSW", "Short"),
+]
 
 
 def corpus_name(dataset: str) -> str:
@@ -55,189 +58,200 @@ def pts(v) -> str:
     return "" if v is None else f"{100 * v:+.1f}"
 
 
-def read_jsonl(path: Path) -> list[dict]:
-    out = []
-    if path.exists():
-        for line in path.open():
+def read_csv(name: str) -> list[dict]:
+    def typed(v: str):
+        if v == "":
+            return None
+        try:
+            return int(v)
+        except ValueError:
             try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError:
-                pass
-    return out
+                return float(v)
+            except ValueError:
+                return v
+
+    with (RESULTS / name).open(newline="") as f:
+        return [{k: typed(v) for k, v in r.items()} for r in csv.DictReader(f)]
 
 
-def summarize_dirs(prefix: str, row: str = "9h") -> dict:
-    """{source name: {family: row}} for every run directory with this prefix."""
-    out = {}
-    for d in sorted((REVIEW / "per_query").glob(f"{prefix}*")):
-        cells = load_cells(d, row) if any(d.glob("*.npz")) else []
-        cells = [c for c in cells if c["scores"]]
-        if not cells:
-            continue
-        manifest = read_jsonl(REVIEW / f"{d.name}.jsonl.manifest.jsonl")
-        n_docs = manifest[0]["config"]["n_docs"]
-        rows = summarize(cells, n_docs)
-        for r in rows:
-            r.update(source=d.name, dataset=cells[0]["dataset"], corpus=corpus_name(cells[0]["dataset"]), row=row)
-        out[d.name] = {r["family"]: r for r in rows}
-    return out
+def read_jsonl(name: str) -> list[dict]:
+    return [json.loads(line) for line in (RESULTS / name).open() if line.strip()]
 
 
-def sort_key(by_family: dict):
-    r = next(iter(by_family.values()))
-    return (ORDER.index(r["corpus"]) if r["corpus"] in ORDER else 99, r["n_docs"])
+class Results:
+    """results/, indexed the ways the tables read it."""
+
+    def __init__(self):
+        self.retention = defaultdict(lambda: defaultdict(dict))  # source -> row -> family -> record
+        for r in read_csv("retention.csv"):
+            r["corpus"] = corpus_name(r["dataset"])
+            self.retention[r["source"]][r["row"]][r["family"]] = r
+        self.cells = defaultdict(lambda: defaultdict(dict))  # source -> cell -> (row, system) -> mean
+        for r in read_csv("cells.csv"):
+            self.cells[r["source"]][r["cell"]][r["row"], r["system"]] = r["ndcg5_mean"]
+        self.timing = defaultdict(lambda: {"stages": {}})  # (label, device) -> record
+        for r in read_csv("timing.csv"):
+            label, device = r["run"].removeprefix("timing_").rsplit("_", 1)
+            t = self.timing[label, device]
+            t.update(n=r["queries"], tokens_per_pair=r["tokens_per_pair"])
+            t["stages"][r["stage"]] = {"p50": r["p50_ms"], "p95": r["p95_ms"]}
+        self.setup = read_csv("setup.csv")
+
+    def published(self, row: str = "9h") -> dict:
+        """One entry per corpus and size: the 8.84M MS MARCO has two runs, one per family."""
+        merged = defaultdict(dict)
+        for source, rows in self.retention.items():
+            if source.startswith("recompute_") and row in rows:
+                by = rows[row]
+                r = next(iter(by.values()))
+                merged[r["corpus"], r["n_docs"]].update(by)
+        return dict(sorted(merged.items(), key=lambda kv: (ORDER.index(kv[0][0]) if kv[0][0] in ORDER else 99, kv[0][1])))
 
 
-def write_retention_csv(all_rows: list[dict]) -> None:
-    keys = ["source", "dataset", "corpus", "row", "family", "n_docs", "n_queries", "pairs", "seeds", "cells", "retention", "retention_low", "retention_high", "line", "verdict", "seed_sd",
-            "worst_pair", "worst_pair_name", "strict", "strict_low", "strict_high", "vs_reindex", "vs_reindex_low", "vs_reindex_high", "gap_reindex", "gap_reindex_low", "gap_reindex_high",
-            "no_bridge_retention", "no_bridge_low", "no_bridge_high", "bridge_gain", "bridge_gain_low", "bridge_gain_high", "abs_bridge", "abs_native", "abs_oracle", "abs_native_bm25", "abs_oracle_bm25", "abs_no_bridge"]
-    with (RESULTS / "retention.csv").open("w", newline="") as f:
-        w = csv.DictWriter(f, keys, extrasaction="ignore")
-        w.writeheader()
-        for r in all_rows:
-            w.writerow({k: round(v, 5) if isinstance(v, float) else v for k, v in r.items()})
+def retention_tables(res: Results, t: dict) -> None:
+    ordered = list(res.published().values())
 
+    def ret_cols(by):
+        cols = []
+        for fam, _ in FAMILIES:
+            r = by.get(fam)
+            cols += [f3(r["retention"]), f3(r["retention_low"]), f3(r["retention_high"])] if r else ["", "", ""]
+        return cols
 
-def export_per_query() -> None:
-    """Per-query nDCG@5 of each published cell, in units of 1/10,000. No text and no embeddings: only scores, in the order of each run's query list."""
-    out = RESULTS / "per_query"
-    out.mkdir(parents=True, exist_ok=True)
-    for d in sorted((REVIEW / "per_query").iterdir()):
-        arrays = {}
-        for path in sorted(d.glob("*.npz")):
-            with np.load(path) as z:
-                for name in z.files:
-                    row, system, metric = name.split("/")
-                    if metric == "ndcg@5" and row in ("9", "9h"):
-                        arrays[f"{path.stem}/{row}/{system}"] = np.round(z[name] * 10_000).astype(np.uint16)
-        if arrays:
-            np.savez_compressed(out / f"{d.name}.npz", **arrays)
-
-
-def export_manifests() -> None:
-    with (RESULTS / "manifests.jsonl").open("w") as f:
-        for path in sorted(REVIEW.glob("*.jsonl.manifest.jsonl")):
-            first = read_jsonl(path)
-            if first:
-                f.write(json.dumps({"run": path.name.split(".jsonl")[0], **first[0]}) + "\n")
-
-
-TIMED = [  # label, corpus, documents, search, kind, record file stem or None
-    ("100k", "MS MARCO", 100_000, "Exact", "Short"), ("long171k", "TREC-COVID", 171_332, "Exact", "Long"), ("long382k", "Touché 2020", 382_545, "Exact", "Long"),
-    ("1m_hnsw", "MS MARCO", 1_000_000, "HNSW", "Short"), ("2m", "MS MARCO", 2_000_000, "Exact", "Short"), ("4m", "MS MARCO", 4_000_000, "Exact", "Short"),
-    ("5m", "HotpotQA", 5_233_329, "Exact", "Medium"), ("8m_exact", "MS MARCO", 8_841_823, "Exact", "Short"), ("8m_hnsw", "MS MARCO", 8_841_823, "HNSW", "Short"),
-]
-
-
-def timing_records() -> dict:
-    out = {}
-    for label, *_ in TIMED:
-        for device in ("gpu", "cpu"):
-            recs = read_jsonl(REVIEW / f"timing_{label}_{device}.jsonl")
-            if recs:
-                out[label, device] = recs[-1]
-    return out
-
-
-def speed_rows(short_only: bool = False) -> list[list]:
-    t = timing_records()
+    head = ["Corpus", "Documents", "Queries", "Same family", "Low", "High", "Across families", "Low", "High"]
+    sizes = (100_000, 500_000, 1_000_000, 2_000_000, 4_000_000, 5_233_329, 8_841_823)
+    t["retention_short"] = table(head, [[r["corpus"], docs_label(r["n_docs"]), r["n_queries"], *ret_cols(by)] for by in ordered for r in [next(iter(by.values()))] if r["n_docs"] in sizes])
+    # One row per family, so each row's native and re-index are that family's comparators.
     rows = []
-    fmt = {"cpu": lambda v: f"{v / 1e3:.1f}", "gpu": lambda v: f"{v / 1e3:.2f}"}
-    for label, corpus, n, search, kind in TIMED:
-        if short_only and label in ("2m", "4m"):
+    for by in ordered:
+        for fam, label in FAMILIES:
+            r = by.get(fam)
+            if r:
+                rows.append([r["corpus"], docs_label(r["n_docs"]), r["n_queries"], label, f3(r["retention"]), f3(r["retention_low"]), f3(r["retention_high"]), f3(r["strict"]),
+                             f3(r["abs_bridge"]), f3(r["abs_native"]), f3(r["abs_oracle"])])
+    t["retention"] = table(["Corpus", "Documents", "Queries", "Models", "Retention", "Low", "High", "Strict retention", "Bridge, absolute", "Native, absolute", "Re-index, absolute"], rows)
+
+    def by_family(sizes, cols, need):
+        out = []
+        for by in ordered:
+            for fam, label in FAMILIES:
+                r = by.get(fam)
+                if r and r["n_docs"] in sizes and r.get(need) is not None:
+                    out.append([r["corpus"], docs_label(r["n_docs"]), label, *cols(r)])
+        return out
+
+    reindex = lambda r: [f3(r["abs_bridge"]), f3(r["abs_oracle_bm25"]), pts(r["gap_reindex"]), pts(r["gap_reindex_low"]), pts(r["gap_reindex_high"]), f3(r["vs_reindex"]), f3(r["vs_reindex_low"]), f3(r["vs_reindex_high"])]
+    rh = ["Corpus", "Documents", "Models", "Bridge", "Re-index with BM25", "Difference, absolute points", "Low", "High", "Direct retention", "Low", "High"]
+    t["reindex"] = table(rh, by_family(set(sizes), reindex, "gap_reindex"))
+    t["reindex_short"] = table(rh, by_family({1_000_000, 5_233_329, 8_841_823}, reindex, "gap_reindex"))
+    nobridge = lambda r: [f3(r["no_bridge_retention"]), f3(r["no_bridge_low"]), f3(r["no_bridge_high"]), f3(r["retention"]), pts(r["bridge_gain"]), pts(r["bridge_gain_low"]), pts(r["bridge_gain_high"])]
+    nh = ["Corpus", "Documents", "Models", "No bridge, retention", "Low", "High", "Bridge, retention", "Bridge adds, absolute points", "Low", "High"]
+    t["nobridge"] = table(nh, by_family({1_000_000, 2_000_000, 4_000_000, 5_233_329, 8_841_823}, nobridge, "no_bridge_retention"))
+    t["nobridge_short"] = table(nh, by_family({1_000_000, 5_233_329, 8_841_823}, nobridge, "no_bridge_retention"))
+
+
+def bm25_table(res: Results, t: dict) -> None:
+    rows = []
+    for source, by_row in sorted(res.retention.items(), key=lambda kv: (kv[0])):
+        if not source.startswith("recompute_") or "9" not in by_row:
             continue
-        cols = [docs_label(n), corpus, kind, search]
-        tokens = None
-        for device in ("cpu", "gpu"):
-            r = t.get((label, device))
-            if r is None:
-                cols += ["not run", "not run", ""]
-            else:
-                total = r["stages_ms"]["total"]
-                cols += [fmt[device](total["p50"]), fmt[device](total["p95"]), r["n"]]
-                tokens = r.get("tokens_per_pair", tokens)
-        if not short_only:
-            cols.append(round(tokens) if tokens else "")
-            cols.append("Measured")
-        rows.append(cols)
-    return rows
-
-
-def estimated_rows(t: dict) -> list[list]:
-    """Sizes with no run of their own: another run's total, with its search and BM25 medians replaced by those of a run nearer this size. A model of the tail, not an observation."""
-    out = []
-    base = {("cpu"): t.get(("long171k", "cpu")), ("gpu"): t.get(("long171k", "gpu"))}
-    for label, n, search in (("1m_hnsw", 1_000_000, "HNSW"), ("8m_hnsw", 8_841_823, "HNSW")):
-        cols = [docs_label(n), "TREC-COVID's rerank time, this size's search", "Long", search]
-        for device in ("cpu", "gpu"):
-            long_, here = base[device], t.get((label, device))
-            if long_ is None or here is None:
-                cols += ["", "", ""]
+        on_by, off_by = by_row["9h"], by_row["9"]
+        r0 = next(iter(on_by.values()))
+        if r0["corpus"] not in ("SciFact", "ArguAna", "SciDocs", "FiQA", "TREC-COVID"):
+            continue
+        cells = res.cells[source]
+        for fam, label in FAMILIES:
+            on, off = on_by.get(fam), off_by.get(fam)
+            if not on or not off:
                 continue
-            add = here["stages_ms"]["search"]["p50"] + here["stages_ms"]["lexical"]["p50"] - long_["stages_ms"]["search"]["p50"] - long_["stages_ms"]["lexical"]["p50"]
-            fm = (lambda v: f"{v / 1e3:.1f}") if device == "cpu" else (lambda v: f"{v / 1e3:.2f}")
-            cols += [fm(long_["stages_ms"]["total"]["p50"] + add), fm(long_["stages_ms"]["total"]["p95"] + add), ""]
-        cols += ["", "**Estimated**"]
-        out.append(cols)
-    return out
+            keys = [c for c in cells if (tuple(c.split("__")[1:3]) in SAME_FAMILY) == (fam == "same")]
+            gain = sum(cells[c][("9h", "bridge")] > cells[c][("9", "bridge")] for c in keys)
+            rows.append((ORDER.index(on["corpus"]), [on["corpus"], f"{on['n_docs']:,}", on["n_queries"], label, f3(off["retention"]), f3(on["retention"]), f3(off["abs_bridge"]), f3(on["abs_bridge"]), gain, len(keys)]))
+    rows.sort(key=lambda x: x[0])
+    t["bm25"] = table(["Corpus", "Documents", "Queries", "Models", "Retention, BM25 off", "Retention, BM25 on", "Absolute, BM25 off", "Absolute, BM25 on", "Cells that gain", "Cells"], [r for _, r in rows])
 
 
-def write_timing_csv() -> None:
-    with (RESULTS / "timing.csv").open("w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["run", "device", "dataset", "documents", "backend", "pool", "queries", "stage", "p50_ms", "p95_ms", "tokens_per_pair", "peak_rss_gb", "peak_vram_gb", "load_s"])
-        for path in sorted(REVIEW.glob("timing_*.jsonl")):
-            for r in read_jsonl(path):
-                for stage, v in r["stages_ms"].items():
-                    w.writerow([path.stem, r["device"] if r.get("search_device") in (None, r["device"]) else f"{r['device']}, search on {r['search_device']}", r["dataset"], r["N"], "HNSW" if r["backend"] != "exact" else "exact", r["pool"], r["n"], stage, round(v["p50"], 2), round(v["p95"], 2),
-                                round(r.get("tokens_per_pair", 0), 1), round(r.get("peak_rss_gb", 0), 2), round(r.get("peak_vram_gb", 0) or 0, 2), round(r.get("load_s", 0), 1)])
+def speed_tables(res: Results, t: dict) -> None:
+    fmt = {"cpu": lambda v: f"{v / 1e3:.1f}", "gpu": lambda v: f"{v / 1e3:.2f}"}
+
+    def measured(short_only: bool) -> list[list]:
+        rows = []
+        for label, corpus, n, search, kind in TIMED:
+            if short_only and label in ("2m", "4m"):
+                continue
+            cols, tokens = [docs_label(n), corpus, kind, search], None
+            for device in ("cpu", "gpu"):
+                r = res.timing.get((label, device))
+                if r is None:
+                    cols += ["not run", "not run", ""]
+                else:
+                    total = r["stages"]["total"]
+                    cols += [fmt[device](total["p50"]), fmt[device](total["p95"]), r["n"]]
+                    tokens = r["tokens_per_pair"] or tokens
+            if not short_only:
+                cols += [round(tokens) if tokens else "", "Measured"]
+            rows.append(cols)
+        return rows
+
+    def estimated() -> list[list]:
+        """Sizes with no run of their own: another run's total, with its search and BM25 medians replaced by those of a run nearer this size. A model of the tail, not an observation."""
+        out = []
+        for label, n, search in (("1m_hnsw", 1_000_000, "HNSW"), ("8m_hnsw", 8_841_823, "HNSW")):
+            cols = [docs_label(n), "TREC-COVID's rerank time, this size's search", "Long", search]
+            for device in ("cpu", "gpu"):
+                long_, here = res.timing.get(("long171k", device)), res.timing.get((label, device))
+                if long_ is None or here is None:
+                    cols += ["", "", ""]
+                    continue
+                s, b = here["stages"], long_["stages"]
+                add = s["search"]["p50"] + s["lexical"]["p50"] - b["search"]["p50"] - b["lexical"]["p50"]
+                cols += [fmt[device](b["total"]["p50"] + add), fmt[device](b["total"]["p95"] + add), ""]
+            out.append(cols + ["", "**Estimated**"])
+        return out
+
+    sh = ["Documents", "Corpus", "Documents' length", "Search", "CPU p50, s", "CPU p95, s", "CPU queries", "GPU p50, s", "GPU p95, s", "GPU queries"]
+    t["speed"] = table([*sh, "Tokens per pair", "Status"], measured(False) + estimated())
+    t["speed_short"] = table(sh, measured(True))
 
 
-def breakeven_rows() -> list[list]:
+def breakeven_table(res: Results, t: dict) -> None:
     """(re-index setup - bridge setup) / (bridge query cost - re-indexed query cost): a scenario estimate on this machine, one job at a time."""
-    t = timing_records()
-    rate, mount = {}, {}
-    for r in read_jsonl(PHASE1 / "m1_timing/mount.jsonl"):
-        if r.get("mode") == "rate":
-            rate[r["model"], r["device"]] = r
-        elif r.get("K") == 8192:
-            mount[r["model"], r["device"]] = r["mount_s"]
-    hnsw_build_s = {1_000_000: None, 8_841_823: 1.8 * 3600}
-    for r in read_jsonl(PHASE1 / "w5_ann/ms1m.jsonl"):
-        if r.get("key") == "build":
-            hnsw_build_s[1_000_000] = r.get("build_s_this_run")
-    lexical_s = {1_000_000: 22.0, 8_841_823: 128.0}
-    runs = {1_000_000: "1m_hnsw", 8_841_823: "8m_hnsw"}
+    rate = {(r["model"], r["device"]): r for r in res.setup if r["kind"] == "encode_rate"}
+    mount = {(r["model"], r["device"]): r["seconds"] for r in res.setup if r["kind"] == "mount" and r["K"] == 8192}
+    hnsw_build = {r["documents"]: r["seconds"] for r in res.setup if r["kind"] == "hnsw_build"}
+    bm25_build = {r["documents"]: r["seconds"] for r in res.setup if r["kind"] == "bm25_build"}
     out = []
+    short = lambda n: f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.0f}K" if n >= 1e4 else f"{n / 1e3:.1f}K" if n >= 1e3 else f"{n:.0f}"
+    hours = lambda x: f"{x / 3600:.1f} h" if x >= 3600 else f"{x / 60:.0f} min"
     for m, name in (("minilm", "all-MiniLM-L6-v2"), ("bge-base-en", "bge-base-en-v1.5"), ("bge-large-en", "bge-large-en-v1.5"), ("qwen3-0.6b", "Qwen3-Embedding-0.6B")):
-        for size, run in runs.items():
+        for size, run in ((1_000_000, "1m_hnsw"), (8_841_823, "8m_hnsw")):
             for device, key in (("cuda", "gpu"), ("cpu", "cpu")):
-                rec = t.get((run, key))
+                rec = res.timing.get((run, key))
                 if rec is None or (m, device) not in rate:
                     continue
-                encode = size * rate[m, device]["tokens_per_doc"] / rate[m, device]["tokens_per_s"]
-                reindex = encode + (hnsw_build_s[size] or 0)
+                reindex = size * rate[m, device]["tokens_per_doc"] / rate[m, device]["tokens_per_s"] + (hnsw_build.get(size) or 0)
                 timed_mount = mount.get((m, device))
-                bridge = (timed_mount or 0) + lexical_s[size]  # an untimed mount counts as 0: minutes, against hours of re-encoding
-                s = rec["stages_ms"]
+                bridge = (timed_mount or 0) + bm25_build[size]  # an untimed mount counts as 0: minutes, against hours of re-encoding
+                s = rec["stages"]
                 both = s["project"]["p50"] / 1e3  # both have BM25 and a reranker: only the projection differs
                 none = (s["total"]["p50"] - s["encode"]["p50"] - s["search"]["p50"]) / 1e3  # the other system does neither
                 gain = reindex - bridge
-                short = lambda n: f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.0f}K" if n >= 1e4 else f"{n / 1e3:.1f}K" if n >= 1e3 else f"{n:.0f}"
-                hours = lambda x: f"{x / 3600:.1f} h" if x >= 3600 else f"{x / 60:.0f} min"
-                out.append([f"`{name}`", docs_label(size), key.upper(), hours(reindex), (hours(bridge) if bridge >= 60 else f"{bridge:.0f} s") + ("" if timed_mount else ", BM25 only: mount not timed here"), f"{1e3 * both:.1f} ms", short(gain / both), f"{none:.2f} s", short(gain / none)])
-    return out
+                out.append([f"`{name}`", docs_label(size), key.upper(), hours(reindex), (hours(bridge) if bridge >= 60 else f"{bridge:.0f} s") + ("" if timed_mount else ", BM25 only: mount not timed here"),
+                            f"{1e3 * both:.1f} ms", short(gain / both), f"{none:.2f} s", short(gain / none)])
+    t["breakeven"] = table(["Query model", "Documents", "Device", "Re-index setup", "Bridge setup", "Per query, if it also reranks", "Break-even queries", "Per query, if it doesn't", "Break-even queries"], out)
 
 
-def stage1_rows() -> list[list]:
+def study_tables(t: dict) -> None:
+    sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
     from spacebridge_bench.metrics import spearman
 
     rows = []
+    records = read_jsonl("stage1.jsonl")
     for name, label in (("fiqa", "FiQA"), ("scidocs", "SciDocs"), ("nq", "NQ")):
         fits = defaultdict(dict)
-        for r in read_jsonl(REVIEW / f"stage1_{name}.jsonl"):
-            fits[r["src"], r["tgt"], r["K"], r["seed"]][r["op"], r["lambda_rel"]] = r
+        for r in records:
+            if r["dataset"] == name:
+                fits[r["src"], r["tgt"], r["K"], r["seed"]][r["op"], r["lambda_rel"]] = r
         full = [list(v.values()) for v in fits.values() if len(v) == 6]
         if not full:
             continue
@@ -246,145 +260,46 @@ def stage1_rows() -> list[list]:
         best = [max(x["auto"]["rho_ceil"]["recall@30"] for x in c) for c in full]
         corr = [c for c in corr if c == c]
         rows.append([label, len(full), f"{np.mean(corr):.2f}", f"{min(corr):.2f}", f"{max(corr):.2f}", f"{np.mean(pick):.3f}", f"{np.mean(best):.3f}", f"{100 * (np.mean(best) - np.mean(pick)):.2f}"])
-    return rows
+    t["stage1"] = table(["Corpus", "Fits", "Mean Spearman, agreement against real retention", "Lowest", "Highest", "Agreement's pick, after Stage 2", "Best candidate, after Stage 2", "Retention points a perfect selector would gain"], rows)
 
-
-def fresh_rows(fresh: dict, hnsw: dict) -> list[list]:
+    prec = [r for r in read_jsonl("precision_cpu.jsonl") if r["pool"] == 60]
+    names = {"msmarco-1m": "MS MARCO 1M", "nq-1m": "NQ 1M", "fiqa": "FiQA", "trec-covid": "TREC-COVID"}
     rows = []
-    order = ["fresh_msmarco", "fresh_hotpotqa", "fresh_lotte", "fresh_fever", "fresh_touche"]
+    for ds, label in names.items():
+        by = {r["variant"]: r for r in prec if r["dataset"] == ds}
+        if {"fp32", "bf16", "cpu"} <= set(by):
+            rows.append([label, by["cpu"]["n_queries"], f"{by['cpu']['pool_tokens']:.0f}", f"{by['fp32']['ndcg@5']:.4f}", f"{by['cpu']['ndcg@5']:.4f}", f"{100 * by['cpu']['difference_from_fp32']:+.2f}",
+                         f"{100 * by['cpu']['ci_difference'][0]:+.2f}", f"{100 * by['cpu']['ci_difference'][1]:+.2f}", f"{by['cpu']['top5_jaccard_with_fp32']:.3f}", f"{by['bf16']['ndcg@5']:.4f}", f"{100 * by['bf16']['difference_from_fp32']:+.2f}"])
+    t["precision"] = table(["Corpus", "Queries", "Tokens per pair", "GPU fp32", "CPU fp32", "CPU minus GPU, absolute points", "Low", "High", "Top-5 overlap, CPU and GPU", "GPU bf16", "bf16 minus GPU fp32, absolute points"], rows)
+
+
+def fresh_table(res: Results, t: dict) -> None:
     names = {"fresh_msmarco": "MS MARCO, unused queries", "fresh_hotpotqa": "HotpotQA, unused queries", "fresh_lotte": "LoTTE technology", "fresh_fever": "FEVER", "fresh_touche": "Touché 2020"}
-    for name in order:
-        by = fresh.get(name)
-        if by is None:
-            rows.append([names[name], "", "", "not run", "", "", "", "", "Not run", "", ""])
-            continue
-        for fam, label in (("same", "Same family"), ("across", "Across families")):
-            r = by[fam]
-            rows.append([names[name], docs_label(r["n_docs"]), r["n_queries"], label, f3(r["retention"]), f3(r["retention_low"]), f3(r["retention_high"]), f"{r['line']:.2f}", r["verdict"].capitalize(), f3(r.get("no_bridge_retention")), f3(r.get("abs_bridge"))])
-    rows += hnsw
-    return rows
-
-
-def hnsw_fresh() -> list[list]:
-    res = {r["key"]: r for r in read_jsonl(REVIEW / "fresh_msmarco_hnsw.jsonl")}
     rows = []
-    for tgt, label, line in (("bge-base-en", "Same family, one direction", 0.95), ("qwen3-0.6b", "Across families, one direction", 0.90)):
-        lex = [res.get(f"lexical|{tgt}|s{s}|ef500|pool60") for s in (0, 1, 2)]
-        native, oracle = res.get("hnsw|native|ef500|pool60"), res.get(f"oracle|{tgt}|pool60")
-        if None in lex or native is None or oracle is None:
-            rows.append(["MS MARCO, unused queries, HNSW", "8.84M", "", label, "", "", "", f"{line:.2f}", "Not run", "", ""])
+    for source, name in names.items():
+        by = res.retention.get(source, {}).get("9h")
+        if not by:
+            rows.append([name, "", "", "not run", "", "", "", "", "Not run", "", ""])
             continue
-        v = float(np.mean([r["ndcg5_approx"] for r in lex])) / min(native["ndcg5_exact"], oracle["ndcg5_exact"])
-        low = high = None
-        pq_path = REVIEW / "followup/hnsw_per_query.npz"
-        if pq_path.exists():  # the same joint bootstrap as retention_ci, over queries, retaking the weaker baseline each time
-            with np.load(pq_path) as z:
-                seeds = [z[f"lexical|{tgt}|s{s}|ef500|pool60/approx"].astype(np.float64) for s in (0, 1, 2)]
-                nat, ora = z["hnsw|native|ef500|pool60/exact"].astype(np.float64), z[f"oracle|{tgt}|pool60/exact"].astype(np.float64)
-            n = len(nat)
-            w = np.random.default_rng(0).multinomial(n, np.full(n, 1.0 / n), size=2_000) / n
-            reps = np.mean([w @ x for x in seeds], axis=0) / np.minimum(w @ nat, w @ ora)
-            low, high = float(np.percentile(reps, 2.5)), float(np.percentile(reps, 97.5))
-            point = float(np.mean([x.mean() for x in seeds])) / min(nat.mean(), ora.mean())
-            assert abs(point - v) < 1e-6, (point, v)  # the per-query file and the records agree
-        verdict = "Miss" if v < line else "Confirmed" if low is not None and low >= line else "Point pass"
-        rows.append(["MS MARCO, unused queries, HNSW", "8.84M", 2000, label, f3(v), f3(low), f3(high), f"{line:.2f}", verdict, "", f3(float(np.mean([r["ndcg5_approx"] for r in lex])))])
-    return rows
+        for fam, label in FAMILIES:
+            r = by[fam]
+            rows.append([name, docs_label(r["n_docs"]), r["n_queries"], label, f3(r["retention"]), f3(r["retention_low"]), f3(r["retention_high"]), f"{r['line']:.2f}", r["verdict"].capitalize(), f3(r["no_bridge_retention"]), f3(r["abs_bridge"])])
+    hnsw = res.retention.get("fresh_msmarco_hnsw", {}).get("9h", {})
+    for fam, label in FAMILIES:
+        r = hnsw.get(fam)
+        if r:
+            rows.append(["MS MARCO, unused queries, HNSW", docs_label(r["n_docs"]), r["n_queries"], f"{label}, one direction", f3(r["retention"]), f3(r["retention_low"]), f3(r["retention_high"]), f"{r['line']:.2f}", r["verdict"].capitalize(), "", f3(r["abs_bridge"])])
+    t["fresh"] = table(["Data", "Documents", "Queries", "Models", "Retention", "Low", "High", "Line", "Verdict", "No bridge, retention", "Bridge, absolute `nDCG@5`"], rows)
 
 
 def build_tables() -> dict[str, str]:
-    published = summarize_dirs("recompute_")
-    plain = summarize_dirs("recompute_", "9")
-    fresh = summarize_dirs("fresh_")
-    fresh = {k: v for k, v in fresh.items() if not k.endswith("hnsw")}
-    all_rows = [r for d in (published, fresh) for by in d.values() for r in by.values()]
-    RESULTS.mkdir(exist_ok=True)
-    write_retention_csv(all_rows)
-    export_per_query()
-    export_manifests()
-    write_timing_csv()
-
-    # One row per size: the 8.84M MS MARCO has two runs, one per family.
-    merged = defaultdict(dict)
-    for name, by in published.items():
-        r = next(iter(by.values()))
-        merged[r["corpus"], r["n_docs"]].update(by)
-    ordered = sorted(merged.values(), key=sort_key)
-    t = {}
-
-    def ret_cols(by):
-        cols = []
-        for fam in ("same", "across"):
-            r = by.get(fam)
-            cols += [f3(r["retention"]), f3(r["retention_low"]), f3(r["retention_high"])] if r else ["", "", ""]
-        return cols
-
-    head = ["Corpus", "Documents", "Queries", "Same family", "Low", "High", "Across families", "Low", "High"]
-    t["retention_short"] = table(head, [[r["corpus"], docs_label(r["n_docs"]), r["n_queries"], *ret_cols(by)] for by in ordered for r in [next(iter(by.values()))] if r["n_docs"] in (100_000, 500_000, 1_000_000, 2_000_000, 4_000_000, 5_233_329, 8_841_823)])
-    t["retention"] = table(
-        [*head, "Same family, strict", "Across families, strict", "Same family, absolute", "Across families, absolute", "Native, absolute", "Re-index, absolute"],
-        [[r["corpus"], docs_label(r["n_docs"]), r["n_queries"], *ret_cols(by), f3(by.get("same", {}).get("strict")), f3(by.get("across", {}).get("strict")), f3(by.get("same", {}).get("abs_bridge")), f3(by.get("across", {}).get("abs_bridge")), f3(r.get("abs_native")), f3(r.get("abs_oracle"))]
-         for by in ordered for r in [by.get("across", next(iter(by.values())))]],
-    )
-
-    def reindex(sizes):
-        rows = []
-        for by in ordered:
-            for fam, label in (("same", "Same family"), ("across", "Across families")):
-                r = by.get(fam)
-                if r and r["n_docs"] in sizes and "gap_reindex" in r:
-                    rows.append([r["corpus"], docs_label(r["n_docs"]), label, f3(r["abs_bridge"]), f3(r["abs_oracle_bm25"]), pts(r["gap_reindex"]), pts(r["gap_reindex_low"]), pts(r["gap_reindex_high"]), f3(r["vs_reindex"]), f3(r["vs_reindex_low"]), f3(r["vs_reindex_high"])])
-        return rows
-
-    rh = ["Corpus", "Documents", "Models", "Bridge", "Re-index with BM25", "Difference, absolute points", "Low", "High", "Direct retention", "Low", "High"]
-    t["reindex"] = table(rh, reindex({100_000, 500_000, 1_000_000, 2_000_000, 4_000_000, 5_233_329, 8_841_823}))
-    t["reindex_short"] = table(rh, reindex({1_000_000, 5_233_329, 8_841_823}))
-
-    def nobridge(sizes):
-        rows = []
-        for by in ordered:
-            for fam, label in (("same", "Same family"), ("across", "Across families")):
-                r = by.get(fam)
-                if r and r["n_docs"] in sizes and "no_bridge_retention" in r:
-                    rows.append([r["corpus"], docs_label(r["n_docs"]), label, f3(r["no_bridge_retention"]), f3(r["no_bridge_low"]), f3(r["no_bridge_high"]), f3(r["retention"]), pts(r["bridge_gain"]), pts(r["bridge_gain_low"]), pts(r["bridge_gain_high"])])
-        return rows
-
-    nh = ["Corpus", "Documents", "Models", "No bridge, retention", "Low", "High", "Bridge, retention", "Bridge adds, absolute points", "Low", "High"]
-    t["nobridge"] = table(nh, nobridge({1_000_000, 2_000_000, 4_000_000, 5_233_329, 8_841_823}))
-    t["nobridge_short"] = table(nh, nobridge({1_000_000, 5_233_329, 8_841_823}))
-
-    rows = []
-    for name, by in sorted(published.items(), key=lambda kv: sort_key(kv[1])):
-        r0 = next(iter(by.values()))
-        if r0["corpus"] not in ("SciFact", "ArguAna", "SciDocs", "FiQA", "TREC-COVID"):
-            continue
-        for fam, label in (("same", "Same family"), ("across", "Across families")):
-            on, off = by.get(fam), plain.get(name, {}).get(fam)
-            if not on or not off:
-                continue
-            cells_on = {(c["src"], c["tgt"], c["seed"]): float(c["scores"]["bridge"].mean()) for c in load_cells(REVIEW / "per_query" / name, "9h") if c["src"] is not None}
-            cells_off = {(c["src"], c["tgt"], c["seed"]): float(c["scores"]["bridge"].mean()) for c in load_cells(REVIEW / "per_query" / name, "9")}
-            same_fam = [k for k in cells_on if (k[0], k[1]) in (("bge-large-en", "bge-base-en"), ("bge-base-en", "bge-large-en"))]
-            keys = same_fam if fam == "same" else [k for k in cells_on if k not in same_fam]
-            rows.append([on["corpus"], f"{on['n_docs']:,}", on["n_queries"], label, f3(off["retention"]), f3(on["retention"]), f3(off["abs_bridge"]), f3(on["abs_bridge"]), sum(cells_on[k] > cells_off[k] for k in keys), len(keys)])
-    t["bm25"] = table(["Corpus", "Documents", "Queries", "Models", "Retention, BM25 off", "Retention, BM25 on", "Absolute, BM25 off", "Absolute, BM25 on", "Cells that gain", "Cells"], rows)
-
-    tm = timing_records()
-    sh = ["Documents", "Corpus", "Documents' length", "Search", "CPU p50, s", "CPU p95, s", "CPU queries", "GPU p50, s", "GPU p95, s", "GPU queries"]
-    t["speed"] = table([*sh, "Tokens per pair", "Status"], speed_rows() + estimated_rows(tm))
-    t["speed_short"] = table(sh, speed_rows(short_only=True))
-    t["breakeven"] = table(["Query model", "Documents", "Device", "Re-index setup", "Bridge setup", "Per query, if it also reranks", "Break-even queries", "Per query, if it doesn't", "Break-even queries"], breakeven_rows())
-    t["stage1"] = table(["Corpus", "Fits", "Mean Spearman, agreement against real retention", "Lowest", "Highest", "Agreement's pick, after Stage 2", "Best candidate, after Stage 2", "Retention points a perfect selector would gain"], stage1_rows())
-    prec = [r for r in read_jsonl(REVIEW / "followup/precision_cpu.jsonl") if r["pool"] == 60]
-    names = {"msmarco-1m": "MS MARCO 1M", "nq-1m": "NQ 1M", "fiqa": "FiQA", "trec-covid": "TREC-COVID"}
-    rows = []
-    for ds in names:
-        by = {r["variant"]: r for r in prec if r["dataset"] == ds}
-        if {"fp32", "bf16", "cpu"} <= set(by):
-            rows.append([names[ds], by["cpu"]["n_queries"], f"{by['cpu']['pool_tokens']:.0f}", f"{by['fp32']['ndcg@5']:.4f}", f"{by['cpu']['ndcg@5']:.4f}", f"{100 * by['cpu']['difference_from_fp32']:+.2f}",
-                         f"{100 * by['cpu']['ci_difference'][0]:+.2f}", f"{100 * by['cpu']['ci_difference'][1]:+.2f}", f"{by['cpu']['top5_jaccard_with_fp32']:.3f}", f"{by['bf16']['ndcg@5']:.4f}", f"{100 * by['bf16']['difference_from_fp32']:+.2f}"])
-    t["precision"] = table(["Corpus", "Queries", "Tokens per pair", "GPU fp32", "CPU fp32", "CPU minus GPU, absolute points", "Low", "High", "Top-5 overlap, CPU and GPU", "GPU bf16", "bf16 minus GPU fp32, absolute points"], rows)
-    t["fresh"] = table(["Data", "Documents", "Queries", "Models", "Retention", "Low", "High", "Line", "Verdict", "No bridge, retention", "Bridge, absolute `nDCG@5`"], fresh_rows(fresh, hnsw_fresh()))
+    res, t = Results(), {}
+    retention_tables(res, t)
+    bm25_table(res, t)
+    speed_tables(res, t)
+    breakeven_table(res, t)
+    study_tables(t)
+    fresh_table(res, t)
     return t
 
 
@@ -397,17 +312,24 @@ def fill(text: str, tables: dict[str, str]) -> str:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--check", action="store_true")
     a = p.parse_args()
     tables = build_tables()
+    stale = []
     for name in DOCS:
         path = Path(name)
         new = fill(path.read_text(), tables)
         if new != path.read_text():
-            print(("would change " if a.check else "updated ") + name)
+            stale.append(name)
             if not a.check:
                 path.write_text(new)
+    for name in stale:
+        print(("differs from results/: " if a.check else "updated ") + name)
+    if a.check and stale:
+        sys.exit(1)
+    if a.check:
+        print(f"every table in {', '.join(DOCS)} matches results/")
 
 
 if __name__ == "__main__":

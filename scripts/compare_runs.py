@@ -15,6 +15,8 @@ from pathlib import Path
 
 import numpy as np
 
+from spacebridge_bench.provenance import unique_records
+
 from spacebridge_bench.run import TIERS
 
 
@@ -29,6 +31,7 @@ def main() -> None:
     p.add_argument("--ignore-dataset", action="store_true",
                    help="pair configurations across datasets (e.g. one corpus subsampled at two sizes)")
     p.add_argument("--allow-duplicates", action="store_true", help="when a file repeats a cell, keep the last record instead of refusing")
+    p.add_argument("--allow-unmatched", action="store_true", help="compare on the cells in both files when some are in only one")
     args = p.parse_args()
     tier = {}
     for t, prs in TIERS.items():  # first tier wins: Tier 5a reuses Tier 3 pairs
@@ -48,9 +51,18 @@ def main() -> None:
 
     ret = lambda r: (r["rho_native"] if r["row"] == "1" else r["rho_ceil"])[args.metric]
     base, new = load(args.base), load(args.new)
-    unmatched = len(set(base) ^ set(new))
+    unmatched = sorted(set(base) ^ set(new), key=str)
+    if unmatched and not args.allow_unmatched:
+        raise SystemExit(f"{len(unmatched)} cells are in only one file, e.g. {unmatched[0]}: the comparison would be over an incomplete set. "
+                         "Pass --allow-unmatched to compare on the cells in both")
     if unmatched:
-        print(f"Compared on cells in both files only: {unmatched} cells are in just one of them.\n")
+        print(f"Compared on cells in both files only: {len(unmatched)} cells are in just one of them.\n")
+    protocol = ("proxy", "doc_pair_tokens", "anchor_select", "stage2_rule", "anchor_bank", "shift_bank")
+    for name, side in (("base", base), ("new", new)):
+        try:
+            unique_records(list(side.values()), lambda r: id(r), protocol=protocol)
+        except ValueError as e:
+            raise SystemExit(f"the {name} file mixes protocols: {e}")
     groups = defaultdict(lambda: defaultdict(list))
     for k, r in new.items():
         if k in base:

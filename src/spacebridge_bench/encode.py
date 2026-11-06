@@ -16,8 +16,9 @@ import torch.nn.functional as F
 
 from spacebridge.encoders import CPU_BATCH_TOKENS, default_dtype, longest_first as _longest_first, run_token_batches, token_lengths
 
-from . import durable
+from . import cache_meta, durable
 from .models import ModelSpec
+from .provenance import _revision
 from .store import EmbeddingStore, release_gpu
 
 DEFAULT_CACHE = Path("data/cache/embeddings")
@@ -34,7 +35,7 @@ class Encoder:
     def __init__(self, spec: ModelSpec, device: str = "cuda", cache_dir: Path = DEFAULT_CACHE):
         self.spec = spec
         self.device = device if torch.cuda.is_available() else "cpu"
-        self.cache_dir = cache_dir / (spec.cache_key or spec.key)
+        self.cache_dir = cache_dir / cache_meta.namespace(spec.cache_key or spec.key, self.device)
         self._model = None
 
     @property
@@ -142,13 +143,18 @@ class Encoder:
         run_token_batches(lengths, _longest_first(lengths), self._budget, handle)
         return out
 
+    def _meta(self) -> dict:
+        return cache_meta.describe(self.spec.hf_id, _revision("models", self.spec.hf_id), cache_meta.device_class(self.device), max_seq_length=self.spec.max_seq_length)
+
     def _ensure_file(self, inputs: list[str], path: Path) -> None:
         parts = path.with_suffix(".parts")
         if path.exists():
             if parts.exists():  # a crash between finishing the file and removing its parts
                 shutil.rmtree(parts)
+            cache_meta.check(path, self._meta())
             return
         self._encode_to_file(inputs, path, parts)
+        cache_meta.write(path, self._meta())
 
     def _encode_to_file(self, inputs: list[str], path: Path, parts: Path) -> None:
         """Encodes longest first, saving a part every ``PART_ROWS`` rows or ``PART_SECONDS`` seconds. A rerun after a

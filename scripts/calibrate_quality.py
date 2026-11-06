@@ -18,6 +18,9 @@ from spacebridge_bench.provenance import unique_records
 from spacebridge.quality import CALIBRATION_PATH
 
 TARGET = "recall@30"
+# Fields that change what a fit means: the training set must agree on all of them (the shipped calibration's 306 fits do).
+PROTOCOL = ("proxy", "doc_pair_tokens", "anchor_select", "stage2_rule", "stage2_batch", "stage2_tau_scale", "anchor_bank", "shift_bank")
+KEEP_LAST = False
 ROWS = ("6", "6b", "6n", "8", "8s", "8n", "8b")
 # Candidate measurements; ``fidelity.agree@10`` alone is the rho_val baseline.
 FEATURES = [
@@ -46,9 +49,10 @@ def load(paths: list[Path], extra: dict | None = None) -> list[dict]:
                         continue
                     r["fit"]["quality"]["corpus"] = f
                 recs.append(r)
-    # One record per configuration. Reruns under other protocols are expected in these files, so the last wins, and the count of those replaced is printed.
+    # One record per configuration, all under one protocol. A repeated configuration is refused unless --keep-last names the choice,
+    # and then each replaced record is listed.
     key = lambda r: (r["dataset"], r["src"], r["tgt"], r["K"], r["row"], r.get("seed", 0))
-    return unique_records(recs, key, allow_duplicates=True)
+    return unique_records(recs, key, protocol=PROTOCOL, allow_duplicates=KEEP_LAST)
 
 
 def features(r: dict, names: list[str]) -> list[float]:
@@ -83,8 +87,11 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("results", type=Path, nargs="+")
     p.add_argument("--write", action="store_true", help=f"write {CALIBRATION_PATH.name}")
+    p.add_argument("--keep-last", action="store_true", help="when a configuration repeats, keep the last record and list each replaced one")
     p.add_argument("--features", type=Path, help="difficulty features JSONL: also test rho_val + each corpus feature")
     args = p.parse_args()
+    global KEEP_LAST
+    KEEP_LAST = args.keep_last
     extra = None
     if args.features:
         extra = {}

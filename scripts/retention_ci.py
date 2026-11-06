@@ -34,14 +34,32 @@ def load_cells(directory: Path, row: str, metric: str = "ndcg@5") -> list[dict]:
     return cells
 
 
-def verdict(point: float, low: float, line: float) -> str:
+def verdict(point: float, low: float, line: float, complete: bool = True) -> str:
+    if not complete:
+        return "incomplete"
+    if not np.isfinite(point):
+        return "undefined"
     return "confirmed" if low >= line else "point pass" if point >= line else "miss"
 
 
-def summarize(cells: list[dict], n_docs: int, boot: int = BOOTSTRAPS, seed: int = 0) -> list[dict]:
-    """One row per family. Means here are of per-query scores, so a replicate's mean is a weighted mean of the same scores."""
+def ratio(num, den):
+    """num / den, and NaN where the denominator is zero: a replicate with no baseline quality has no retention. Intervals drop those."""
+    num, den = np.asarray(num, dtype=np.float64), np.asarray(den, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(den > 0, num / np.where(den > 0, den, 1.0), np.nan)
+
+
+def summarize(cells: list[dict], n_docs: int, boot: int = BOOTSTRAPS, seed: int = 0, expected: set | None = None) -> list[dict]:
+    """One row per family. Means here are of per-query scores, so a replicate's mean is a weighted mean of the same scores.
+
+    ``expected`` is the planned set of (index model, query model, seed): a family missing any of its planned cells reads "incomplete",
+    never a verdict from the cells that happen to be there. Every cell must score the same queries, in the same order."""
     out = []
     n = len(cells[0]["scores"]["bridge"])
+    lengths = {len(v) for c in cells for v in c["scores"].values()}
+    if lengths != {n}:
+        raise ValueError(f"cells score different numbers of queries ({sorted(lengths)}): they aren't aligned on one query list")
+    present = {(c["src"], c["tgt"], c["seed"]) for c in cells}
     # Each replicate is one draw of the queries: counts per query, shared by every pair and seed.
     rng = np.random.default_rng(seed)
     counts = rng.multinomial(n, np.full(n, 1.0 / n), size=boot).astype(np.float64) / n
@@ -55,7 +73,7 @@ def summarize(cells: list[dict], n_docs: int, boot: int = BOOTSTRAPS, seed: int 
             pairs, seeds = defaultdict(list), defaultdict(list)
             reps = defaultdict(list)
             for c in chosen:
-                m = {s: float(v.mean()) for s, v in c["scores"].items()}
+                m = {s: float(np.mean(v, dtype=np.float64)) for s, v in c["scores"].items()}  # float64: float32 sums drift in the 8th digit
                 value = ratio(m)
                 pairs[c["src"], c["tgt"]].append(value)
                 seeds[c["seed"]].append(value)
@@ -65,30 +83,34 @@ def summarize(cells: list[dict], n_docs: int, boot: int = BOOTSTRAPS, seed: int 
             replicate = np.mean([np.mean(v, axis=0) for v in reps.values()], axis=0)
             return point, replicate, {k: float(np.mean(v)) for k, v in pairs.items()}, {k: float(np.mean(v)) for k, v in seeds.items()}
 
+        planned = {k for k in (expected or set()) if family(k[0], k[1]) == fam}
+        missing = sorted(planned - present)
+
         def interval(replicate) -> tuple[float, float]:
             return float(np.nanpercentile(replicate, 2.5)), float(np.nanpercentile(replicate, 97.5))
 
         def weaker(m, a, b):
             return np.minimum(m[a], m[b])
 
-        ret, ret_b, by_pair, by_seed = average(lambda m: m["bridge"] / weaker(m, "native", "oracle"))
+        ret, ret_b, by_pair, by_seed = average(lambda m: ratio(m["bridge"], weaker(m, "native", "oracle")))
         row = {
             "family": fam, "n_docs": n_docs, "n_queries": n, "pairs": len(by_pair), "seeds": len(by_seed), "cells": len(chosen),
             "retention": ret, "retention_low": interval(ret_b)[0], "retention_high": interval(ret_b)[1],
             "seed_sd": float(np.std(list(by_seed.values()), ddof=1)) if len(by_seed) > 1 else None,
             "worst_pair": min(by_pair.values()),
             "worst_pair_name": " <- ".join(min(by_pair, key=by_pair.get)),
+            "missing_cells": ["|".join(map(str, k)) for k in missing],
         }
         has_bm25 = all("native_bm25" in c["scores"] for c in chosen)
         if has_bm25:
-            v, b, _, _ = average(lambda m: m["bridge"] / weaker(m, "native_bm25", "oracle_bm25"))
+            v, b, _, _ = average(lambda m: ratio(m["bridge"], weaker(m, "native_bm25", "oracle_bm25")))
             row.update(strict=v, strict_low=interval(b)[0], strict_high=interval(b)[1])
-            v, b, _, _ = average(lambda m: m["bridge"] / m["oracle_bm25"])
+            v, b, _, _ = average(lambda m: ratio(m["bridge"], m["oracle_bm25"]))
             row.update(vs_reindex=v, vs_reindex_low=interval(b)[0], vs_reindex_high=interval(b)[1])
             v, b, _, _ = average(lambda m: m["bridge"] - m["oracle_bm25"])
             row.update(gap_reindex=v, gap_reindex_low=interval(b)[0], gap_reindex_high=interval(b)[1])
         if all("no_bridge" in c["scores"] for c in chosen):
-            v, b, _, _ = average(lambda m: m["no_bridge"] / weaker(m, "native", "oracle"))
+            v, b, _, _ = average(lambda m: ratio(m["no_bridge"], weaker(m, "native", "oracle")))
             row.update(no_bridge_retention=v, no_bridge_low=interval(b)[0], no_bridge_high=interval(b)[1])
             v, b, _, _ = average(lambda m: m["bridge"] - m["no_bridge"])
             row.update(bridge_gain=v, bridge_gain_low=interval(b)[0], bridge_gain_high=interval(b)[1])
@@ -97,7 +119,7 @@ def summarize(cells: list[dict], n_docs: int, boot: int = BOOTSTRAPS, seed: int 
                 row[f"abs_{system}"] = average(lambda m, s=system: m[s])[0]
         if fam in ("same", "across"):
             line = LINES["up_to_1m" if n_docs <= 1_000_000 else "above_1m"][fam]
-            row.update(line=line, verdict=verdict(row["retention"], row["retention_low"], line))
+            row.update(line=line, verdict=verdict(row["retention"], row["retention_low"], line, complete=not missing))
         out.append(row)
     return out
 

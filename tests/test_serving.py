@@ -63,7 +63,10 @@ class UncheckedBackend(ExactBackend):
 
 
 def any_size(bridge):
+    """A bridge with no record of its corpus, so a ``SizedIndex`` can stand in for an index of any size."""
     bridge.corpus = None
+    if bridge.quality is not None:
+        bridge.quality.details.get("coverage", {}).pop("index_size", None)
     return bridge
 
 

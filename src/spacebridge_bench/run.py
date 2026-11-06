@@ -22,7 +22,7 @@ from spacebridge import (
 )
 from spacebridge.lexical import LEXICAL_SHARE
 
-from . import durable, provenance
+from . import cache_meta, durable, provenance
 from .datasets import DATASETS, FLORES_SPLITS, SHIFT_BANKS, RetrievalDataset, flores_available, load_beir, load_flores, load_shift_bank
 from .encode import Encoder, MountEncoder
 from .metrics import bootstrap_retention_ci, per_query, retention, spearman
@@ -652,25 +652,20 @@ def main() -> None:
         ds = _first_docs(ds, args.max_docs)
     if args.max_queries is not None:
         ds = _first_queries(ds, args.max_queries)
-    # Everything that can change a number; seed, pair and K are in the cell.
-    config = {
-        "dataset": ds.name, "n_docs": ds.N, "queries_sha256": provenance.query_digest(ds.queries), "rows": sorted(args.rows), "rerankers": sorted(args.rerankers),
-        "proxy": args.proxy, "doc_pair_tokens": args.doc_pair_tokens, "stage2_batch": args.stage2_batch, "stage2_tau_scale": args.stage2_tau_scale,
-        "stage2_rule": args.stage2_rule, "stage2_curves": args.stage2_curves, "shift_bank": args.shift_bank, "anchor_bank": args.anchor_bank,
-        "anchor_select": args.anchor_select, "rerank_row": args.rerank_row, "full_index_diagnostics": args.full_index_diagnostics,
-        "time_mount": args.time_mount, "no_bridge": args.no_bridge,
-    }
+    config = experiment_config(args, ds, pairs)
     run_id = provenance.config_id(config)
-    done = finished_cells(args.out, run_id) if args.resume else set()
-    # Beside the results: what this run was, what it ran on, and when. One line per start, so a resumed run shows every commit it used.
-    durable.append_lines(args.out.with_name(f"{args.out.name}.manifest.jsonl"), [json.dumps({
-        "config_id": run_id, "config": config, "started": time.strftime("%F %T"), "device": args.device,
+    cells = [(s, pr, K) for s in args.seed for pr in pairs for K in args.K]
+    # Beside the results, before anything is skipped: what this run is, what it runs on, and when. One line per start.
+    manifest = args.out.with_name(f"{args.out.name}.manifest.jsonl")
+    durable.append_lines(manifest, [json.dumps({
+        "config_id": run_id, "config": config, "started": time.strftime("%F %T"),
+        "planned_cells": [f"{ds.name}|{src}|{tgt}|K{K}|s{s}" for s, (src, tgt), K in cells], "dataset_counts": dataset_counts(ds),
         **provenance.collect(
             [MODELS[k].hf_id for pr in pairs for k in pr] + [RERANKERS[r].hf_id for r in args.rerankers],
             [DATASETS[ds.name.split("@")[0]].repo],
         ),
     }, default=str)])
-    cells = [(s, pr, K) for s in args.seed for pr in pairs for K in args.K]
+    done = finished_cells(args.out, run_id) if args.resume else set()
     for n, (seed, (src, tgt), K) in enumerate(cells, 1):
         cell = f"{ds.name}|{src}|{tgt}|K{K}|s{seed}"
         if cell in done:
@@ -687,6 +682,30 @@ def main() -> None:
         ])
         durable.progress(f"cell {n}/{len(cells)} {cell}: done in {time.perf_counter() - t0:.0f} s")
         print_table(records)
+    durable.append_lines(manifest, [json.dumps({"config_id": run_id, "finished": time.strftime("%F %T"), "cache_use": cache_meta.summary()})])
+
+
+def experiment_config(args, ds: RetrievalDataset, pairs: list[tuple[str, str]]) -> dict:
+    """Everything that can change a number, other than the seed, pair and K that name a cell: options, device, the code and its defaults,
+    model and dataset revisions, and the exact corpus, queries and judgments. A resume compares all of it before skipping anything."""
+    return {
+        "dataset": ds.name, "n_docs": ds.N, "queries_sha256": provenance.query_digest(ds.queries), "rows": sorted(args.rows), "rerankers": sorted(args.rerankers),
+        "proxy": args.proxy, "doc_pair_tokens": args.doc_pair_tokens, "stage2_batch": args.stage2_batch, "stage2_tau_scale": args.stage2_tau_scale,
+        "stage2_rule": args.stage2_rule, "stage2_curves": args.stage2_curves, "shift_bank": args.shift_bank, "anchor_bank": args.anchor_bank,
+        "anchor_select": args.anchor_select, "rerank_row": args.rerank_row, "full_index_diagnostics": args.full_index_diagnostics,
+        "time_mount": args.time_mount, "no_bridge": args.no_bridge, "device": args.device,
+        "implementation": provenance.implementation_digest(),
+        "revisions": provenance.revisions([MODELS[k].hf_id for pr in pairs for k in pr] + [RERANKERS[r].hf_id for r in args.rerankers], [DATASETS[ds.name.split("@")[0]].repo]),
+        "corpus_sha256": provenance.corpus_digest(ds.doc_ids, ds.titles[: ds.N], ds.texts[: ds.N]),
+        "qrels_sha256": provenance.qrels_digest(ds.qrels),
+    }
+
+
+def dataset_counts(ds: RetrievalDataset) -> dict:
+    """What a positive-preserving corpus is made of: its documents, its judged positives, and the rest."""
+    positives = {d for rel in ds.qrels for d in rel}
+    return {"documents": ds.N, "queries": len(ds.queries), "judgments": sum(len(r) for r in ds.qrels), "positive_documents": len(positives),
+            "distractor_documents": ds.N - len(positives), "positive_share": len(positives) / ds.N, "self_match_queries": int((ds.self_rows >= 0).sum())}
 
 
 def _json_default(o):

@@ -16,6 +16,10 @@ jobs:
         run: |
           uv sync --no-default-groups
           uv run --no-sync python -c "import spacebridge"
+      - name: Real-model adapters import, with the models and banks extras only
+        run: |
+          uv sync --no-default-groups --extra models --extra banks
+          uv run --no-sync python -c "import sentence_transformers, datasets; from spacebridge import SentenceTransformerEncoder, CrossEncoderReranker"
       - name: Tests, with HNSW
         run: |
           uv sync --extra hnsw
@@ -23,4 +27,7 @@ jobs:
       - name: Wheel holds both packages
         run: |
           uv build --wheel
-          python -m zipfile -l dist/*.whl | grep -E "spacebridge/(mount|quality_calibration)|spacebridge_bench/run"
+          python -m zipfile -l dist/*.whl > members.txt
+          for m in spacebridge/__init__.py spacebridge/mount.py spacebridge/identity.py spacebridge/quality_calibration.json spacebridge_bench/run.py spacebridge_bench/provenance.py; do
+            grep -q "$m" members.txt || { echo "missing from the wheel: $m"; exit 1; }
+          done

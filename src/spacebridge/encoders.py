@@ -55,7 +55,8 @@ def default_dtype(device: str) -> torch.dtype:
 
 
 class SentenceTransformerEncoder:
-    """A ``spacebridge.mount.QueryEncoder`` over a ``sentence-transformers`` model.
+    """A ``spacebridge.mount.QueryEncoder`` over a ``sentence-transformers`` model. Set the length limit with ``max_seq_length`` here:
+    changing ``model.max_seq_length`` afterwards has no effect, so that concurrent calls can't change each other's length.
 
     Templates hold the model's native prompts, for example ``query_template="query: {text}"``; ``doc_template`` may use
     ``{body}`` (``title\\ntext``), ``{title_or_none}`` and ``{text}``.
@@ -91,7 +92,8 @@ class SentenceTransformerEncoder:
         }
 
     def encode_queries(self, texts: list[str]) -> np.ndarray:
-        return self._encode([self.query_template.format(text=t) for t in texts], self.model.max_seq_length)
+        # The configured limit, never self.model.max_seq_length: an overlapping call may have set that to its own length.
+        return self._encode([self.query_template.format(text=t) for t in texts], self._max_seq_length)
 
     def encode_docs(self, titles: list[str], texts: list[str], max_tokens: Optional[int] = None) -> np.ndarray:
         if len(titles) != len(texts):
@@ -100,7 +102,7 @@ class SentenceTransformerEncoder:
             self.doc_template.format(body=f"{title}\n{text}" if title else text, title_or_none=title or "none", text=text)
             for title, text in zip(titles, texts)
         ]
-        limit = self.model.max_seq_length
+        limit = self._max_seq_length
         return self._encode(inputs, limit if max_tokens is None else min(max_tokens, limit))
 
     def _encode(self, inputs: list[str], max_length: int) -> np.ndarray:

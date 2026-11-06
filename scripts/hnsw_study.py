@@ -25,7 +25,7 @@ from spacebridge_bench import durable
 from spacebridge_bench.datasets import load_beir
 from spacebridge_bench.encode import Encoder, MountEncoder
 from spacebridge_bench.metrics import per_query, recall_at
-from spacebridge_bench.provenance import check_or_write_config
+from spacebridge_bench.provenance import artifact_digest, check_or_write_config, implementation_digest, query_digest
 from spacebridge_bench.models import MODELS
 from spacebridge_bench.rerank import RERANKERS, Reranker, rerank, rerank_pools
 from spacebridge_bench.run import _DocTexts, _first_docs, _first_queries, anchor_candidates, cached_anchors, cached_lexical
@@ -92,15 +92,19 @@ def lexical_report(res: Results, tag: str, approx: np.ndarray, exact: np.ndarray
                 recall30_approx=float(pq_a["recall@30"].mean()), recall30_exact=float(pq_e["recall@30"].mean()))
 
 
-def hnsw_search(index, Q: np.ndarray, k: int, ef: int, exclude: Optional[np.ndarray] = None) -> np.ndarray:
-    """Top-k row ids. ``exclude`` holds one row per query that may not be returned, the same self-match policy exact search applies: one
-    more row is asked for, so a removed row doesn't cost a candidate slot."""
-    index.hnsw.efSearch = ef
+def search_excluding(index, Q: np.ndarray, k: int, exclude: Optional[np.ndarray] = None) -> np.ndarray:
+    """Top-k row ids of any FAISS index. ``exclude`` holds one row per query that may not be returned, the same self-match policy exact
+    search applies: one more row is asked for, so a removed row doesn't cost a candidate slot."""
     if exclude is None or (exclude < 0).all():
         return index.search(np.asarray(Q, dtype=np.float32), k)[1]
     ranked = index.search(np.asarray(Q, dtype=np.float32), k + 1)[1]
     keep = ranked != exclude[:, None]
     return np.stack([row[mask][:k] for row, mask in zip(ranked, keep)])
+
+
+def hnsw_search(index, Q: np.ndarray, k: int, ef: int, exclude: Optional[np.ndarray] = None) -> np.ndarray:
+    index.hnsw.efSearch = ef
+    return search_excluding(index, Q, k, exclude)
 
 
 class QuantizedIndex:
@@ -169,7 +173,12 @@ def main() -> None:
     if args.max_queries is not None:
         ds = _first_queries(ds, args.max_queries)
     # The key of a result names its query model, seed, ef and pool; this ties the file to everything else that can change a number.
-    check_or_write_config(args.out, {"dataset": ds.name, "n_docs": ds.N, "n_queries": len(ds.queries), "index_model": args.index_model, "K": args.K, "M": args.M, "ef_construction": args.ef_construction, "lexical": args.lexical, "ivfpq": args.ivfpq, "max_docs": args.max_docs})
+    check_or_write_config(args.out, {
+        "dataset": ds.name, "n_docs": ds.N, "queries_sha256": query_digest(ds.queries), "index_model": args.index_model, "K": args.K, "M": args.M,
+        "ef_construction": args.ef_construction, "lexical": args.lexical, "ivfpq": args.ivfpq, "max_docs": args.max_docs, "device": args.device,
+        "index_path": str(args.index_path) if args.index_path else None, "index_sha256": artifact_digest(args.index_path) if args.index_path else None,
+        "implementation": implementation_digest(),
+    })
     res = Results(args.out)
     src = MODELS[args.index_model]
     enc = Encoder(src, args.device)
@@ -210,7 +219,7 @@ def main() -> None:
         faiss.extract_index_ivf(pq_index).make_direct_map()
         for nprobe in args.nprobe:
             faiss.extract_index_ivf(pq_index).nprobe = nprobe
-            ranked = pq_index.search(np.asarray(Q_native, dtype=np.float32), maxk)[1]
+            ranked = search_excluding(pq_index, Q_native, maxk, ds.self_rows)
             rankings_report(res, f"{args.ivfpq}|native|nprobe{nprobe}", ranked, exact_native, ds, ds.index_lang_queries, rr, pools)
         rr.unload()
 
@@ -254,7 +263,7 @@ def main() -> None:
                 Q_hat_pq = pq_bridge.transform_query(Q_tgt)
                 for nprobe in args.nprobe:
                     faiss.extract_index_ivf(pq_index).nprobe = nprobe
-                    ranked = pq_index.search(np.asarray(Q_hat_pq, dtype=np.float32), maxk)[1]
+                    ranked = search_excluding(pq_index, Q_hat_pq, maxk, ds.self_rows)
                     rankings_report(res, f"{args.ivfpq}|{tgt_key}|s{seed}|nprobe{nprobe}", ranked, exact, ds, ds.queries, rr, pools)
             rr.unload()
     if args.per_query is not None:

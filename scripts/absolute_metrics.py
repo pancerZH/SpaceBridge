@@ -12,6 +12,8 @@ from pathlib import Path
 
 import numpy as np
 
+from spacebridge_bench.provenance import unique_records
+
 
 def main() -> None:
     p = argparse.ArgumentParser()
@@ -28,6 +30,10 @@ def main() -> None:
                 if any(x.get("seed", 0) == r.get("seed", 0) for x in bucket):
                     raise ValueError(f"{path}: two records for {r['dataset']}, {r['src']} <- {r['tgt']}, K {r['K']}, row {r['row']}, seed {r.get('seed', 0)}")
                 bucket.append(r)
+    protocol = ("proxy", "doc_pair_tokens", "anchor_select", "stage2_rule", "anchor_bank", "shift_bank")
+    for rows in cells.values():  # each table row compares one protocol's records
+        for recs in rows.values():
+            unique_records(recs, lambda r: r.get("seed", 0), protocol=protocol)
     for m in args.metrics:
         cols = ["native", "re-index"] + [f"Row {r}" for r in args.rows] + [f"ρceil {r}" for r in args.rows] + [f"ρnative {r}" for r in args.rows]
         print(f"\n### {m} (mean over seeds)\n")

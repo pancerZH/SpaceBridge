@@ -47,6 +47,56 @@ def collect(model_ids: Iterable[str], dataset_repos: Iterable[str]) -> dict[str,
     }
 
 
+def implementation_digest() -> str:
+    """A hash of the library's and the harness's source, and the shipped calibration: every default and every code path a number
+    depends on. Any edit changes it, so results never resume across code changes."""
+    import spacebridge
+
+    h = hashlib.sha256()
+    for root in (Path(spacebridge.__file__).parent, Path(__file__).parent):
+        for path in sorted(root.rglob("*")):
+            if path.suffix in (".py", ".json") and "__pycache__" not in path.parts:
+                h.update(str(path.relative_to(root.parent)).encode() + b"\x00" + path.read_bytes() + b"\x01")
+    return h.hexdigest()[:16]
+
+
+def revisions(model_ids: Iterable[str], dataset_repos: Iterable[str]) -> dict:
+    return {"models": {m: _revision("models", m) for m in sorted(set(model_ids))}, "datasets": {d: _revision("datasets", d) for d in sorted(set(dataset_repos))}}
+
+
+def corpus_digest(doc_ids: list, titles: list[str], texts: list[str]) -> str:
+    """Identifies a corpus's rows, in order, by their IDs and text."""
+    h = hashlib.sha256()
+    for i, a, b in zip(doc_ids, titles, texts):
+        h.update(f"{i}\x00{a}\x00{b}\x01".encode())
+    return h.hexdigest()
+
+
+def qrels_digest(qrels: list[dict[int, int]]) -> str:
+    h = hashlib.sha256()
+    for rel in qrels:
+        h.update(json.dumps(sorted(rel.items())).encode() + b"\x00")
+    return h.hexdigest()
+
+
+def artifact_digest(path: Path) -> Optional[str]:
+    """Content identity of a saved artifact: a directory by its manifest of checksums, a large file by its size and the hash of its first
+    and last 4 MB (a sampled digest: it catches a rebuilt or replaced file, not an edit in its middle)."""
+    path = Path(path)
+    if path.is_dir():
+        manifest = path / "manifest.json"
+        return hashlib.sha256(manifest.read_bytes()).hexdigest()[:16] if manifest.exists() else None
+    if not path.exists():
+        return None
+    size, h = path.stat().st_size, hashlib.sha256()
+    with path.open("rb") as f:
+        h.update(f.read(4 << 20))
+        if size > 8 << 20:
+            f.seek(size - (4 << 20))
+            h.update(f.read())
+    return f"{size}:{h.hexdigest()[:16]}"
+
+
 def query_digest(queries: list[str]) -> str:
     """Identifies the exact, ordered query list."""
     h = hashlib.sha256()
@@ -86,6 +136,7 @@ def unique_records(records: list[dict], key, protocol=(), allow_duplicates: bool
             if not allow_duplicates:
                 raise ValueError(f"two records for {k}: pass the allow-duplicates option to keep the last, or remove one")
             dropped += 1
+            durable.progress(f"unique_records: {k}: kept the later record (config {r.get('config_id')}), replaced one (config {out[k].get('config_id')})")
         out[k] = r
     if dropped:
         durable.progress(f"unique_records: kept the last of {dropped} duplicate records")

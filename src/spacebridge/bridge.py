@@ -151,6 +151,31 @@ class SpaceBridge:
         self.corpus, self.src_encoder, self.tgt_encoder = None, None, None
 
     @staticmethod
+    def _norm_matched(W: torch.Tensor, inputs: torch.Tensor, target_norm: torch.Tensor) -> Optional[torch.Tensor]:
+        """``W`` rescaled so mapped ``inputs`` have the native residual norm, or None if no scale can do that: the inputs map to (near)
+        zero or to something not finite. Dividing by such a norm would give a map of NaNs or infinities that looks fitted."""
+        if not torch.isfinite(W).all():
+            return None
+        mapped = (inputs @ W).norm(dim=1).mean()
+        if not (torch.isfinite(mapped) and mapped > 1e-6 * max(float(target_norm), 1e-12)):
+            return None
+        return W * (target_norm / mapped)
+
+    def _check_map(self, W: torch.Tensor, Y_val: torch.Tensor, mu_y: torch.Tensor, mu_x: torch.Tensor) -> None:
+        """Raises unless the map and its validation queries are finite and nonzero, before any fitted state is kept."""
+        if not torch.isfinite(W).all():
+            raise ValueError("the fitted map isn't finite: the calibration data are degenerate for this model pair")
+        q = (Y_val - mu_y) @ W + (mu_x if self.restore_source_mean else 0.0)
+        norms = q.norm(dim=1)
+        if not (torch.isfinite(q).all() and (norms > 1e-6).all()):
+            raise ValueError("the fitted map sends validation queries to zero or to non-finite vectors: the calibration data are degenerate for this model pair")
+
+    @staticmethod
+    def _check_split(bundle: CalibrationBundle) -> None:
+        if len(bundle.val_idx) < 1 or len(bundle.train_idx) < 2:
+            raise ValueError(f"the bundle's split has {len(bundle.train_idx)} training and {len(bundle.val_idx)} validation anchors: at least 2 and 1 are needed")
+
+    @staticmethod
     def _check_calibration(**arrays: np.ndarray) -> None:
         """Rejects calibration embeddings no map can be fitted on, before they reach a solver as NaNs."""
         for name, a in arrays.items():
@@ -215,7 +240,7 @@ class SpaceBridge:
         X_distractor: Optional[np.ndarray] = None,
         Y_doc_raw: Optional[np.ndarray] = None,
     ) -> Dict[str, Any]:
-        """Fits the affine query map and computes rho_val / status.
+        """Fits the affine query map and computes rho_val / status. Any failure raises and leaves no fitted state behind.
 
         Args:
             Y_raw: (K, d_t) target embeddings of the anchors: of ``bundle.anchor_query_texts`` with
@@ -229,6 +254,13 @@ class SpaceBridge:
                 doc<->doc pairs (each centered on its own doc-cone mean) to Stage 1 and 2; validation stays on
                 query proxies.
         """
+        try:
+            return self._fit(bundle, Y_raw, mode, pairs, X_distractor, Y_doc_raw)
+        except Exception:
+            self._reset_fit_state()
+            raise
+
+    def _fit(self, bundle, Y_raw, mode, pairs, X_distractor, Y_doc_raw) -> Dict[str, Any]:
         if mode not in get_args(Mode):
             raise ValueError(f"unknown fit mode {mode!r}; choose from {get_args(Mode)}")
         if pairs not in get_args(Pairs):
@@ -245,6 +277,7 @@ class SpaceBridge:
                 "target doc prompt), or construct SpaceBridge(doc_pairs=False)"
             )
         self._reset_fit_state()
+        self._check_split(bundle)
         self._check_calibration(Y_raw=Y_raw, X_query_raw=bundle.X_query_raw, X_doc_raw=bundle.X_doc_raw)
         Y = self._t(Y_raw)
         Xq, Xd = self._t(bundle.X_query_raw), self._t(bundle.X_doc_raw)
@@ -300,20 +333,27 @@ class SpaceBridge:
                 info["doc_pairs"] = len(tr)
             if self.match_residual_norm:
                 target_norm = Xc[tr].norm(dim=1).mean()
-                rescale = lambda W: W * (target_norm / (Yc[tr] @ W).norm(dim=1).mean())
+                rescale = lambda W: self._norm_matched(W, Yc[tr], target_norm)
             else:
-                rescale = lambda W: W
+                rescale = lambda W: W if torch.isfinite(W).all() else None
             candidates = []
             ops = self.stage1_operators if mode in ("stage1", "auto") else (mode,)
             if "stiefel" in ops:
                 # Without residual norm matching the scale stays in W, so it has to be the right one for this map.
                 W_s, s_info = stiefel_procrustes(Y_fit, X_fit, objective_scale=not self.match_residual_norm)
                 W_s = rescale(W_s)
-                candidates.append((val_score(W_s), W_s, {"solver": "stiefel", "rank": s_info["rank"], "scale": s_info["scale"]}))
+                if W_s is not None:
+                    candidates.append((val_score(W_s), W_s, {"solver": "stiefel", "rank": s_info["rank"], "scale": s_info["scale"]}))
             if "ridge" in ops:
                 for lam_rel, W_r in ridge_path(Y_fit, X_fit, self.lambdas_rel):
                     W_r = rescale(W_r)
-                    candidates.append((val_score(W_r), W_r, {"solver": "ridge", "lambda_rel": lam_rel}))
+                    if W_r is not None:
+                        candidates.append((val_score(W_r), W_r, {"solver": "ridge", "lambda_rel": lam_rel}))
+            if not candidates:
+                raise ValueError(
+                    "no Stage-1 map is usable: every candidate sends the calibration proxies to zero or to non-finite vectors. "
+                    "The proxies' variation isn't shared with the document pairs or the source side: check the encoders and the anchors"
+                )
             _, W, chosen = max(candidates, key=lambda c: c[0])
             info.update(chosen)
         self._sync()
@@ -347,6 +387,7 @@ class SpaceBridge:
             if self.refine_config.keep_checkpoints:  # studies score other candidate maps with the same signals
                 self.stage2_signals = lambda W_np: stage2_signals(self._t(W_np))
 
+        self._check_map(W, Y[va], mu_y, mu_x)
         self.src_lang = bundle.src_lang
         self._val_pool = (bundle.X_doc_raw, X_distractor)
         self.W = W.cpu().numpy()
@@ -383,13 +424,21 @@ class SpaceBridge:
         self, bundle: CalibrationBundle, Y_query_raw: np.ndarray, Y_doc_raw: np.ndarray, X_distractor: Optional[np.ndarray] = None,
         stage2: bool = True, center: str = "doc", operator: str = "stiefel", stage2_rows: str = "both",
     ) -> Dict[str, Any]:
-        """Fits without the source model, for an index whose model is gone (design §4.5): only stored vectors and M_tgt.
+        """Fits without the source model, for an index whose model is gone (design §4.5): only stored vectors and M_tgt. Any failure
+        raises and leaves no fitted state behind.
 
         Queries stay in the target model's own geometry: they are centered on its *doc* mean and restored on the source
         doc mean, so a doc-pair map carries the target's query/doc relation across. With no teacher, Stage 2 uses the
         proxies' own-doc retrieval and has no KL term, and the quality report has no score. ``operator="select"`` also
         tries ridge maps and picks by own-doc MRR, which picked worse maps across families (FiQA, design §4.5).
         """
+        try:
+            return self._fit_source_free(bundle, Y_query_raw, Y_doc_raw, X_distractor, stage2, center, operator, stage2_rows)
+        except Exception:
+            self._reset_fit_state()
+            raise
+
+    def _fit_source_free(self, bundle, Y_query_raw, Y_doc_raw, X_distractor, stage2, center, operator, stage2_rows) -> Dict[str, Any]:
         if center not in ("doc", "query"):
             raise ValueError(f"unknown centering {center!r}; choose 'doc' or 'query'")
         if operator not in ("stiefel", "select"):
@@ -397,6 +446,7 @@ class SpaceBridge:
         if stage2_rows not in ("both", "proxies", "docs"):
             raise ValueError(f"unknown Stage-2 rows {stage2_rows!r}; choose 'both', 'proxies' or 'docs'")
         self._reset_fit_state()
+        self._check_split(bundle)
         self._check_calibration(Y_query_raw=Y_query_raw, Y_doc_raw=Y_doc_raw, X_doc_raw=bundle.X_doc_raw)
         Yq, Yd, Xd = self._t(Y_query_raw), self._t(Y_doc_raw), self._t(bundle.X_doc_raw)
         tr = torch.as_tensor(bundle.train_idx, device=self.device)
@@ -413,7 +463,10 @@ class SpaceBridge:
         Ydc, Xdc = Yd - mu_yd, Xd - mu_x
         Yqc = Yq - mu_y
         target_norm = Xdc[tr].norm(dim=1).mean()
-        rescale = (lambda W: W * (target_norm / (Ydc[tr] @ W).norm(dim=1).mean())) if self.match_residual_norm else (lambda W: W)
+        if self.match_residual_norm:
+            rescale = lambda W: self._norm_matched(W, Ydc[tr], target_norm)
+        else:
+            rescale = lambda W: W if torch.isfinite(W).all() else None
 
         def mrr(W: torch.Tensor, pool_: torch.Tensor) -> float:
             return retrieval_stats(self._project(Yq[va], mu_y, mu_x, W), pool_, va)["mrr"]
@@ -423,11 +476,15 @@ class SpaceBridge:
         candidates = []
         W_s, s_info = stiefel_procrustes(Ydc[tr], Xdc[tr], objective_scale=not self.match_residual_norm)
         W_s = rescale(W_s)
-        candidates.append((mrr(W_s, sel_pool), W_s, {"solver": "stiefel", "rank": s_info["rank"], "scale": s_info["scale"]}))
+        if W_s is not None:
+            candidates.append((mrr(W_s, sel_pool), W_s, {"solver": "stiefel", "rank": s_info["rank"], "scale": s_info["scale"]}))
         if operator == "select":
             for lam_rel, W_r in ridge_path(Ydc[tr], Xdc[tr], self.lambdas_rel):
                 W_r = rescale(W_r)
-                candidates.append((mrr(W_r, sel_pool), W_r, {"solver": "ridge", "lambda_rel": lam_rel}))
+                if W_r is not None:
+                    candidates.append((mrr(W_r, sel_pool), W_r, {"solver": "ridge", "lambda_rel": lam_rel}))
+        if not candidates:
+            raise ValueError("no Stage-1 map is usable: every candidate sends the anchor documents to zero or to non-finite vectors")
         _, W, chosen = max(candidates, key=lambda c: c[0])
         info.update(chosen)
         self._sync()
@@ -450,6 +507,7 @@ class SpaceBridge:
             info.update(stage2_ms=1e3 * (time.perf_counter() - t0), stage2_gain=r_info["mrr_gain"], stage2_tau=r_info["tau"],
                         stage2_averaged=r_info["averaged"], stage2_best_step=r_info["best_step"], stage2_curve=[{"step": s, **sig} for s, sig in r_info["val_curve"]])
 
+        self._check_map(W, Yq[va], mu_y, mu_x)
         self.src_lang = bundle.src_lang
         self.W = W.cpu().numpy()
         self.mu_x_query = mu_x.cpu().numpy()

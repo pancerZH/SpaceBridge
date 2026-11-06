@@ -1,0 +1,15 @@
+{
+ "config_id": "0f9bea47d03d9bba",
+ "config": {
+  "dataset": "msmarco-full-fresh",
+  "n_docs": 8841823,
+  "n_queries": 2000,
+  "index_model": "bge-large-en",
+  "K": 0,
+  "M": 32,
+  "ef_construction": 200,
+  "lexical": true,
+  "ivfpq": null,
+  "max_docs": null
+ }
+}

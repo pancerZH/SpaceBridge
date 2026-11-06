@@ -94,12 +94,13 @@ result = searcher.search("your query", k=5)    # result.ids, .scores, .texts, .c
 
 **Old model gone?** `spacebridge.freeze(index, None)` fits from the stored vectors and the new model alone. An index whose old model is alive gets a bundle holding that model's embeddings, so `mount` still doesn't need the old model. A `freeze(index, None)` bundle has no quality score, `result.confidence` is NaN, and it gets a candidate pool of 100.
 
-**What protects you from mismatches.** Artifacts remember what they were made for, and `mount` and `Searcher` check them, on a sample of 32 rows. A replaced or reordered corpus raises `ValueError`; a single edited row outside the sample doesn't. Artifacts saved before these checks existed are checked by size only. For a custom backend, add a `check_index(index)` method, or the backend goes unchecked.
+**What protects you from mismatches.** Artifacts remember what they were made for, and `mount` and `Searcher` check them, on a sample of 32 rows. A replaced or reordered corpus raises `ValueError`; a single edited row outside the sample doesn't. Artifacts saved before these checks existed are checked by the size and vector width they recorded, with a warning that their content and row order are unverified. For a custom backend, add a `check_index(index)` method, or the backend goes unchecked.
 
 | Protection | What it covers | What it doesn't |
 | --- | --- | --- |
 | Checksums in `manifest.json` | A file changed or cut short | Whether it belongs with this index |
 | Sampled fingerprints | Another corpus, row order or re-embedding | An edit outside the sample |
+| Recorded size and width, for artifacts saved before fingerprints | Another size or vector width | Another corpus of the same size and width, or a reordering |
 | Encoder identity | Another model, prompt or length, if the encoder says | Encoders with no `identity` |
 | Atomic saves | A crash during a save | Two writers to one bundle, or swapping files under a running server |
 
@@ -217,7 +218,8 @@ Model loading, `freeze`, `mount`, BM25 building and HNSW building all come befor
 | `build_hnsw` | The path you give it | Continues from its last save, at most about 10 minutes back plus the batch in progress |
 | Benchmark runs (`spacebridge_bench.run`) | `data/cache/` and `--out` | Rerun the same command. Encoding saves at most every 2 minutes, reranker scores every 30 s, results per finished cell |
 
-- Benchmark runs refuse to continue an output file that holds another configuration's results, so use a new `--out` when you change a setting.
+- Benchmark runs refuse to continue an output file that holds another configuration's results, so use a new `--out` when you change a setting. The configuration covers every option, the device, the model and dataset revisions, the exact corpus, queries and judgments, and a hash of the library's and the harness's code, so a code change starts a new file too.
+- Benchmark caches written on a CPU live apart from the GPU's, under `<name>@cpu-fp32`, and every cache file written from now on has a `.meta.json` sidecar naming its model, revision and device class. A file whose sidecar disagrees with the run raises instead of being reused. Older files have no sidecar and are counted as legacy in each run's manifest.
 - These recovery claims were tested by killing processes (`kill -9`), including during the 8.84M HNSW build. A real power loss wasn't tested and rests on `fsync`.
 - `scripts/steps.sh` isn't a command. A driver script sets `OUT` and sources it, as its comments show.
 - [`data/README.md`](../data/README.md) explains the benchmark's local files.

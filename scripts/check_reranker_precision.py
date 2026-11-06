@@ -34,7 +34,10 @@ BOOTSTRAPS = 2_000
 
 
 class Fp32Reranker(Reranker):
-    """A reranker in fp32 on the GPU. The same dtype as a CPU run, not proven the same numbers: kernels and attention code can differ, and CPU agreement on this task is assumed, not tested."""
+    """A reranker in fp32 on the GPU. The same dtype as a CPU run, but other kernels: the ``cpu`` variant measures the CPU itself, and on
+    four corpora its top 5 matched this one exactly (outputs/review/followup/precision_cpu.jsonl)."""
+
+    precision = "fp32"
 
     @property
     def model(self):
@@ -65,7 +68,7 @@ def main() -> None:
 
     spec = RERANKERS[args.reranker]
     specs = {"fp32": RerankerSpec(f"{spec.key}-fp32", spec.hf_id, instructed=False), "bf16": spec, "int8": RERANKERS["bge-reranker-v2-m3-int8"],
-             "cpu": RerankerSpec(f"{spec.key}-cpu", spec.hf_id, instructed=False)}  # its own cache: CPU scores never mix with GPU ones
+             "cpu": spec}  # the reranker itself, on the CPU: its cache is the CPU namespace, so CPU scores never mix with GPU ones
     variants = {name: specs[name] for name in args.variants}
     assert "fp32" in variants and ("int8" not in variants or args.reranker == "bge-reranker-v2-m3")
     cell = lambda r: (r.get("reranker", "bge-reranker-v2-m3"), r["dataset"], r["n_queries"], r["pool"], r["variant"])

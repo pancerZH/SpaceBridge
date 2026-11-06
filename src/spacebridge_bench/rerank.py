@@ -13,7 +13,8 @@ import torch
 
 from spacebridge.encoders import CPU_BATCH_TOKENS, default_dtype, predict_pairs
 
-from . import durable
+from . import cache_meta, durable
+from .provenance import _revision
 from .store import release_gpu
 
 DEFAULT_CACHE = Path("data/cache/rerank")
@@ -74,8 +75,16 @@ class Reranker:
     def __init__(self, spec: RerankerSpec, device: str = "cuda", cache_dir: Path = DEFAULT_CACHE):
         self.spec = spec
         self.device = device if torch.cuda.is_available() else "cpu"
-        self.cache_path = cache_dir / f"{spec.key}_L{spec.max_length}.npz"
+        # An ONNX export runs on the CPU whatever the device, and its key already names it. Otherwise CPU scores get their own namespace.
+        name = spec.key if spec.onnx else cache_meta.namespace(spec.key, self.device)
+        self.cache_path = cache_dir / f"{name}_L{spec.max_length}.npz"
         self._model = None
+
+    precision: Optional[str] = None  # set by subclasses that run at another precision than the device's default
+
+    def _meta(self) -> dict:
+        cls = cache_meta.device_class("cpu", "int8") if self.spec.onnx else cache_meta.device_class(self.device, self.precision)
+        return cache_meta.describe(self.spec.hf_id, _revision("models", self.spec.hf_id), cls, max_length=self.spec.max_length)
 
     @property
     def model(self):
@@ -105,6 +114,8 @@ class Reranker:
                 n = log.stat().st_size // _LOG_RECORD.itemsize  # a power loss can tear the last record
                 records = np.fromfile(log, dtype=_LOG_RECORD, count=n)
                 cache.update(zip(records["key"].tolist(), records["score"].tolist()))
+            if cache:
+                cache_meta.check(self.cache_path, self._meta())
             _CACHES[self.cache_path] = cache
         return _CACHES[self.cache_path]
 
@@ -115,6 +126,8 @@ class Reranker:
             torch.cuda.empty_cache()
 
     def _save_scores(self, keys: list[int], scores: np.ndarray) -> None:
+        if not cache_meta.sidecar(self.cache_path).exists() and not self.cache and not any(self.cache_path.parent.glob(f"{self.cache_path.stem}.*.scores")):
+            cache_meta.write(self.cache_path, self._meta())  # a new cache: it says how it was made
         records = np.empty(len(keys), dtype=_LOG_RECORD)
         records["key"], records["score"] = np.array(keys, dtype=np.uint64), scores
         durable.append_bytes(self.cache_path.parent / f"{self.cache_path.stem}.{os.getpid()}.scores", records.tobytes())

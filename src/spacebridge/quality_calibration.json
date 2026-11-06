@@ -36,5 +36,34 @@
   ],
   "calibrated": "2026-10-31",
   "applies_to": "English queries, indexes up to about 171K documents",
-  "fitted_by": "scripts/calibrate_quality.py"
+  "training_sources": [
+    {
+      "file": "outputs/m2_fiqa_p4.jsonl",
+      "sha256": "2d7116dc198083927f6e9705d975733e50a920d5718b7ea50122a9162a3fdf6d"
+    },
+    {
+      "file": "outputs/m2_nfcorpus_v3.jsonl",
+      "sha256": "9eda4538229e13483f24d0c5763b35efb580cddff450a2bd045ea187aab53462"
+    },
+    {
+      "file": "outputs/m2_scidocs_v3.jsonl",
+      "sha256": "5ffa5e5b377bdbaf1ce71dd5ed408f4873e5de77f9a60a238d7878c7fff29e0d"
+    },
+    {
+      "file": "outputs/m2_arguana_v3.jsonl",
+      "sha256": "754365d15e8e91feaa5fe7dfdb0f0e76fa35494fcdb52d00dc5692f7345ec25a"
+    },
+    {
+      "file": "outputs/m2_nq.jsonl",
+      "sha256": "53f68ca4ffd656357d68e97de62e8db4cc8ec0d61df3cd40b08be4229b9e2d18"
+    },
+    {
+      "file": "outputs/m2_trec-covid.jsonl",
+      "sha256": "2d8e0a6d439ce6788a0a2ae8a0f0c9128d1f492907201dbd3e8f6791e94cebf9"
+    }
+  ],
+  "training_protocol": "306 fits: six model pairs, rows 6, 8 and 8b, K 1,024, 2,048 and 4,096 (NFCorpus, at 3,633 documents, has no 4,096), seed 0 only, lead-sentence proxies, full-length anchor documents. One protocol, and no configuration repeated",
+  "fitting_code": "scripts/calibrate_quality.py at commit 1deac9b (2026-10-31), the commit that shipped this file",
+  "reproduced": "2026-11-05: scripts/calibrate_quality.py, as revised for the review, refits every coefficient, mean, scale and band bit for bit from the training sources",
+  "nested_lodo_rmse": 0.049
 }

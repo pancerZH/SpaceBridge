@@ -442,3 +442,256 @@ def test_the_encoder_adapter_rejects_misaligned_docs_and_returns_shaped_empties(
     enc.doc_template = "{body}"
     with pytest.raises(ValueError, match="row-aligned"):
         enc.encode_docs(["t"], ["a", "b"])
+
+
+# ---- second review round
+
+def degenerate_bundle():
+    """Proxies vary along one direction, document pairs along others, and the source proxies are constant on the training rows:
+    every map sends the proxies to zero, so residual norm matching would divide by zero."""
+    rng = np.random.default_rng(0)
+    K, d = 20, 8
+    tr, va = np.arange(16), np.arange(16, 20)
+    Yq = np.zeros((K, d)); Yq[:, 0] = 1; Yq[:, 1] = rng.standard_normal(K) * 0.3
+    Yd = np.zeros((K, d)); Yd[:, 2] = 1; Yd[:, 3:] = rng.standard_normal((K, 5))
+    Xq = np.tile(l2(rng.standard_normal((1, d))), (K, 1)); Xq[va] = l2(rng.standard_normal((4, d)))
+    Xd = l2(rng.standard_normal((K, d)))
+    f = lambda a: l2(a).astype(np.float32)
+    bundle = CalibrationBundle("en", np.arange(K), [""] * K, [""] * K, f(Xd), f(Xq), tr, va, np.empty(0, dtype=np.int64), Xd.mean(0))
+    return bundle, f(Yq), f(Yd)
+
+
+@pytest.mark.parametrize("operators", [("stiefel", "ridge"), ("ridge",), ("stiefel",)])
+def test_a_degenerate_fit_raises_instead_of_returning_a_nan_bridge(operators):
+    bundle, Yq, Yd = degenerate_bundle()
+    bridge = SpaceBridge(device="cpu", stage1_operators=operators)
+    with pytest.raises(ValueError, match="no Stage-1 map is usable"):
+        bridge.fit(bundle, Yq, Y_doc_raw=Yd)
+    assert bridge.W is None and bridge.quality is None and bridge.status == "uninitialized"
+
+
+def test_a_failure_late_in_a_fit_leaves_no_fitted_state(world, monkeypatch):
+    _, index, src, tgt, bundle, _ = world
+    Y_q, Y_d = tgt.encode_queries(bundle.anchor_query_texts), tgt.encode_docs(bundle.anchor_doc_titles, bundle.anchor_doc_texts)
+    bridge = SpaceBridge(device="cpu")
+    bridge.fit(bundle, Y_q, X_distractor=index.vectors(bundle.distractor_ids), Y_doc_raw=Y_d)
+
+    def broken(*_, **__):
+        raise RuntimeError("late failure")
+
+    monkeypatch.setattr(bridge, "_fit_confidence", broken)  # after the map and the report were computed
+    with pytest.raises(RuntimeError, match="late failure"):
+        bridge.fit(bundle, Y_q, X_distractor=index.vectors(bundle.distractor_ids), Y_doc_raw=Y_d)
+    assert bridge.W is None and bridge.quality is None and bridge._conf_map is None
+
+
+def test_an_empty_validation_split_is_refused():
+    bundle, Yq, Yd = degenerate_bundle()
+    bundle.val_idx = bundle.val_idx[:0]
+    with pytest.raises(ValueError, match="validation"):
+        SpaceBridge(device="cpu").fit(bundle, Yq, Y_doc_raw=Yd)
+
+
+def test_an_overlapping_document_call_does_not_shorten_a_query():
+    import threading
+    import time
+
+    import torch as th
+    from spacebridge.encoders import SentenceTransformerEncoder
+
+    lengths, started = [], threading.Event()
+
+    class Tokenizer:
+        def __call__(self, texts, truncation=True, max_length=None):
+            lengths.append(max_length)
+            return {"input_ids": [[1] * 3 for _ in texts]}
+
+    class Model:
+        max_seq_length = 512
+        tokenizer = Tokenizer()
+
+        def preprocess(self, texts, prompt=""):
+            return {"x": th.zeros(len(texts), 1)}
+
+        def __call__(self, features):
+            if not started.is_set():  # the document call holds the lock, with its 128-token limit set
+                started.set()
+                time.sleep(0.3)
+            return {"sentence_embedding": th.ones(features["x"].shape[0], 4)}
+
+        def get_sentence_embedding_dimension(self):
+            return 4
+
+    enc = SentenceTransformerEncoder.__new__(SentenceTransformerEncoder)
+    enc.model, enc.device, enc.batch_tokens = Model(), "cpu", 1_000
+    enc.query_template, enc.doc_template = "{text}", "{body}"
+    enc._lock, enc._max_seq_length = threading.RLock(), 512
+    docs = threading.Thread(target=lambda: enc.encode_docs(["t"], ["a document"], max_tokens=128))
+    docs.start()
+    started.wait()
+    enc.encode_queries(["a query"])
+    docs.join()
+    assert lengths == [128, 512] and enc.model.max_seq_length == 512
+
+
+def test_a_legacy_bundle_is_checked_by_size_and_width():
+    vectors, index, src, tgt = make_mount_world(n_docs=240)
+    bundle = freeze(Index(vectors[:120], index.texts(np.arange(120)), index.titles(np.arange(120))), src, K=60, device="cpu")
+    bundle.corpus = None  # as saved before fingerprints existed
+    with pytest.raises(ValueError, match="made for 120 documents"):
+        mount(bundle, index, tgt, device="cpu")
+    narrow = Index(vectors[:120, :20], index.texts(np.arange(120)), index.titles(np.arange(120)))
+    with pytest.raises(ValueError, match="dimension"):
+        mount(bundle, narrow, tgt, device="cpu")
+    with pytest.warns(UserWarning, match="no corpus fingerprint"):
+        mount(bundle, Index(vectors[:120], index.texts(np.arange(120)), index.titles(np.arange(120))), tgt, device="cpu")
+
+
+def test_a_legacy_bridge_is_checked_by_size_and_width(world):
+    vectors, index, src, tgt, bundle, bridge = world
+    stored = bridge.corpus
+    bridge.corpus = None
+    try:
+        bigger = Index(np.vstack([vectors, vectors[:10]]), index.texts(np.arange(len(vectors))) + ["x"] * 10, index.titles(np.arange(len(vectors))) + [""] * 10)
+        with pytest.raises(ValueError, match="made for 800 documents"):
+            Searcher(bridge, tgt, ExactBackend(bigger._vectors), bigger, lexical=None)
+    finally:
+        bridge.corpus = stored
+
+
+@pytest.mark.parametrize("kind", ["explicit anchors", "exclusions", "parallel bank"])
+def test_the_effective_anchor_count_is_checked_after_selection(kind):
+    vectors, index, src, tgt = make_mount_world(n_docs=60)
+    kwargs = {
+        "explicit anchors": {"anchor_ids": np.array([0, 1])},
+        "exclusions": {"exclude": np.arange(2, 60)},
+        "parallel bank": {"parallel_bank": ([f"sentence {i}" for i in range(5)], [f"phrase {i}" for i in range(5)])},
+    }[kind]
+    with pytest.raises(ValueError, match="at least 20 are needed"):
+        freeze(index, src, device="cpu", **kwargs)
+
+
+# ---- second round: identities, coverage, cache provenance
+
+def _args(**over):
+    import argparse
+
+    base = dict(rows=["0a", "0b", "8b", "9h"], rerankers=["bge-reranker-v2-m3"], proxy="title", doc_pair_tokens=128, stage2_batch=None, stage2_tau_scale=None,
+                stage2_rule=None, stage2_curves=False, shift_bank="auto", anchor_bank="corpus", anchor_select="auto", rerank_row=None,
+                full_index_diagnostics=False, time_mount=False, no_bridge=True, device="cuda")
+    return argparse.Namespace(**{**base, **over})
+
+
+def _toy_dataset(n_queries=4):
+    from spacebridge_bench.datasets import RetrievalDataset
+
+    texts = [f"text {i}" for i in range(10)]
+    return RetrievalDataset("scifact", "en", "task", [str(i) for i in range(10)], [""] * 10, texts, [f"q {i}" for i in range(n_queries)],
+                            [{i: 1} for i in range(n_queries)], np.full(n_queries, -1, dtype=np.int64))
+
+
+def test_a_run_identity_changes_with_queries_rows_device_and_code(monkeypatch):
+    from spacebridge_bench import provenance
+    from spacebridge_bench.run import experiment_config
+
+    pairs = [("bge-large-en", "bge-base-en")]
+    ident = lambda args=_args(), ds=_toy_dataset(): provenance.config_id(experiment_config(args, ds, pairs))
+    base = ident()
+    assert ident() == base
+    assert ident(ds=_toy_dataset(3)) != base                 # a 500-query screen against a full run
+    assert ident(args=_args(rows=["0a", "0b", "8b", "9", "9h"])) != base
+    assert ident(args=_args(device="cpu")) != base
+    ds = _toy_dataset()
+    ds.texts[0] = "another text"
+    assert ident(ds=ds) != base                               # the same IDs, another corpus content
+    monkeypatch.setattr(provenance, "implementation_digest", lambda: "edited")
+    assert ident() != base                                    # changed code
+
+
+def test_the_run_manifest_is_written_before_the_resume_decision(tmp_path, monkeypatch):
+    import sys
+
+    from spacebridge_bench import run
+
+    out = tmp_path / "r.jsonl"
+    out.write_text(json.dumps({"cell": "x", "cell_records": 1, "row": "0a", "config_id": "another"}) + "\n")
+    monkeypatch.setattr(run, "load_beir", lambda name: _toy_dataset())
+    monkeypatch.setattr(sys, "argv", ["run", "--dataset", "scifact", "--pair", "bge-large-en:bge-base-en", "--rerankers", "bge-reranker-v2-m3", "--out", str(out)])
+    with pytest.raises(ValueError, match="another configuration"):
+        run.main()
+    manifest = [json.loads(l) for l in (tmp_path / "r.jsonl.manifest.jsonl").read_text().splitlines()]
+    assert manifest[0]["planned_cells"] == ["scifact|bge-large-en|bge-base-en|K0|s0"] and manifest[0]["dataset_counts"]["documents"] == 10
+
+
+def test_scale_curve_files_are_tied_to_their_size_grid_and_queries(tmp_path):
+    import sys
+
+    sys.path.insert(0, "scripts")
+    from scale_curve import file_config
+
+    out = tmp_path / "curve.jsonl"
+    check_or_write_config(out, file_config(_toy_dataset(), [5, 10], "cuda"))
+    with pytest.raises(ValueError, match="sizes"):
+        check_or_write_config(out, file_config(_toy_dataset(), [5, 8, 10], "cuda"))
+    with pytest.raises(ValueError, match="queries_sha256"):
+        check_or_write_config(out, file_config(_toy_dataset(3), [5, 10], "cuda"))
+
+
+def test_mount_timing_keys_name_every_option():
+    import argparse
+    import sys
+
+    sys.path.insert(0, "scripts")
+    from mount_timing import measurement_key
+
+    a = dict(mode="rate", dataset="msmarco", model="qwen3-0.6b", index_model="bge-large-en", K=8192, max_docs=None, seed=0, n=2000, device="cpu", threads=10)
+    key = lambda **over: measurement_key(argparse.Namespace(**{**a, **over}))
+    assert len({key(), key(n=500), key(seed=1), key(index_model="bge-base-en")}) == 4
+
+
+def test_a_verdict_needs_every_planned_cell_and_aligned_queries():
+    import sys
+
+    sys.path.insert(0, "scripts")
+    from retention_ci import summarize
+
+    q = lambda v: np.full(50, v)
+    cell = lambda seed, src="bge-large-en", tgt="bge-base-en", b=0.9: {"src": src, "tgt": tgt, "seed": seed, "scores": {"bridge": q(b), "native": q(0.9), "oracle": q(0.9)}}
+    planned = {("bge-large-en", "bge-base-en", s) for s in (0, 1, 2)}
+    row = summarize([cell(0)], 1_000, expected=planned)[0]
+    assert row["verdict"] == "incomplete" and len(row["missing_cells"]) == 2
+    assert summarize([cell(s) for s in (0, 1, 2)], 1_000, expected=planned)[0]["verdict"] == "confirmed"
+    short = cell(1)
+    short["scores"]["bridge"] = np.full(49, 0.9)
+    with pytest.raises(ValueError, match="aligned"):
+        summarize([cell(0), short], 1_000)
+    zero = {"src": "bge-large-en", "tgt": "bge-base-en", "seed": 0, "scores": {"bridge": q(0.5), "native": q(0.0), "oracle": q(0.0)}}
+    assert summarize([zero], 1_000)[0]["verdict"] == "undefined"
+
+
+def test_cpu_caches_have_their_own_namespace(tmp_path):
+    from spacebridge_bench.encode import Encoder
+    from spacebridge_bench.models import MODELS
+    from spacebridge_bench.rerank import RERANKERS, Reranker
+
+    assert Encoder(MODELS["bge-base-en"], "cpu", cache_dir=tmp_path).cache_dir.name == "bge-base-en@cpu-fp32"
+    assert Reranker(RERANKERS["bge-reranker-v2-m3"], "cpu", cache_dir=tmp_path).cache_path.name == "bge-reranker-v2-m3@cpu-fp32_L512.npz"
+    assert Reranker(RERANKERS["bge-reranker-v2-m3-int8"], "cpu", cache_dir=tmp_path).cache_path.name == "bge-reranker-v2-m3-int8_L512.npz"
+
+
+def test_a_cached_file_made_by_another_revision_is_refused(tmp_path, monkeypatch):
+    from spacebridge_bench import cache_meta, encode
+    from spacebridge_bench.models import MODELS
+
+    monkeypatch.setattr(encode, "_revision", lambda kind, repo: "rev-now")
+    enc = encode.Encoder(MODELS["bge-base-en"], "cpu", cache_dir=tmp_path)
+    inputs = ["a", "b"]
+    path = enc.cache_dir / f"{enc._key(inputs)}.npy"
+    path.parent.mkdir(parents=True)
+    np.save(path, np.ones((2, 768), dtype=np.float16))
+    np.testing.assert_allclose(np.linalg.norm(enc.encode(inputs), axis=1), 1, atol=1e-3)  # no sidecar: a legacy entry, used and counted
+    assert str(path) in cache_meta._USE["legacy"]
+    encode._MEMO.clear()
+    cache_meta.write(path, cache_meta.describe("BAAI/bge-base-en-v1.5", "rev-then", "cpu-fp32"))
+    with pytest.raises(ValueError, match="revision"):
+        enc.encode(inputs)
