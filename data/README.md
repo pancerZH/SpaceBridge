@@ -1,8 +1,8 @@
 # Local data index
 
-This folder and `outputs/` hold about 275 GB of embeddings, indexes and results that are not on GitHub. Use this page to find out what a file is and whether you can reuse it, so that work isn't repeated.
+This folder and `outputs/` hold about 290 GB of embeddings, indexes and results that are not on GitHub. Use this page to find out what a file is and whether you can reuse it, so that work isn't repeated.
 
-Only this page and [`catalog.csv`](catalog.csv) are committed. Figures are from 2026-11-04.
+Only this page and [`catalog.csv`](catalog.csv) are committed. Figures are from 2026-11-05, after the review round. Compact records of the published results are committed separately, in [`results/`](../results/README.md).
 
 All of it was produced on one machine: Intel Core i5-12600K, Nvidia RTX 5070 Ti, 96 GB of DDR4 RAM.
 
@@ -20,7 +20,7 @@ All of it was produced on one machine: Intel Core i5-12600K, Nvidia RTX 5070 Ti,
 
 ## The catalog
 
-`catalog.csv` has 6,885 rows: one per file, except that each BM25 index and the ONNX export get one row per folder. It leaves out the logs, driver scripts and finished-step markers in `outputs/`. It holds no document text and no measured results.
+`catalog.csv` has 7,709 rows: one per file, except that each BM25 index and the ONNX export get one row per folder. It leaves out the logs, driver scripts and finished-step markers in `outputs/`. It holds no document text and no measured results.
 
 | Column | Meaning |
 | --- | --- |
@@ -113,6 +113,9 @@ These whole-corpus files are the most expensive to rebuild, so keep them above a
 | `hotpotqa-full` | 5,233,329 | `2fc30e1cd9` | `a93d6efd1d` | `acd488f6fb` |
 | `hotpotqa-full`, after the first 1M rows | 4,233,329 | `295c6ba6f6` | `b6b605265d` | `a17e7da182` |
 | `msmarco-1m` | 1,000,000 | `9fab5f9dcc` | `de4f162f7e` | `dbb6e75c9d` |
+| `fever-1m` | 1,000,000 | `a9de17e9e5` | `2af939d4cf` | `58beee3ee9` |
+| `lotte-technology` | 638,509 | `1809968d6d` | `a6df3f7a67` | `5a7538cfb5` |
+| `touche2020` | 382,545 | `8c0ab82b77` | `c1e12f5a28` | `63ca5c055d` |
 | `msmarco-1m-nested` | 1,000,000 | `db0fd56320` | `d2528f1213` | `45c5f4e128` |
 | `hotpotqa-1m` | 1,000,000 | `0a5b0f3d47` | `135e4c9e93` | `ef9e329b20` |
 | `hotpotqa-1m-nested` | 1,000,000 | `fddf42658a` | `5ab6810c2f` | `f69e03d571` |
@@ -226,5 +229,17 @@ Phase 1, under `outputs/phase1/`. Each folder's report is in `docs/reports/`. Mo
 | HotpotQA study | `hp_study`, `hp_fixes`, `hp_fixes_arguana`, `hp_identity`, `hp_scale` | Why multi-hop questions miss, and the fixes tried, including BM25. `hp_study/fits/` (9 GB) holds fitted maps | `hotpotqa-followup.md` |
 | Milestone 3 | `m3_lib`, `m3_a6`, `m3_b`, `m3_1m`, `m3_encode`, `m3_curves`, `m3_full`, `m3_timing`, `m3_quickstart`, `m3_f`, `m3_tables` | The library with BM25, cross-language checks, end-to-end runs up to 8.84M, timing and the fresh-clone quickstart | `phase1-m3.md` |
 | Closeout | `followup`, `closeout`, `final` | Follow-up checks, the closeout decisions, and the final checks at the 160K line | `phase1-closeout.md`, `phase1-final.md` |
+
+The review round, under `outputs/review/` (driver `scripts/review_experiments.sh`, report `review/review_reply.md`):
+
+| Files | What they hold |
+| --- | --- |
+| `recompute_*.jsonl` | The published cells again, with the corrected code. They match the original records to six decimal places |
+| `fresh_*.jsonl`, `fresh_msmarco_hnsw.jsonl` | The fresh confirmation of `docs/fresh_confirmation_plan.md` |
+| `per_query/<run>/` | Per-query scores of every cell, in full precision. `results/per_query/` is a compact copy |
+| `timing_*.jsonl`, `bridge_*/` | Measured latency, and the bridges it served |
+| `stage1_*.jsonl` | The Stage-1 selector study at 128-token anchor documents |
+| `*.jsonl.manifest.jsonl`, `*.config.json` | What each run was: configuration, commit, revisions |
+| `frozen_commit`, `started_at`, `progress.log`, `driver.log` | The frozen system's commit and the run's logs |
 
 `outputs/phase1/m3_quickstart/clone/` (8 GB) is a full fresh checkout with its own Python environment, used to test the quickstart. The catalog skips it. It holds no unique results and can be deleted to save space.
