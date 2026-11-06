@@ -84,7 +84,9 @@ class Reranker:
     precision: Optional[str] = None  # set by subclasses that run at another precision than the device's default
 
     def _meta(self) -> dict:
-        cls = cache_meta.device_class("cpu", "int8") if self.spec.onnx else cache_meta.device_class(self.device, self.precision)
+        """How this reranker's scores are made. The revision is the local Hugging Face reference: once the model is loaded, the one the load
+        resolved, a first download included; before that, unknown if the model was never downloaded."""
+        cls =cache_meta.device_class("cpu", "int8") if self.spec.onnx else cache_meta.device_class(self.device, self.precision)
         return cache_meta.describe(self.spec.hf_id, _revision("models", self.spec.hf_id), cls, max_length=self.spec.max_length)
 
     @property
@@ -117,7 +119,7 @@ class Reranker:
                 records = np.fromfile(log, dtype=_LOG_RECORD, count=n)
                 cache.update(zip(records["key"].tolist(), records["score"].tolist()))
             # Decided from the disk, before anything is scored: a sidecar is always checked; data with no sidecar is a legacy cache,
-            # used and counted; nothing at all is a new cache, which gets its sidecar before its first score is written.
+            # used and counted; nothing at all is a new cache, which gets its sidecar once the model is loaded, before its first score.
             if cache_meta.sidecar(self.cache_path).exists() or self.cache_path.exists() or logs:
                 cache_meta.check(self.cache_path, self._meta())
             else:
@@ -131,14 +133,19 @@ class Reranker:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _describe_new_cache(self) -> None:
-        """A new cache says how it was made, before it holds anything."""
+    def _ready_to_score(self) -> None:
+        """Loads the model, then ties the cache to it, before any score is computed. On a first download the revision is known only now:
+        a new cache's sidecar records it, and an existing cache is checked again, since the load may have fetched a newer revision."""
+        self.model
         if self.cache_path in _NEW:
             cache_meta.write(self.cache_path, self._meta())
             _NEW.discard(self.cache_path)
+        else:
+            cache_meta.check(self.cache_path, self._meta())
 
     def _save_scores(self, keys: list[int], scores: np.ndarray) -> None:
-        self._describe_new_cache()
+        if self.cache_path in _NEW:
+            self._ready_to_score()
         records = np.empty(len(keys), dtype=_LOG_RECORD)
         records["key"], records["score"] = np.array(keys, dtype=np.uint64), scores
         durable.append_bytes(self.cache_path.parent / f"{self.cache_path.stem}.{os.getpid()}.scores", records.tobytes())
@@ -150,7 +157,7 @@ class Reranker:
         cache = self.cache
         todo = list({k: i for i, k in enumerate(keys) if k not in cache}.values())
         if todo:
-            self._describe_new_cache()
+            self._ready_to_score()
         pos, t_begin = 0, time.perf_counter()
         while pos < len(todo):
             t0 = time.perf_counter()

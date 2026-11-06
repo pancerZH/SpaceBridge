@@ -700,22 +700,43 @@ def test_a_cached_file_made_by_another_revision_is_refused(tmp_path, monkeypatch
 # ---- closure assessment: through the real entry points
 
 class _FixedReranker:
-    """A ``Reranker`` whose predictor returns 0.75, so ``score()`` runs for real with no model."""
+    """A ``Reranker`` whose predictor returns 0.75, so ``score()`` runs for real with no model. Loading its model calls ``on_load``,
+    which can stand in for a first download by changing what the local revision reads."""
 
     @staticmethod
-    def make(cache_dir, precision=None):
+    def make(cache_dir, precision=None, on_load=lambda: None):
         from spacebridge_bench.rerank import RERANKERS, Reranker
 
         class Fixed(Reranker):
             calls = 0
 
+            @property
+            def model(self):
+                if self._model is None:
+                    on_load()
+                    self._model = object()
+                return self._model
+
             def _predict(self, queries, docs, prompt):
+                self.model  # as the real one does: the model loads lazily, when first needed
                 Fixed.calls += 1
                 return np.full(len(queries), 0.75, dtype=np.float32)
 
         r = Fixed(RERANKERS["bge-reranker-v2-m3"], "cpu", cache_dir=cache_dir)
         r.precision = precision
         return r
+
+
+def _fake_encoder_model(monkeypatch, encode, on_load=lambda: None):
+    """``Encoder.model`` without a model: loading it calls ``on_load``, which can stand in for a first download."""
+
+    def model(self):
+        if self._model is None:
+            on_load()
+            self._model = object()
+        return self._model
+
+    monkeypatch.setattr(encode.Encoder, "model", property(model))
 
 
 def test_a_new_rerank_cache_written_by_score_has_a_sidecar_and_refuses_other_provenance(tmp_path, monkeypatch):
@@ -752,6 +773,7 @@ def test_a_new_embedding_file_written_by_encode_has_a_sidecar_and_refuses_other_
         np.save(path, np.ones((len(inputs), 768), dtype=np.float16))
 
     monkeypatch.setattr(encode.Encoder, "_encode_to_file", fake_encode)
+    _fake_encoder_model(monkeypatch, encode)
     monkeypatch.setattr(encode, "_revision", lambda kind, repo: "rev-a")
     encode._MEMO.clear()
     enc = encode.Encoder(MODELS["bge-base-en"], "cpu", cache_dir=tmp_path)
@@ -762,6 +784,107 @@ def test_a_new_embedding_file_written_by_encode_has_a_sidecar_and_refuses_other_
     monkeypatch.setattr(encode, "_revision", lambda kind, repo: "rev-b")
     with pytest.raises(ValueError, match="revision"):
         encode.Encoder(MODELS["bge-base-en"], "cpu", cache_dir=tmp_path).encode(["a", "b"])
+
+
+# ---- closure recheck: a first download, and revisions that stay unknown
+
+def test_a_cold_first_load_records_the_revision_it_downloaded(tmp_path, monkeypatch):
+    """The recheck's case: no local reference before the load, revision A once the model is downloaded, B later. The sidecar must say A."""
+    from spacebridge_bench import cache_meta, rerank
+
+    ref = {"main": None}  # never downloaded
+    monkeypatch.setattr(rerank, "_revision", lambda kind, repo: ref["main"])
+    monkeypatch.setattr(rerank, "_CACHES", {})
+    monkeypatch.setattr(cache_meta, "_USE", {k: set() for k in cache_meta._USE})
+    first = _FixedReranker.make(tmp_path, on_load=lambda: ref.update(main="rev-a"))
+    assert first.score(["q"], ["d"], "task").tolist() == [0.75]
+    assert json.loads(cache_meta.sidecar(first.cache_path).read_text())["revision"] == "rev-a"
+
+    monkeypatch.setattr(rerank, "_CACHES", {})
+    ref["main"] = "rev-b"  # the model moved on upstream, and a later run fetched it
+    with pytest.raises(ValueError, match="revision"):
+        _FixedReranker.make(tmp_path).score(["q"], ["d"], "task")
+
+
+def test_a_revision_unknown_even_after_loading_is_never_counted_as_validated(tmp_path, monkeypatch):
+    from spacebridge_bench import cache_meta, rerank
+
+    ref = {"main": None}
+    monkeypatch.setattr(rerank, "_revision", lambda kind, repo: ref["main"])
+    monkeypatch.setattr(rerank, "_CACHES", {})
+    monkeypatch.setattr(cache_meta, "_USE", {k: set() for k in cache_meta._USE})
+    first = _FixedReranker.make(tmp_path)  # loading leaves no reference: a local path, or a moved cache
+    with pytest.warns(UserWarning, match="unknown even with the model loaded"):
+        first.score(["q"], ["d"], "task")
+    path = str(first.cache_path)
+    assert json.loads(cache_meta.sidecar(first.cache_path).read_text())["revision"] is None
+    assert path in cache_meta._USE["unverified"] and path not in cache_meta._USE["validated"]
+
+    monkeypatch.setattr(rerank, "_CACHES", {})
+    monkeypatch.setattr(cache_meta, "_USE", {k: set() for k in cache_meta._USE})
+    ref["main"] = "rev-b"  # known now, but there is nothing to compare it with
+    again = _FixedReranker.make(tmp_path)
+    with pytest.warns(UserWarning, match="revision in its sidecar is unknown"):
+        assert again.score(["q"], ["d"], "task").tolist() == [0.75]
+    assert path in cache_meta._USE["unverified"] and path not in cache_meta._USE["validated"]
+    assert cache_meta.summary()["unverified"] == 1 and cache_meta.summary()["validated"] == 0
+
+
+def test_a_load_that_fetches_another_revision_stops_before_any_score_is_added(tmp_path, monkeypatch):
+    """A cache checked before the load can still meet a newer revision: the load itself may fetch one. Nothing is scored into it then."""
+    from spacebridge_bench import cache_meta, rerank
+
+    ref = {"main": "rev-a"}
+    monkeypatch.setattr(rerank, "_revision", lambda kind, repo: ref["main"])
+    monkeypatch.setattr(rerank, "_CACHES", {})
+    _FixedReranker.make(tmp_path).score(["q"], ["d"], "task")
+    logs = sorted(tmp_path.glob("*.scores"))
+    size = sum(p.stat().st_size for p in logs)
+
+    monkeypatch.setattr(rerank, "_CACHES", {})
+    monkeypatch.setattr(cache_meta, "_USE", {k: set() for k in cache_meta._USE})
+    later = _FixedReranker.make(tmp_path, on_load=lambda: ref.update(main="rev-b"))
+    assert later.score(["q"], ["d"], "task").tolist() == [0.75]  # all cached: checked against rev-a, no load needed
+    calls = type(later).calls
+    with pytest.raises(ValueError, match="revision"):
+        later.score(["q2"], ["d2"], "task")  # needs the model; its load fetches rev-b
+    assert type(later).calls == calls and sum(p.stat().st_size for p in tmp_path.glob("*.scores")) == size
+
+    monkeypatch.setattr(rerank, "_CACHES", {})
+    ref["main"] = None  # the model isn't local: checked at load as unverified, and checked again once the load says rev-b
+    with pytest.raises(ValueError, match="revision"):
+        _FixedReranker.make(tmp_path, on_load=lambda: ref.update(main="rev-b")).score(["q3"], ["d3"], "task")
+
+
+def test_a_cold_first_encode_records_the_revision_it_downloaded(tmp_path, monkeypatch):
+    from spacebridge_bench import cache_meta, encode
+    from spacebridge_bench.models import MODELS
+
+    encoded = []
+
+    def fake_encode(self, inputs, path, parts):
+        encoded.append(path)
+        np.save(path, np.ones((len(inputs), 768), dtype=np.float16))
+
+    ref = {"main": None}
+    monkeypatch.setattr(encode.Encoder, "_encode_to_file", fake_encode)
+    _fake_encoder_model(monkeypatch, encode, on_load=lambda: ref.update(main="rev-a"))
+    monkeypatch.setattr(encode, "_revision", lambda kind, repo: ref["main"])
+    encode._MEMO.clear()
+    enc = encode.Encoder(MODELS["bge-base-en"], "cpu", cache_dir=tmp_path)
+    enc.encode(["a", "b"])
+    path = enc.cache_dir / f"{enc._key(['a', 'b'])}.npy"
+    assert json.loads(cache_meta.sidecar(path).read_text())["revision"] == "rev-a"
+
+    # A crashed encode of other inputs, begun under rev-a; the run continuing it loads rev-b, so it stops before encoding anything.
+    other = enc.cache_dir / f"{enc._key(['c'])}.npy"
+    cache_meta.write(other, enc._meta())
+    encoded.clear()
+    _fake_encoder_model(monkeypatch, encode, on_load=lambda: ref.update(main="rev-b"))
+    ref["main"] = None
+    with pytest.raises(ValueError, match="revision"):
+        encode.Encoder(MODELS["bge-base-en"], "cpu", cache_dir=tmp_path).encode(["c"])
+    assert encoded == []
 
 
 def _toy_run(tmp_path, seeds_on_disk, planned_seeds, with_plan=True):
@@ -815,6 +938,54 @@ def test_the_interval_command_needs_a_plan_and_one_configuration(tmp_path):
     manifest.write_text(manifest.read_text() + json.dumps({"config_id": "def", "config": {"n_docs": 1_000}}) + "\n")
     with pytest.raises(SystemExit, match="2 configurations"):
         retention_ci.main([str(run_dir), "--allow-unplanned"])
+
+
+def _toy_plan_run(tmp_path, on_disk, planned):
+    """Like ``_toy_run``, with any (index model, query model, seed) cells on disk and in the plan."""
+    run_dir = tmp_path / "per_query" / "toy"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    for src, tgt, seed in on_disk:
+        q = np.full(50, 0.9, dtype=np.float32)
+        np.savez(run_dir / f"toy__{src}__{tgt}__K0__s{seed}.npz", **{f"9h/{s}/ndcg@5": q for s in ("bridge", "native", "oracle")})
+    manifest = {"config_id": "abc", "config": {"n_docs": 1_000}, "planned_cells": [f"toy|{s}|{t}|K0|s{k}" for s, t, k in planned]}
+    (tmp_path / "toy.jsonl.manifest.jsonl").write_text(json.dumps(manifest) + "\n")
+    return run_dir
+
+
+def test_the_interval_command_refuses_a_run_missing_a_whole_planned_family(tmp_path, capsys):
+    """The recheck's case: same-family seeds 0-2 and across-family seeds 0-2 planned, only the same-family ones on disk."""
+    import sys
+
+    sys.path.insert(0, "scripts")
+    import retention_ci
+
+    same = [("bge-large-en", "bge-base-en", s) for s in (0, 1, 2)]
+    across = [("bge-large-en", "qwen3-0.6b", s) for s in (0, 1, 2)]
+    run_dir = _toy_plan_run(tmp_path, on_disk=same, planned=same + across)
+    with pytest.raises(SystemExit, match=r"incomplete runs[\s\S]*bge-large-en\|qwen3-0.6b\|0"):
+        retention_ci.main([str(run_dir)])
+    out = capsys.readouterr().out
+    assert "across" in out and "incomplete" in out  # the absent family is printed, not dropped
+
+    rows = {r["family"]: r for r in retention_ci.summarize(retention_ci.load_cells(run_dir, "9h"), 1_000, expected=set(same + across))}
+    assert rows["same"]["verdict"] == "confirmed"  # valid for its own cells
+    assert rows["across"]["verdict"] == "incomplete" and rows["across"]["cells"] == 0 and len(rows["across"]["missing_cells"]) == 3
+
+    empty = tmp_path / "empty"
+    empty_dir = _toy_plan_run(empty, on_disk=[], planned=same)
+    with pytest.raises(SystemExit, match="incomplete runs"):
+        retention_ci.main([str(empty_dir)])
+
+    extra = tmp_path / "extra"
+    extra_dir = _toy_plan_run(extra, on_disk=same + [("bge-large-en", "bge-base-en", 3)], planned=same)
+    with pytest.raises(SystemExit, match="plan doesn't name"):
+        retention_ci.main([str(extra_dir)])
+
+    complete = tmp_path / "complete"
+    capsys.readouterr()
+    retention_ci.main([str(_toy_plan_run(complete, on_disk=same + across, planned=same + across))])
+    out = capsys.readouterr().out
+    assert out.count("confirmed") == 2 and "incomplete" not in out
 
 
 def test_the_code_identity_covers_the_lock_and_a_study_script(tmp_path):

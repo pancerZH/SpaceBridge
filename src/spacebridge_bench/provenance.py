@@ -9,7 +9,12 @@ from typing import Any, Iterable, Optional
 
 from . import durable
 
-HF_HUB = Path.home() / ".cache/huggingface/hub"
+try:  # where downloads go, following HF_HOME and HF_HUB_CACHE, so a moved cache still has its revisions read
+    from huggingface_hub.constants import HF_HUB_CACHE as _HUB_CACHE
+
+    HF_HUB = Path(_HUB_CACHE)
+except ImportError:
+    HF_HUB = Path.home() / ".cache/huggingface/hub"
 
 
 def config_id(config: dict[str, Any]) -> str:

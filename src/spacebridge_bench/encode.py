@@ -153,8 +153,10 @@ class Encoder:
                 shutil.rmtree(parts)
             cache_meta.check(path, self._meta())
             return
-        # The sidecar comes first: a run continuing a crashed encode is checked against how that encode began, so parts made by another
-        # model revision or device are never completed by this one.
+        # The model loads first, so even a first download knows its revision. Then the sidecar comes before any part: a run continuing a
+        # crashed encode is checked against how that encode began, so parts made by another model revision or device are never completed
+        # by this one.
+        self.model
         if cache_meta.sidecar(path).exists():
             cache_meta.check(path, self._meta())
         else:

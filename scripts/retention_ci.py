@@ -8,7 +8,9 @@ separately: it does not vary the evaluation sample, only the anchors, split and 
     python scripts/retention_ci.py outputs/review/per_query/<name> ... --row 9h --out table.jsonl
     python scripts/retention_ci.py outputs/review/per_query/<name> --plan results/manifests.jsonl   for runs whose manifest has no plan
 
-A family missing any planned cell reads "incomplete", and the command then exits with an error, so it never confirms a partial run.
+The run's planned cells are compared with the ones on disk before anything is summarized. A family missing any planned cell, or all of
+them, reads "incomplete", and the command then exits with an error, so it never confirms a partial run. Cells the plan doesn't name are
+refused.
 """
 import argparse
 import json
@@ -33,6 +35,8 @@ def load_cells(directory: Path, row: str, metric: str = "ndcg@5") -> list[dict]:
         dataset, src, tgt, _, seed = path.stem.split("__")
         with np.load(path) as z:
             scores = {s: z[f"{row}/{s}/{metric}"] for s in SYSTEMS if f"{row}/{s}/{metric}" in z.files}
+        if scores and not {"bridge", "native", "oracle"} <= scores.keys():  # none at all: this cell didn't run the row
+            raise ValueError(f"{path} has row {row} {metric} scores, but none for {sorted({'bridge', 'native', 'oracle'} - scores.keys())}")
         cells.append({"dataset": dataset, "src": src, "tgt": tgt, "seed": int(seed[1:]), "scores": scores})
     return cells
 
@@ -56,7 +60,8 @@ def summarize(cells: list[dict], n_docs: int, boot: int = BOOTSTRAPS, seed: int 
     """One row per family. Means here are of per-query scores, so a replicate's mean is a weighted mean of the same scores.
 
     ``expected`` is the planned set of (index model, query model, seed): a family missing any of its planned cells reads "incomplete",
-    never a verdict from the cells that happen to be there. Every cell must score the same queries, in the same order."""
+    never a verdict from the cells that happen to be there, and so does a planned family with none of its cells here. Every cell must
+    score the same queries, in the same order."""
     out = []
     n = len(cells[0]["scores"]["bridge"])
     lengths = {len(v) for c in cells for v in c["scores"].values()}
@@ -68,7 +73,19 @@ def summarize(cells: list[dict], n_docs: int, boot: int = BOOTSTRAPS, seed: int 
     counts = rng.multinomial(n, np.full(n, 1.0 / n), size=boot).astype(np.float64) / n
     for fam in ("same", "across", "other"):
         chosen = [c for c in cells if family(c["src"], c["tgt"]) == fam]
+        planned = {k for k in (expected or set()) if family(k[0], k[1]) == fam}
+        missing = sorted(planned - present)
         if not chosen:
+            if planned:  # planned, and not one cell of it is here: incomplete, never just absent
+                nan = float("nan")
+                row = {
+                    "family": fam, "n_docs": n_docs, "n_queries": n, "pairs": 0, "seeds": 0, "cells": 0,
+                    "retention": nan, "retention_low": nan, "retention_high": nan, "seed_sd": None, "worst_pair": nan, "worst_pair_name": "",
+                    "missing_cells": ["|".join(map(str, k)) for k in missing],
+                }
+                if fam in ("same", "across"):
+                    row.update(line=LINES["up_to_1m" if n_docs <= 1_000_000 else "above_1m"][fam], verdict="incomplete")
+                out.append(row)
             continue
 
         def average(ratio):
@@ -85,9 +102,6 @@ def summarize(cells: list[dict], n_docs: int, boot: int = BOOTSTRAPS, seed: int 
             point = float(np.mean([np.mean(v) for v in pairs.values()]))
             replicate = np.mean([np.mean(v, axis=0) for v in reps.values()], axis=0)
             return point, replicate, {k: float(np.mean(v)) for k, v in pairs.items()}, {k: float(np.mean(v)) for k, v in seeds.items()}
-
-        planned = {k for k in (expected or set()) if family(k[0], k[1]) == fam}
-        missing = sorted(planned - present)
 
         def interval(replicate) -> tuple[float, float]:
             return float(np.nanpercentile(replicate, 2.5)), float(np.nanpercentile(replicate, 97.5))
@@ -166,16 +180,25 @@ def main(argv: list[str] | None = None) -> None:
     rows, incomplete = [], []
     for d in a.directories:
         cells = load_cells(d, a.row)
-        if not cells:
-            continue
-        name = cells[0]["dataset"]
+        if any(not c["scores"] for c in cells):
+            raise SystemExit(f"{d.name}: {sum(not c['scores'] for c in cells)} of its archives have no row {a.row} scores. Pick the row they ran")
         planned, n_docs = run_plan(d.parent.parent / f"{d.name}.jsonl.manifest.jsonl", a.plan, d.name)
         if not planned and not a.allow_unplanned:
             raise SystemExit(f"{d.name}: no planned cells in its manifest or in --plan, so a missing cell couldn't be detected. Pass --plan, or --allow-unplanned")
+        # The whole plan against what is here, before any family is summarized, so no planned cell or family can drop out unnoticed.
+        present = {(c["src"], c["tgt"], c["seed"]) for c in cells}
+        if planned and present - planned:
+            raise SystemExit(f"{d.name}: holds cells its plan doesn't name ({', '.join('|'.join(map(str, k)) for k in sorted(present - planned))}), so it isn't the planned run")
+        if planned - present:
+            incomplete.append(f"{d.name}: missing {', '.join('|'.join(map(str, k)) for k in sorted(planned - present))}")
+        if not cells:
+            if not planned:
+                raise SystemExit(f"{d.name}: no per-query archives for row {a.row}")
+            print(f"{d.name:42} no cells       incomplete")
+            continue
+        name = cells[0]["dataset"]
         for r in summarize(cells, n_docs, expected=planned or None):
             rows.append({"source": d.name, "dataset": name, "row": a.row, **r})
-            if r.get("verdict") == "incomplete":
-                incomplete.append(f"{d.name} {r['family']}: missing {', '.join(r['missing_cells'])}")
             print(f"{d.name:42} {r['family']:6} n={r['n_queries']:5} {r['retention']:.3f} [{r['retention_low']:.3f}, {r['retention_high']:.3f}] {r.get('verdict', ''):11} vs re-index {r.get('vs_reindex', float('nan')):.3f}")
     if a.out:
         a.out.parent.mkdir(parents=True, exist_ok=True)
