@@ -10,7 +10,11 @@ existing 234 GB of caches would orphan them, so they stay where they are, as leg
   first download records the revision it fetched.
 
 A revision can still be unknown: in a sidecar, if a load left no local reference, or for the current run, if the model isn't in the local
-Hugging Face cache. Such a file is never counted as validated: it is reused as ``unverified``, with a warning.
+Hugging Face cache. Such a file is never counted as validated: it is reused as ``unverified``, with a warning, and, like a legacy file, it
+can still be extended.
+
+The revision is the local reference read just after the load: transformers 5 doesn't record the commit on a loaded model. Another
+process moving that reference in the instant between the two would go unnoticed.
 
 ``summary()`` says how many legacy, validated and unverified entries a run read, and how many it wrote, for its manifest.
 """
