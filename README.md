@@ -213,3 +213,5 @@ So with a translator, the bridge matches the old model plus translation, without
 - `results/`: compact records of the published results.
 
 No dataset text or embeddings are in this repository. Benchmark runs download them and cache them under `data/`, and the examples use Hugging Face's own cache.
+
+*Disclaimer: This is a personal project. The views, code, and opinions expressed here are my own and do not represent those of my current or past employers.*
